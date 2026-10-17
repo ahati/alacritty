@@ -15,6 +15,7 @@ use log::error;
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 use crate::event::{self, Event, EventListener, WindowSize};
+use crate::graphics::DecodeJob;
 use crate::sync::FairMutex;
 use crate::term::Term;
 use crate::{thread, tty};
@@ -115,7 +116,7 @@ where
 
         // Reserve the next terminal lock for PTY reading.
         let _terminal_lease = Some(self.terminal.lease());
-        let mut terminal = None;
+        let mut locked = None;
 
         loop {
             // Read from the PTY.
@@ -135,15 +136,17 @@ where
             }
 
             // Attempt to lock the terminal.
-            let terminal = match &mut terminal {
-                Some(terminal) => terminal,
-                None => terminal.insert(match self.terminal.try_lock_unfair() {
+            if locked.is_none() {
+                match self.terminal.try_lock_unfair() {
+                    Some(guard) => locked = Some(guard),
                     // Force block if we are at the buffer size limit.
-                    None if unprocessed >= READ_BUFFER_SIZE => self.terminal.lock_unfair(),
+                    None if unprocessed >= READ_BUFFER_SIZE => {
+                        locked = Some(self.terminal.lock_unfair())
+                    },
                     None => continue,
-                    Some(terminal) => terminal,
-                }),
-            };
+                }
+            }
+            let terminal = locked.as_mut().expect("terminal locked above");
 
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
@@ -153,8 +156,32 @@ where
             // Parse the incoming bytes.
             state.parser.advance(&mut **terminal, &buf[..unprocessed]);
 
+            let jobs = terminal.take_graphics_jobs();
+
             processed += unprocessed;
             unprocessed = 0;
+
+            if !jobs.is_empty() {
+                // Decoding an image costs time proportional to its pixels rather
+                // than to the command that carried them, so it happens with the
+                // terminal unlocked: the display keeps drawing and input keeps
+                // being handled while a large image decodes.
+                //
+                // The PTY is not read again until the decode finishes, which is
+                // what stops a client sending a whole directory from getting
+                // ahead of us and filling memory with undecoded payloads.
+                locked = None;
+
+                let results: Vec<_> = jobs.into_iter().map(DecodeJob::decode).collect();
+
+                let mut terminal = self.terminal.lock_unfair();
+                for result in results {
+                    terminal.install_graphics(result);
+                }
+                drop(terminal);
+
+                self.event_proxy.send_event(Event::Wakeup);
+            }
 
             // Assure we're not blocking the terminal too long unnecessarily.
             if processed >= MAX_LOCKED_READ {

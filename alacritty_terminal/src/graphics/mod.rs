@@ -30,8 +30,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::index::{Line, Point};
 
-use self::command::{Action, Command, Compression, CursorMovement, Medium};
-use self::image::{ImageData, ImageStore};
+use self::command::{Action, Command, Compression, CursorMovement, Format, Medium};
+use self::image::{Decoded, ImageData, ImageStore};
 pub use self::placement::CellFootprint;
 
 use self::placement::{Placement, PlacementStore, SourceRect};
@@ -240,6 +240,8 @@ pub struct GraphicsStore {
     cell_size: (u16, u16),
     /// Transmission currently being assembled, if any.
     transfer: Option<Transfer>,
+    /// Decodes queued by the parser, to be run with the terminal unlocked.
+    jobs: Vec<DecodeJob>,
     /// Control data of the APC currently being received.
     control: Vec<u8>,
     /// Base64 characters of the APC currently being received.
@@ -267,6 +269,7 @@ impl GraphicsStore {
             placements: PlacementStore::new(),
             cell_size: DEFAULT_CELL_SIZE,
             transfer: None,
+            jobs: Vec::new(),
             control: Vec::new(),
             chars: Vec::new(),
             phase: ApcPhase::default(),
@@ -446,6 +449,54 @@ impl GraphicsStore {
         self.images.clear();
         self.placements.clear();
         self.transfer = None;
+        self.jobs.clear();
+    }
+
+    /// Take the decodes queued since the last call.
+    ///
+    /// Decompression and pixel decoding are proportional to the image rather
+    /// than to the command, so the caller is expected to run these with the
+    /// terminal unlocked and then hand each outcome to
+    /// [`install`](Self::install). Until it does, an affected image is stored
+    /// without pixels and is not drawn.
+    pub fn take_jobs(&mut self) -> Vec<DecodeJob> {
+        mem::take(&mut self.jobs)
+    }
+
+    /// Apply the outcome of a decode obtained from [`take_jobs`](Self::take_jobs).
+    ///
+    /// Returns the update the caller should act on, which carries the response
+    /// the client has been waiting for since it sent the payload.
+    pub fn install(&mut self, result: DecodeResult) -> GraphicsUpdate {
+        let DecodeResult { internal_id, command, result } = result;
+
+        let update = match result {
+            Ok(decoded) => {
+                // A query stores nothing, so it can never change the screen. For a
+                // transmission, the image may have been evicted or deleted while
+                // the decode ran; its pixels are then dropped and the
+                // transmission counts as having changed nothing, exactly as an
+                // eviction does.
+                let changed = match internal_id {
+                    Some(internal_id) => self.images.complete(internal_id, decoded),
+                    None => false,
+                };
+
+                self.success(&command, changed)
+            },
+            Err(error) => {
+                // Nothing will be displayed, so the space reserved for it is
+                // released along with any placement that referred to it.
+                if let Some(internal_id) = internal_id {
+                    self.placements.remove_image(internal_id);
+                    self.images.remove(internal_id);
+                }
+
+                self.failure(&command, error)
+            },
+        };
+
+        update
     }
 
     /// Carry out a parsed command.
@@ -469,6 +520,12 @@ impl GraphicsStore {
 
         match outcome {
             Ok((changed, cursor_advance)) => {
+                // A deferred command has not decoded its payload yet, so whether it
+                // was accepted is still unknown and the reply is left to `install`.
+                if command.action.is_deferred() {
+                    return GraphicsUpdate { response: None, changed, cursor_advance };
+                }
+
                 let mut update = self.success(command, changed);
                 update.cursor_advance = cursor_advance;
                 update
@@ -477,18 +534,43 @@ impl GraphicsStore {
         }
     }
 
-    /// Decode and store image data.
+    /// Reserve space for a transmission and queue its payload for decoding.
     fn transmit(&mut self, command: &Command, data: Vec<u8>) -> Result<u32, GraphicsError> {
-        let data = decompress(command, data, decompression_limit(command, &self.config))?;
-        let decoded = image::decode(
-            command.format,
-            &data,
-            command.source_width,
-            command.source_height,
-            self.config.max_image_dimension,
-        )?;
+        let limit = decompression_limit(command, &self.config);
+        let max_dimension = self.config.max_image_dimension;
 
-        self.make_room(decoded.pixels.len())?;
+        // A placement has to be anchored and quota reserved before the payload
+        // is decoded, so the dimensions are established here. A PNG carries
+        // them in a header, which a compressed payload has to be expanded to
+        // reach; raw formats declare theirs in the control data and stay
+        // compressed until the worker runs.
+        let (data, command, (width, height)) = match (command.format, command.compression) {
+            (Format::Png, Some(_)) => {
+                let data = decompress(command, data, limit)?;
+                let mut expanded = command.clone();
+                expanded.compression = None;
+                let shape = image::probe_png(&data, max_dimension)?;
+                (data, expanded, shape)
+            },
+            (Format::Png, None) => {
+                let shape = image::probe_png(&data, max_dimension)?;
+                (data, command.clone(), shape)
+            },
+            _ => {
+                let shape = image::probe_raw(
+                    command.format,
+                    command.source_width,
+                    command.source_height,
+                    max_dimension,
+                )?;
+                (data, command.clone(), shape)
+            },
+        };
+
+        // The payload has not been decoded, so the layout it will produce is
+        // not known yet and the largest one is reserved for it.
+        let reserved = image::max_pixel_bytes(width, height);
+        self.make_room(reserved)?;
 
         // Re-transmitting an identifier replaces the image and drops its
         // existing placements, as the protocol requires.
@@ -496,23 +578,37 @@ impl GraphicsStore {
             self.placements.remove_image(existing);
         }
 
-        let (internal_id, _) =
-            self.images.insert(command.image_id, command.image_number, decoded, command.transient);
+        let (internal_id, _) = self.images.insert_pending(
+            command.image_id,
+            command.image_number,
+            width,
+            height,
+            reserved,
+            command.transient,
+        );
+
+        self.jobs.push(DecodeJob {
+            internal_id: Some(internal_id),
+            command,
+            data,
+            limit,
+            max_dimension,
+        });
 
         Ok(internal_id)
     }
 
-    /// Validate image data without storing it (`a=q`).
-    fn validate(&self, command: &Command, data: Vec<u8>) -> Result<(), GraphicsError> {
-        let data = decompress(command, data, decompression_limit(command, &self.config))?;
-        image::decode(
-            command.format,
-            &data,
-            command.source_width,
-            command.source_height,
-            self.config.max_image_dimension,
-        )
-        .map(|_| ())
+    /// Queue a validation of image data that is not stored (`a=q`).
+    fn validate(&mut self, command: &Command, data: Vec<u8>) -> Result<(), GraphicsError> {
+        self.jobs.push(DecodeJob {
+            internal_id: None,
+            command: command.clone(),
+            data,
+            limit: decompression_limit(command, &self.config),
+            max_dimension: self.config.max_image_dimension,
+        });
+
+        Ok(())
     }
 
     /// Anchor a placement of a stored image at the cursor.
@@ -783,6 +879,55 @@ fn resolve_footprint(
     }
 }
 
+/// A decode handed off by the parser so that its cost is not paid while the
+/// terminal is locked.
+///
+/// Decompression and pixel decoding dominate a transmission and are
+/// proportional to the image, so performing them under the lock stalls the
+/// display for as long as the image takes to decode.
+#[derive(Debug)]
+pub struct DecodeJob {
+    /// Image the pixels belong to, or `None` for a validation query.
+    internal_id: Option<u32>,
+    /// Command the payload belongs to, holding any compression still to undo.
+    command: Command,
+    /// Payload as transmitted.
+    data: Vec<u8>,
+    /// Bound on the bytes `data` may expand to.
+    limit: usize,
+    /// Maximum image dimension the terminal will allocate.
+    max_dimension: u32,
+}
+
+impl DecodeJob {
+    /// Decode the payload.
+    ///
+    /// Touches no terminal state, so it is safe to run without the lock.
+    pub fn decode(self) -> DecodeResult {
+        let result = decompress(&self.command, self.data, self.limit).and_then(|data| {
+            image::decode(
+                self.command.format,
+                &data,
+                self.command.source_width,
+                self.command.source_height,
+                self.max_dimension,
+            )
+        });
+
+        DecodeResult { internal_id: self.internal_id, command: self.command, result }
+    }
+}
+
+/// The outcome of a [`DecodeJob`].
+pub struct DecodeResult {
+    /// Image the pixels belong to, or `None` for a validation query.
+    internal_id: Option<u32>,
+    /// Command the result belongs to, used to build the response.
+    command: Command,
+    /// Pixels, or the reason the payload was rejected.
+    result: Result<Decoded, GraphicsError>,
+}
+
 /// Reject transmission features this implementation does not support.
 ///
 /// File, temporary file and shared memory mediums would let a client make the
@@ -835,12 +980,27 @@ mod tests {
     }
 
     /// Feed one complete APC string to the store.
+    /// Feed one APC string to the store, then run any decode it queues.
+    ///
+    /// Decoding is deferred to whoever drains `take_jobs`, so the tests settle
+    /// it here to leave the store in the state the event loop would reach. The
+    /// cursor advance comes from parsing and the response from the decode, which
+    /// is how they are applied in production.
     fn apc(store: &mut GraphicsStore, payload: &str) -> GraphicsUpdate {
         store.apc_start();
         for byte in payload.bytes() {
             store.apc_put(byte);
         }
-        store.apc_end(Point::new(Line(0), Column(0)))
+
+        let mut update = store.apc_end(Point::new(Line(0), Column(0)));
+
+        for result in store.take_jobs() {
+            let settled = store.install(result.decode());
+            update.response = settled.response;
+            update.changed |= settled.changed;
+        }
+
+        update
     }
 
     /// A 1x1 red RGBA image payload.
@@ -979,7 +1139,12 @@ mod tests {
                     store.apc_put(*byte);
                 }
             }
-            let update = store.apc_end(Point::new(Line(0), Column(0)));
+            let mut update = store.apc_end(Point::new(Line(0), Column(0)));
+
+            // The reply follows the decode, as it does in the event loop.
+            for result in store.take_jobs() {
+                update.response = store.install(result.decode()).response;
+            }
 
             assert_eq!(
                 update.response.as_deref(),

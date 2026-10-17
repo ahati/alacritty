@@ -95,6 +95,17 @@ pub enum Action {
 }
 
 impl Action {
+    /// Whether the command's payload is decoded away from the parse path.
+    ///
+    /// Such a command cannot be answered as it is parsed, because whether its
+    /// payload is acceptable is only known once that payload has been decoded.
+    pub const fn is_deferred(self) -> bool {
+        match self {
+            Self::Transmit | Self::TransmitAndDisplay | Self::Query => true,
+            Self::Put | Self::Delete | Self::Frame | Self::Animate | Self::Compose => false,
+        }
+    }
+
     fn parse(value: u8) -> Result<Self, ParseError> {
         match value {
             b't' => Ok(Self::Transmit),

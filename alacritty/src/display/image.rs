@@ -75,6 +75,14 @@ pub fn collect(
         let Some(image) = store.image(placement.internal_id) else {
             continue;
         };
+
+        // Decoding happens away from the terminal lock, so an image that has
+        // been placed may not have its pixels yet. It is skipped until they
+        // arrive, which is a frame or two at most.
+        if !image.is_ready() {
+            continue;
+        }
+
         let Some(rendered) = resolve(placement, image, display_offset, size_info) else {
             continue;
         };

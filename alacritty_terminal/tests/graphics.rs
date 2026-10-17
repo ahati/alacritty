@@ -56,9 +56,20 @@ fn terminal() -> (Term<Recorder>, Recorder) {
     (term, recorder)
 }
 
-/// Feed raw bytes through the real parser.
+/// Feed raw bytes through the real parser, then run any queued decode.
+///
+/// Decoding is deferred so it can happen with the terminal unlocked; the event
+/// loop does it immediately afterwards, which is what these tests settle here.
 fn feed(term: &mut Term<Recorder>, parser: &mut Processor, bytes: &[u8]) {
     parser.advance(term, bytes);
+    settle(term);
+}
+
+/// Run the decodes the parser queued and apply their outcomes.
+fn settle(term: &mut Term<Recorder>) {
+    for job in term.take_graphics_jobs() {
+        term.install_graphics(job.decode());
+    }
 }
 
 /// Build a complete `a=T` graphics escape sequence.

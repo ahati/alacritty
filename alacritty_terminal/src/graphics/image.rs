@@ -58,6 +58,9 @@ pub struct ImageData {
     /// Channel layout of `pixels`.
     pub format: PixelFormat,
     /// Tightly packed 8-bit pixels in [`format`](Self::format).
+    ///
+    /// Empty while a deferred decode is still outstanding; see
+    /// [`is_ready`](Self::is_ready).
     pub pixels: Arc<[u8]>,
     /// Bumped whenever the image data is replaced, so renderers can invalidate
     /// cached textures.
@@ -65,12 +68,25 @@ pub struct ImageData {
     /// Whether the client marked the image as transient (`N=1`), which makes it
     /// a preferred eviction candidate.
     pub transient: bool,
+    /// Bytes charged against the quota for this image.
+    ///
+    /// Before the pixels exist this is the reservation made for them, since a
+    /// decode that has not run yet still has to hold its space.
+    charge: usize,
 }
 
 impl ImageData {
-    /// Bytes of pixel data held by this image.
-    pub fn byte_len(&self) -> usize {
-        self.pixels.len()
+    /// Whether the pixel data has been decoded yet.
+    ///
+    /// Decoding happens away from the terminal lock, so an image can be placed
+    /// before its pixels exist. Such an image must not be uploaded or drawn.
+    pub fn is_ready(&self) -> bool {
+        !self.pixels.is_empty()
+    }
+
+    /// Bytes this image is charged against the quota.
+    pub fn charge(&self) -> usize {
+        self.charge
     }
 }
 
@@ -81,6 +97,26 @@ pub struct Decoded {
     pub height: u32,
     pub format: PixelFormat,
     pub pixels: Vec<u8>,
+}
+
+/// An image on its way into an [`ImageStore`].
+struct Stored {
+    client_id: u32,
+    number: u32,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    pixels: Arc<[u8]>,
+    charge: usize,
+    transient: bool,
+}
+
+/// Upper bound on the pixel data an image of these dimensions can occupy.
+///
+/// A deferred decode reserves this much before it knows which layout the
+/// payload will decode to, and corrects the accounting when it finishes.
+pub fn max_pixel_bytes(width: u32, height: u32) -> usize {
+    (width as usize).saturating_mul(height as usize).saturating_mul(RGBA_CHANNELS)
 }
 
 /// Images and the memory quota that bounds them.
@@ -215,11 +251,97 @@ impl ImageStore {
         decoded: Decoded,
         transient: bool,
     ) -> (u32, Arc<ImageData>) {
-        let internal_id = match self.by_client_id.get(&client_id) {
-            Some(internal_id) if client_id != 0 => {
+        let charge = decoded.pixels.len();
+        let pixels: Arc<[u8]> = decoded.pixels.into();
+
+        self.store(Stored {
+            client_id,
+            number,
+            width: decoded.width,
+            height: decoded.height,
+            format: decoded.format,
+            pixels,
+            charge,
+            transient,
+        })
+    }
+
+    /// Reserve space for an image whose pixels have not been decoded yet.
+    ///
+    /// The placement is anchored before the decode runs, so the image is
+    /// registered up front with the dimensions taken from the transmission and
+    /// `reserved` as an upper bound on the size it will eventually occupy.
+    pub fn insert_pending(
+        &mut self,
+        client_id: u32,
+        number: u32,
+        width: u32,
+        height: u32,
+        reserved: usize,
+        transient: bool,
+    ) -> (u32, Arc<ImageData>) {
+        self.store(Stored {
+            client_id,
+            number,
+            width,
+            height,
+            format: PixelFormat::Rgba,
+            pixels: Arc::from(Vec::new()),
+            charge: reserved,
+            transient,
+        })
+    }
+
+    /// Attach decoded pixels to an image created by [`insert_pending`].
+    ///
+    /// Returns whether the image was still stored. It may have been evicted or
+    /// deleted while the decode ran, in which case the pixels are dropped.
+    ///
+    /// [`insert_pending`]: Self::insert_pending
+    pub fn complete(&mut self, internal_id: u32, decoded: Decoded) -> bool {
+        let Some(existing) = self.images.get(&internal_id) else {
+            return false;
+        };
+
+        let mut stored = Stored {
+            client_id: existing.client_id,
+            number: existing.number,
+            width: decoded.width,
+            height: decoded.height,
+            format: decoded.format,
+            pixels: decoded.pixels.into(),
+            charge: 0,
+            transient: existing.transient,
+        };
+        stored.charge = stored.pixels.len();
+
+        self.used -= existing.charge();
+        self.used += stored.charge;
+        self.generation += 1;
+
+        let image = Arc::new(ImageData {
+            client_id: stored.client_id,
+            number: stored.number,
+            width: stored.width,
+            height: stored.height,
+            format: stored.format,
+            pixels: stored.pixels,
+            generation: self.generation,
+            transient: stored.transient,
+            charge: stored.charge,
+        });
+        self.images.insert(internal_id, Arc::clone(&image));
+
+        true
+    }
+
+    /// Insert an image, reusing the identifier a client identifier maps to.
+    fn store(&mut self, stored: Stored) -> (u32, Arc<ImageData>) {
+        let internal_id = match self.by_client_id.get(&stored.client_id) {
+            Some(internal_id) if stored.client_id != 0 => {
                 // Drop the replaced image's bytes.
                 if let Some(old) = self.images.remove(internal_id) {
-                    self.used -= old.byte_len();
+                    self.used -= old.charge();
                 }
                 *internal_id
             },
@@ -232,22 +354,23 @@ impl ImageStore {
 
         self.generation += 1;
         let image = Arc::new(ImageData {
-            client_id,
-            number,
-            width: decoded.width,
-            height: decoded.height,
-            format: decoded.format,
-            pixels: decoded.pixels.into(),
+            client_id: stored.client_id,
+            number: stored.number,
+            width: stored.width,
+            height: stored.height,
+            format: stored.format,
+            pixels: stored.pixels,
             generation: self.generation,
-            transient,
+            transient: stored.transient,
+            charge: stored.charge,
         });
 
-        self.used += image.byte_len();
-        if client_id != 0 {
-            self.by_client_id.insert(client_id, internal_id);
+        self.used += image.charge();
+        if stored.client_id != 0 {
+            self.by_client_id.insert(stored.client_id, internal_id);
         }
-        if number != 0 {
-            self.by_number.insert(number, internal_id);
+        if stored.number != 0 {
+            self.by_number.insert(stored.number, internal_id);
         }
         self.images.insert(internal_id, Arc::clone(&image));
 
@@ -262,7 +385,7 @@ impl ImageStore {
             return false;
         };
 
-        self.used -= image.byte_len();
+        self.used -= image.charge();
         if image.client_id != 0 && self.by_client_id.get(&image.client_id) == Some(&internal_id) {
             self.by_client_id.remove(&image.client_id);
         }
@@ -302,6 +425,37 @@ impl ImageStore {
         self.by_number.clear();
         self.used = 0;
     }
+}
+
+/// Dimensions a raw transmission declares in its control data.
+pub fn probe_raw(
+    format: Format,
+    width: u32,
+    height: u32,
+    max_dimension: u32,
+) -> Result<(u32, u32), GraphicsError> {
+    if format.bytes_per_pixel().is_none() {
+        return Err(GraphicsError::Invalid);
+    }
+
+    check_dimensions(width, height, max_dimension)?;
+
+    Ok((width, height))
+}
+
+/// Dimensions a PNG stream declares in its header.
+///
+/// Only the header is parsed, so that a placement can be anchored and quota
+/// reserved before the pixels are decoded.
+pub fn probe_png(data: &[u8], max_dimension: u32) -> Result<(u32, u32), GraphicsError> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let reader = decoder.read_info().map_err(|_| GraphicsError::BadData)?;
+
+    let info = reader.info();
+    check_dimensions(info.width, info.height, max_dimension)?;
+
+    Ok((info.width, info.height))
 }
 
 /// Decode a transmission's payload into pixels.

@@ -14,7 +14,9 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
-use crate::graphics::{CellFootprint, GraphicsConfig, GraphicsStore};
+use crate::graphics::{
+    CellFootprint, DecodeJob, DecodeResult, GraphicsConfig, GraphicsStore, GraphicsUpdate,
+};
 use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
@@ -678,6 +680,26 @@ impl<T> Term<T> {
         &self.graphics
     }
 
+    /// Take the image decodes queued by the parser.
+    ///
+    /// Decoding is proportional to the image rather than to the command that
+    /// carried it, so callers are expected to run these with the terminal
+    /// unlocked and then pass each outcome to
+    /// [`install_graphics`](Self::install_graphics).
+    pub fn take_graphics_jobs(&mut self) -> Vec<DecodeJob> {
+        self.graphics.take_jobs()
+    }
+
+    /// Apply the outcome of a decode taken from
+    /// [`take_graphics_jobs`](Self::take_graphics_jobs).
+    pub fn install_graphics(&mut self, result: DecodeResult)
+    where
+        T: EventListener,
+    {
+        let update = self.graphics.install(result);
+        self.apply_graphics(update);
+    }
+
     /// Report the size of a single cell in pixels.
     ///
     /// The core only knows its dimensions in cells, but the graphics protocol
@@ -686,6 +708,27 @@ impl<T> Term<T> {
     pub fn set_cell_size(&mut self, width: u16, height: u16) {
         self.graphics.set_cell_size(width, height);
         self.inactive_graphics.set_cell_size(width, height);
+    }
+
+    /// Carry out the state changes a graphics update asks for.
+    ///
+    /// Shared by the parse path and the deferred decode path, so that a
+    /// response and its side effects are applied identically by both.
+    fn apply_graphics(&mut self, update: GraphicsUpdate)
+    where
+        T: EventListener,
+    {
+        if let Some(response) = update.response {
+            self.event_proxy.send_event(Event::PtyWrite(response));
+        }
+
+        if let Some(advance) = update.cursor_advance {
+            self.advance_cursor_after_placement(advance);
+        }
+
+        if update.changed {
+            self.mark_fully_damaged();
+        }
     }
 
     /// Move the cursor past an image that was just displayed.
@@ -1154,18 +1197,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn apc_end(&mut self) {
         let update = self.graphics.apc_end(self.grid.cursor.point);
-
-        if let Some(response) = update.response {
-            self.event_proxy.send_event(Event::PtyWrite(response));
-        }
-
-        if let Some(advance) = update.cursor_advance {
-            self.advance_cursor_after_placement(advance);
-        }
-
-        if update.changed {
-            self.mark_fully_damaged();
-        }
+        self.apply_graphics(update);
     }
 
     /// A character to be displayed.
