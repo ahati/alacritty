@@ -187,22 +187,40 @@ impl PlacementStore {
             }
         }
 
-        // The reference implementation destroys a placement once it has
-        // scrolled entirely off the top of the screen, even though the image
-        // data survives in the scrollback. Keeping them would pile up images
-        // that can never come back into view, and would keep their data
-        // permanently un-evictable.
-        self.placements.retain(|placement| {
-            let bottom = placement.anchor.line.0 + i32::from(placement.footprint.rows);
-            bottom > 0
-        });
+        // A placement is deliberately *not* destroyed as it leaves the
+        // viewport. The reference implementation keeps one for as long as the
+        // line it is anchored to survives in the scrollback, so scrolling back
+        // brings the image into view again; the caller drops it once that line
+        // is discarded, through `retain_within`.
     }
 
-    /// Drop placements anchored outside the given line range.
+    /// Pull pixel offsets back inside a cell.
+    ///
+    /// An offset is measured inside the cell a placement is anchored to, so a
+    /// cell that has just changed size can leave it outside it. The reference
+    /// implementation clamps on its equivalent of a font size change.
+    pub fn clamp_offsets(&mut self, cell: (u16, u16)) {
+        let (width, height) = cell;
+
+        for placement in &mut self.placements {
+            placement.offset_x = placement.offset_x.min(width.saturating_sub(1));
+            placement.offset_y = placement.offset_y.min(height.saturating_sub(1));
+        }
+    }
+
+    /// Drop placements that no longer overlap the given line range.
+    ///
+    /// A placement is measured by its whole extent rather than by its anchor,
+    /// because one whose anchor has scrolled above the top of the buffer is
+    /// still on screen while any of its rows remain. The reference
+    /// implementation keeps a placement until its bottom edge leaves the
+    /// buffer, which is what makes an image taller than the screen survive.
     pub fn retain_within(&mut self, top: Line, bottom: Line) {
         self.placements.retain(|placement| {
-            let line = placement.anchor.line;
-            line >= top && line <= bottom
+            let start = placement.anchor.line;
+            let end = Line(start.0 + i32::from(placement.footprint.rows));
+
+            start <= bottom && end > top
         });
     }
 
@@ -302,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn a_placement_scrolled_off_the_screen_is_destroyed() {
+    fn a_placement_outlives_the_viewport() {
         let mut store = PlacementStore::new();
         store.put(placement(1, 0, 1));
 
@@ -311,9 +329,33 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert_eq!(store.iter().next().unwrap().anchor.line, Line(-1));
 
-        // Now entirely above the top of the screen.
+        // Now entirely above the top of the screen. It is kept, because the line
+        // it is anchored to is still in the scrollback and scrolling back has to
+        // bring the image into view again.
         store.scroll(&(Line(0)..Line(24)), 2);
-        assert_eq!(store.len(), 0, "the reference implementation destroys it");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.iter().next().unwrap().anchor.line, Line(-3));
+
+        // It goes once its bottom edge leaves the buffer. A placement taller
+        // than the buffer keeps overlapping the visible range, so it outlives
+        // one that fits entirely above it.
+        store.retain_within(Line(-1), Line(23));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_cell_size_change_pulls_offsets_back_inside_a_cell() {
+        let mut store = PlacementStore::new();
+        let mut image = placement(0, 0, 1);
+        image.offset_x = 40;
+        image.offset_y = 30;
+        store.put(image);
+
+        store.clamp_offsets((12, 20));
+
+        let placement = store.iter().next().unwrap();
+        assert_eq!(placement.offset_x, 11);
+        assert_eq!(placement.offset_y, 19);
     }
 
     #[test]

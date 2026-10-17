@@ -283,7 +283,12 @@ impl GraphicsStore {
     /// The core has no font metrics, so the display supplies these. They only
     /// affect how image sizes given in cells are resolved.
     pub fn set_cell_size(&mut self, width: u16, height: u16) {
-        self.cell_size = (width.max(1), height.max(1));
+        let cell = (width.max(1), height.max(1));
+        self.cell_size = cell;
+
+        // Placements keep their anchors, but an offset measured inside the old
+        // cell may now fall outside the new one.
+        self.placements.clamp_offsets(cell);
     }
 
     /// Current configuration.

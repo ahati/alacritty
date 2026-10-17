@@ -710,6 +710,17 @@ impl<T> Term<T> {
         self.inactive_graphics.set_cell_size(width, height);
     }
 
+    /// Drop placements anchored to lines the buffer no longer holds.
+    ///
+    /// A placement outlives the viewport: the reference implementation keeps it
+    /// for as long as the line it is anchored to survives in the scrollback, so
+    /// that scrolling back brings the image into view again. It is dropped only
+    /// once that line is discarded from the buffer.
+    fn prune_graphics(&mut self) {
+        let (top, bottom) = (self.topmost_line(), self.bottommost_line());
+        self.graphics.prune(top, bottom);
+    }
+
     /// Carry out the state changes a graphics update asks for.
     ///
     /// Shared by the parse path and the deferred decode path, so that a
@@ -791,11 +802,11 @@ impl<T> Term<T> {
             // Recreate tabs list.
             self.tabs.resize(num_cols);
 
-            // Placements are anchored to cells, and reflow moves those cells
-            // individually, so they cannot be tracked across a column change.
-            // This mirrors the selection policy above.
-            self.graphics.clear();
-            self.inactive_graphics.clear();
+            // Placements survive a column change, unlike the selection above.
+            // They are anchored to a line and a column rather than to a run of
+            // text, so reflowing the text around them does not invalidate them.
+            // The reference implementation keeps them too: nothing about an
+            // image depends on the text it happens to be drawn over.
         } else if let Some(selection) = self.selection.take() {
             let max_lines = cmp::max(num_lines, old_lines) as i32;
             let range = Line(0)..Line(max_lines);
@@ -803,8 +814,7 @@ impl<T> Term<T> {
         }
 
         // Drop graphics that have scrolled out of the buffer entirely.
-        let (top, bottom) = (self.topmost_line(), self.bottommost_line());
-        self.graphics.prune(top, bottom);
+        self.prune_graphics();
 
         // Clamp vi cursor to viewport.
         let vi_point = self.vi_mode_cursor.point;
@@ -880,6 +890,7 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+        self.prune_graphics();
         self.mark_fully_damaged();
     }
 
@@ -902,6 +913,7 @@ impl<T> Term<T> {
         self.graphics.scroll(&region, lines as i32);
 
         self.grid.scroll_up(&region, lines);
+        self.prune_graphics();
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));

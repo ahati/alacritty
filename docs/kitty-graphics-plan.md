@@ -1,12 +1,13 @@
 # Kitty Graphics Protocol in Alacritty — Feasibility Analysis & Implementation Plan
 
-> **Status: implemented.** Phases 0–3 of the plan below are complete and verified
-> by rendering into an Xvfb display: a 96×96 PNG and a 64×64 PNG placed by
-> `a=T` came out pixel-exact (9216 and 4096 px) alongside text. `cargo test
-> --workspace` is green (317 tests). See the container `README.md` for the
-> supported command set, configuration, and known limitations. Phase 4 (client
-> conformance against `kitten icat`, `timg`, `chafa`) and phase 5 (hardening,
-> `t=f`/`t=s`, zlib, placeholders, animation) remain outstanding.
+> **Status: implemented.** Phases 0–4 of the plan below are complete. Verified by
+> rendering into an Xvfb display, driven by real clients: `kitten icat` (kitty
+> 0.45.0) and `chafa --format=kitty` (1.18.1). `cargo test --workspace` is green
+> (331 tests). Performance and anchoring behaviour were checked against the
+> reference implementation's source rather than assumed. See the container
+> `README.md` for the supported command set, configuration, and known
+> limitations. Phase 5 (hardening, `t=f`/`t=s`, placeholders, animation, parallel
+> decode) remains outstanding.
 >
 > Design corrections found during implementation, which supersede the text below:
 > 1. **There is no DCS variant of the kitty graphics protocol.** Every command is
@@ -43,11 +44,30 @@
 >    that passes the last line; clamping instead leaves the cursor inside the
 >    image. Resolving the footprint needs the cell size in pixels, which the core
 >    did not have — the display now reports it via `Term::set_cell_size`.
-> 9. **Skipping placements whose anchor is off-screen is wrong.** Only the anchor's
->    line is tested, but an image may be many rows tall, so an image that has
->    scrolled partly off the top must be clipped by the window, not dropped.
-
-Status: analysis / proposal. Nothing in this document is implemented yet.
+> 9. **A placement must be measured by its whole extent, not by its anchor.** The
+>    original implementation tested only the anchor line, which is wrong in both
+>    directions: an image that has scrolled partly off the top is still visible and
+>    must be clipped rather than dropped, and it must be dropped once its *bottom
+>    edge* leaves the buffer rather than when its anchor does. The reference
+>    implementation's `clear_filter_func` tests `start_row + effective_num_rows`.
+>    See §4.2, which also corrects an earlier revision of this list.
+> 10. **Decoding cannot stay on the parse path.** It cost 9.4ms per 1200×900 PNG
+>     while holding the terminal lock that the display also needs. Decoding now runs
+>     with the lock released, which forces two further changes: the reply must follow
+>     the decode, since whether a payload is acceptable is only known afterwards, and
+>     an image must be able to exist before its pixels do, so that `a=T` still moves
+>     the cursor in step with the surrounding text. See §4.5.
+> 11. **Reaching the memory limit must evict, not reject.** Every image has a
+>     placement, so nothing was ever eligible for eviction and new images were
+>     refused with `ENOSPC`; under `q=2` the client is never told, so they simply
+>     never appeared. The oldest images are now evicted along with their placements,
+>     which is what `apply_storage_quota` does.
+> 12. **A column resize must not drop images.** Kitty's `grman_resize` destroys
+>     nothing on any resize, because a placement is anchored to a line and a column
+>     rather than to a run of text. See §4.2.
+>
+> The body below is the original analysis and plan, corrected in place where the
+> implementation disproved it — §4.2 and §4.5 in particular.
 Base: `/workspaces/alacritty-fork` @ `54214706` (`alacritty 0.18.0-dev`, `alacritty_terminal 0.26.1-dev`).
 
 ---
@@ -297,11 +317,23 @@ Keep placements in a `Term`-level store with explicit transforms, mirroring how 
 
 The precedent is already in the codebase: `Term::scroll_up_relative`/`scroll_down_relative` (`term/mod.rs:770`/`:742`) call `self.selection.rotate(&self, &region, lines)` before `grid.scroll_up`, and `Term::resize` (`:655`) **invalidates the selection on column change** (`:684-687`) and rotates it on row-only change (`:689-692`).
 
-Mirror exactly that:
+Placements use the same scroll hook but deliberately **not** the same resize policy. The selection is invalidated on a column change because it spans a run of text and reflow moves those cells individually. A placement is anchored to a single line and column, and nothing about an image depends on the text it happens to be drawn over, so it survives.
 
-* `placements.scroll(&region, lines)` — move anchors inside the region by the delta; drop anything pushed past the history limit.
-* `placements.on_resize(...)` — on **row-only** change, rotate like the selection; on **column** change, **drop placements** (same policy the selection already uses, because reflow breaks cell anchors). This is a defensible v1 and matches existing project behaviour for the closest analogous feature.
-* `Term::swap_alt` (`:707`) and `reset_state` (`:1835`) must clear/handle graphics. Kitty keeps separate main/alt stores; the simplest faithful v1 is one store per screen, swapped alongside `grid`/`inactive_grid`.
+That was checked against the reference implementation rather than assumed:
+
+* `grman_resize` (`kitty/graphics.c:2678`) marks its `old_lines`/`lines` parameters `UNUSED`, and its only branch requires `columns == old_columns`. **Kitty destroys nothing on any resize.**
+* Placements keep `start_row`/`start_column`; they are re-clamped only when the *cell* size changes — `grman_rescale` (`kitty/graphics.c:2703`) does `MIN(cell_x_offset, cell.width - 1)` per ref.
+* The one thing kitty does drop on resize is "cell images": refs that exist to back Unicode placeholder cells (`screen.c:687-690` calls `grman_remove_all_cell_images`). Those are out of scope here, and `test_gr_unicode_*` notes that cell images are removed on resize.
+
+> **Correction.** An earlier revision of this document asserted that the reference implementation destroys a placement once it scrolls entirely off the top of the screen, and that was implemented. It was a misreading of `test_gr_scroll`. The test asserts `len(layers(s)) == 0` — nothing *displayed* — while `s.grman.image_count == 1`, i.e. still *stored*; the image is destroyed only after `s.historybuf.ynum` further scrolls, when its line leaves the buffer. The rule that does exist is `clear_filter_func` (`kitty/graphics.c:2523`), which keeps a placement while `start_row + effective_num_rows > 0`. It measures the placement's **bottom edge**, not its anchor — which is what lets an image taller than the screen survive at all.
+
+As implemented:
+
+* `placements.scroll(&region, lines)` — move anchors inside the region by the delta.
+* `placements.retain_within(top, bottom)` — called after every scroll and every resize; drops a placement once its bottom edge (`anchor.line + footprint.rows`) passes the oldest line in the buffer. Measuring the extent rather than the anchor is load-bearing: a placement whose anchor has scrolled above the buffer top is still on screen while any of its rows remain.
+* `placements.clamp_offsets(cell)` — on a cell size change, pull pixel offsets back inside the cell they are measured against.
+* `Term::swap_alt` (`:707`) and `reset_state` (`:1835`) clear/handle graphics; one store per screen, swapped alongside `grid`/`inactive_grid`.
+* Memory stays bounded without dropping placements, because `make_room` evicts the oldest images together with their placements. That is what `apply_storage_quota` (`kitty/graphics.c:321`) does by removing whole images, and kitty can afford to be lazier about it because it backs image data with a disk cache.
 
 ### 4.3 Damage (L3)
 
@@ -337,7 +369,19 @@ Negative-z images then show through default-background cells and are occluded on
 * `base64` is already a dependency of `alacritty_terminal`.
 * `png` **is already in the tree** but as `optional = true`, enabled only by the `x11` feature, and *not declared at all on macOS* (`alacritty/Cargo.toml:58, 90-96`); it is currently used only to decode the window icon (`display/window.rs:298-305`). Portable `f=100` requires promoting it to an unconditional dependency. `default-features = false` is already proven sufficient for decoding.
 * `o=z` (zlib) needs `flate2`/`miniz_oxide`; treat as phase 5.
-* **Threading.** `EventLoop` is per-window, but a multi-megabyte PNG decode on the reader thread stalls *that window's* output processing. v1 decodes inline (simple); phase 5 moves decode off the parse path by handing `Arc<[u8]>` compressed bytes to the display thread and decoding on first upload, with `ImageData::generation` guarding cache invalidation.
+* **Threading — as implemented.** v1 decoded inline. That cost 9.4ms per 1200x900 PNG *inside the parser callback*, which holds the terminal lock, so the display could not redraw and input could not be handled for as long as an image took to decode; a directory of photos stalled the terminal for most of a second. v2 queues the payload instead: `GraphicsStore::apc_end` reserves space, anchors the placement and pushes a `DecodeJob`; `Term::take_graphics_jobs` hands the queue to the event loop, which **drops the terminal lock**, decodes, and applies the result under it via `Term::install_graphics`.
+
+  Three consequences are load-bearing and were not foreseen here:
+
+  * **The reply follows the decode.** Whether a payload is acceptable is only known after decoding it, so a deferred command cannot be answered as it is parsed. `Action::is_deferred` suppresses the parse-time reply and `install` produces it; answering from both paths would send two responses for one command.
+  * **An image can be placed before its pixels exist.** It is stored with an empty `pixels` buffer and skipped by the renderer until `install` fills it in. This is what keeps `a=T`'s cursor advance in the same order as the surrounding text; deferring the placement instead would reorder the cursor.
+  * **The backpressure is not reading the PTY.** The reader stops until the outstanding decode finishes, so a client sending a directory blocks in `write` rather than filling memory with undecoded payloads, and keystrokes keep working because they do not travel that path. Decoding one image at a time is deliberate for this reason; a worker pool would need its own bound.
+
+  *Measured*, `kitten icat` over eight 1200x900 photos, release: worst case 99.8us parsing and 91.1us applying a result, against 4.4ms spent decompressing each one. `kitten icat` sends `f=24` with `o=z`, so decompression dominates and it now happens off-lock.
+
+  *Known cost:* `f=100` **with** `o=z` is still expanded under the lock, because a PNG keeps its dimensions in a header that must be read to anchor the placement.
+
+  The alternative sketched above in this section — decoding on the display thread at first upload — was rejected: the display thread holds the same lock while drawing, so it relocates the stall rather than removing it.
 
 ### 4.6 Responses
 
@@ -405,7 +449,7 @@ Test against real clients and fix what breaks: `kitten icat`, `timg`, `chafa --f
 ### Phase 5 — Hardening (5–10d)
 
 * `t=f`/`t=t`/`t=s` with the full security checklist (§4.8), config-gated.
-* `o=z` zlib; off-parse-thread decode; per-region damage instead of full damage; texture cache tuning.
+* Parallel decode (currently one image at a time, off-lock); per-region damage instead of full damage; texture cache tuning.
 * `I=` image numbers; `U=1` Unicode placeholders incl. the `rowcolumn-diacritics` table.
 * Animation (`a=f`/`a=a`/`a=c`) if desired.
 * Docs: `extra/man/alacritty-escapes.7.scd` APC entry, CHANGELOG, `docs/features.md`.

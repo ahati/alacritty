@@ -144,20 +144,51 @@ fn graphics_scroll_with_the_text() {
 }
 
 #[test]
-fn a_placement_scrolled_off_the_screen_is_dropped() {
-    let (mut term, _recorder) = terminal();
+fn a_placement_outlives_the_screen_but_not_the_buffer() {
+    let recorder = Recorder::default();
+    let mut config = Config::default();
+    config.scrolling_history = 4;
+    let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder);
     let mut parser = Processor::new();
 
-    // The 1x1 image covers a single cell and is destroyed once it scrolls off.
     feed(&mut term, &mut parser, &transmit(1, WHITE_PIXEL));
     assert_eq!(term.graphics().placements().len(), 1);
 
+    // Scrolling the image off the *screen* keeps it, because the line it is
+    // anchored to is still in the scrollback and scrolling back shows it again.
     feed(&mut term, &mut parser, b"\x1b[24;1H\n");
+    assert_eq!(term.graphics().placements().len(), 1);
 
+    // It goes once that line is discarded from the buffer.
+    for _ in 0..8 {
+        feed(&mut term, &mut parser, b"\x1b[24;1H\n");
+    }
     assert!(
         term.graphics().placements().is_empty(),
-        "a placement that scrolled entirely off the screen must be destroyed"
+        "a placement whose line left the buffer must be dropped"
     );
+}
+
+#[test]
+fn a_column_resize_keeps_placements() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+
+    feed(&mut term, &mut parser, &transmit(1, WHITE_PIXEL));
+    assert_eq!(term.graphics().placements().len(), 1);
+    let used = term.graphics().memory_used();
+    assert!(used > 0);
+
+    term.resize(TermSize::new(COLUMNS - 20, LINES));
+    assert_eq!(term.graphics().placements().len(), 1, "narrower must keep the image");
+
+    term.resize(TermSize::new(COLUMNS + 20, LINES));
+    assert_eq!(term.graphics().placements().len(), 1, "wider must keep the image");
+
+    // Widening far enough to wrap the text must not disturb it either.
+    term.resize(TermSize::new(COLUMNS / 4, LINES));
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(term.graphics().memory_used(), used, "the pixels must survive too");
 }
 
 #[test]

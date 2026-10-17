@@ -16,14 +16,28 @@ Notable changes to the `alacritty_terminal` crate are documented in its
   `f=100`, zlib compression, direct transmission, placements, z-index, deletion and
   chunked transfers), configurable through `terminal.graphics`
 
+### Changed
+
+- Image pixels are stored in the layout they were transmitted in instead of being
+  expanded to RGBA, which takes a 1200x900 `f=24` image from 4.1 MiB to 3.1 MiB and
+  halves the time spent storing it
+- Image decoding no longer happens while the terminal is locked, so the display keeps
+  drawing and input keeps being handled while a large image is decoded
+
 ### Fixed
 
 - Primary device attributes reply (`CSI ? 6 c`) not being recognised by `kitten icat`,
   which requires a reply longer than three bytes and otherwise times out
 - Images not moving the cursor past the placement, which left the shell prompt and
   any following output hidden underneath the image
-- Images disappearing once their anchor scrolled above the viewport, instead of
-  being clipped by the window
+- Images disappearing when the window was resized. Placements now survive a
+  resize, including a column change, as they do in the reference implementation
+- Images being destroyed as soon as they scrolled above the viewport, rather than
+  when the line they are anchored to leaves the scrollback. Scrolling back now
+  brings an image into view again
+- New images being silently rejected once the graphics memory limit was reached,
+  rather than the oldest images being evicted to make room. With `q=2` the client is
+  not told, so the images simply never appeared
 
 ### Packaging
 
