@@ -1328,7 +1328,16 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                // The capability list must include at least one parameter
+                // beyond the VT102 level: `kitten icat` only recognises a
+                // device attributes reply whose payload is longer than three
+                // bytes, so a bare `\x1b[?6c` makes it wait for a reply that
+                // never comes and time out instead of falling back.
+                //
+                // `22` (ANSI colour) is advertised because it is true; no
+                // parameter is advertised for a capability this terminal does
+                // not implement.
+                let text = String::from("\x1b[?6;22c");
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             Some('>') => {

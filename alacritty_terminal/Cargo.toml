@@ -21,6 +21,7 @@ bitflags = "2.4.1"
 home = "0.5.5"
 libc = "0.2"
 log = "0.4"
+miniz_oxide = "0.8"
 parking_lot = "0.12.0"
 png = { version = "0.17.5", default-features = false }
 polling = "3.8.0"

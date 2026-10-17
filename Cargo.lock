@@ -103,6 +103,7 @@ dependencies = [
  "home",
  "libc",
  "log",
+ "miniz_oxide",
  "miow",
  "parking_lot",
  "piper",

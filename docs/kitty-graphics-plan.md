@@ -26,6 +26,16 @@
 >    when the font size changes.
 > 5. The payload of `t=f`/`t=t`/`t=s` is a **path, not base64**, so unsupported
 >    mediums must be refused *before* base64 decoding.
+> 6. **`o=z` (zlib) is not optional**, contrary to the ranking in §1. `kitten icat`
+>    compresses every transmission with it, so without zlib support the primary
+>    client cannot display anything.
+> 7. **Alacritty's primary device attributes reply blocks kitty clients.** In
+>    kitty's `escape-code-parser.go` the CSI buffer *includes* the final byte, so
+>    `ESC [ ? 6 c` yields a three-byte payload; `kitten icat` only quits its
+>    capability probe on `len(payload) > 3`, so it waits out its timeout on any
+>    terminal reporting a bare `6`. Corrected to `ESC [ ? 6 ; 22 c` (VT102 plus
+>    ANSI colour — no capability is claimed that the terminal lacks). This is
+>    independent of graphics support and would equally affect a stock Alacritty.
 
 Status: analysis / proposal. Nothing in this document is implemented yet.
 Base: `/workspaces/alacritty-fork` @ `54214706` (`alacritty 0.18.0-dev`, `alacritty_terminal 0.26.1-dev`).

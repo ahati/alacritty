@@ -30,7 +30,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::index::{Line, Point};
 
-use self::command::{Action, Command, Medium};
+use self::command::{Action, Command, Compression, Medium};
 use self::image::{ImageData, ImageStore};
 use self::placement::{Placement, PlacementStore, SourceRect};
 
@@ -97,6 +97,8 @@ pub enum GraphicsError {
     NotEnoughData,
     /// The image data could not be decoded.
     BadData,
+    /// The payload could not be decompressed.
+    BadCompression,
     /// The image exceeds the configured dimension limit.
     TooLarge,
     /// There is no room left for the image.
@@ -117,6 +119,7 @@ impl GraphicsError {
             Self::Invalid => "EINVAL",
             Self::NotEnoughData => "ENODATA",
             Self::BadData => "EBADPNG",
+            Self::BadCompression => "EINVAL",
             Self::TooLarge => "EFBIG",
             Self::NoSpace => "ENOSPC",
             Self::BadSequence => "EILSEQ",
@@ -132,6 +135,7 @@ impl GraphicsError {
             Self::Invalid => "invalid arguments",
             Self::NotEnoughData => "not enough image data",
             Self::BadData => "could not decode image data",
+            Self::BadCompression => "could not decompress image data",
             Self::TooLarge => "image too large",
             Self::NoSpace => "image storage limit reached",
             Self::BadSequence => "unexpected chunk sequence",
@@ -432,7 +436,7 @@ impl GraphicsStore {
                 Some(internal_id) => self.place(command, internal_id, cursor).map(|()| true),
                 None => Err(GraphicsError::NotFound),
             },
-            Action::Query => self.validate(command, &data).map(|()| false),
+            Action::Query => self.validate(command, data).map(|()| false),
             Action::Delete => self.delete(command, cursor).map(|()| true),
             Action::Frame | Action::Animate | Action::Compose => Err(GraphicsError::Unsupported),
         };
@@ -445,6 +449,7 @@ impl GraphicsStore {
 
     /// Decode and store image data.
     fn transmit(&mut self, command: &Command, data: Vec<u8>) -> Result<u32, GraphicsError> {
+        let data = decompress(command, data, decompression_limit(command, &self.config))?;
         let decoded = image::decode(
             command.format,
             &data,
@@ -467,10 +472,11 @@ impl GraphicsStore {
     }
 
     /// Validate image data without storing it (`a=q`).
-    fn validate(&self, command: &Command, data: &[u8]) -> Result<(), GraphicsError> {
+    fn validate(&self, command: &Command, data: Vec<u8>) -> Result<(), GraphicsError> {
+        let data = decompress(command, data, decompression_limit(command, &self.config))?;
         image::decode(
             command.format,
-            data,
+            &data,
             command.source_width,
             command.source_height,
             self.config.max_image_dimension,
@@ -676,16 +682,42 @@ fn clamp_to_u16(value: u32) -> u16 {
 /// Reject transmission features this implementation does not support.
 ///
 /// File, temporary file and shared memory mediums would let a client make the
-/// terminal read arbitrary paths, and zlib compression is not implemented.
+/// terminal read arbitrary paths, so only direct transmission is accepted.
 fn unsupported_transmission(command: &Command) -> Result<(), GraphicsError> {
     if command.medium != Medium::Direct {
         return Err(GraphicsError::Unsupported);
     }
-    if command.compression.is_some() {
-        return Err(GraphicsError::Unsupported);
-    }
 
     Ok(())
+}
+
+/// Undo the payload compression requested by the command, if any.
+///
+/// Kitty compresses with zlib *before* base64 encoding, so this runs on the
+/// already decoded payload. `limit` bounds the output so that a small payload
+/// cannot expand into an arbitrarily large allocation.
+fn decompress(command: &Command, data: Vec<u8>, limit: usize) -> Result<Vec<u8>, GraphicsError> {
+    match command.compression {
+        None => Ok(data),
+        Some(Compression::Zlib) => {
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data, limit)
+                .map_err(|_| GraphicsError::BadCompression)
+        },
+    }
+}
+
+/// Upper bound on the bytes a payload may decompress to.
+///
+/// Raw formats declare their exact size, so anything larger is invalid. PNG
+/// streams carry their own dimensions, so the configured memory limit is used
+/// instead.
+fn decompression_limit(command: &Command, config: &GraphicsConfig) -> usize {
+    let bytes_per_pixel = command.format.bytes_per_pixel().unwrap_or(image::RGBA_CHANNELS);
+    let declared = (command.source_width as usize)
+        .saturating_mul(command.source_height as usize)
+        .saturating_mul(bytes_per_pixel);
+
+    if declared > 0 { declared } else { config.memory_limit }
 }
 
 #[cfg(test)]
@@ -721,6 +753,39 @@ mod tests {
 
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=6;OK\x1b\\"));
         assert_eq!(store.placements().len(), 1);
+    }
+
+    #[test]
+    fn decompresses_a_zlib_payload() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+
+        // This is the shape `kitten icat` uses: zlib-compressed RGB, sent with
+        // a silenced response.
+        let pixels = [255u8, 0, 0, 255];
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&pixels, 6);
+        let payload = BASE64.encode(&compressed);
+        let sequence = format!("Gf=32,s=1,v=1,a=T,i=11,o=z;{payload}");
+
+        let update = apc(&mut store, &sequence);
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=11;OK\x1b\\"));
+        assert_eq!(store.placements().len(), 1);
+        assert_eq!(store.memory_used(), 4);
+    }
+
+    #[test]
+    fn rejects_corrupt_compressed_payloads() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload = BASE64.encode(b"not zlib at all");
+        let sequence = format!("Gf=32,s=1,v=1,a=T,i=12,o=z;{payload}");
+
+        let update = apc(&mut store, &sequence);
+
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=12;EINVAL:could not decompress image data\x1b\\")
+        );
+        assert!(store.placements().is_empty());
     }
 
     #[test]
