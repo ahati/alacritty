@@ -117,15 +117,36 @@ fn chunked_transmission_reassembles_across_apc_strings() {
 fn graphics_scroll_with_the_text() {
     let (mut term, _recorder) = terminal();
     let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
 
-    // Place an image, then move the cursor to the last line and scroll up.
-    feed(&mut term, &mut parser, &transmit(1, WHITE_PIXEL));
+    // A 20x30 image covers 2x2 cells, so it stays partly visible after one line
+    // of scrolling.
+    let pixels = vec![0u8; 20 * 30 * 3];
+    let sequence = format!("\x1b_Gf=24,s=20,v=30,a=T,i=1;{}\x1b\\", BASE64.encode(&pixels));
+    feed(&mut term, &mut parser, sequence.as_bytes());
     let anchor = term.graphics().placements()[0].anchor;
 
     feed(&mut term, &mut parser, b"\x1b[24;1H\n");
 
     let moved = term.graphics().placements()[0].anchor;
     assert_eq!(moved.line, anchor.line - 1);
+}
+
+#[test]
+fn a_placement_scrolled_off_the_screen_is_dropped() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // The 1x1 image covers a single cell and is destroyed once it scrolls off.
+    feed(&mut term, &mut parser, &transmit(1, WHITE_PIXEL));
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    feed(&mut term, &mut parser, b"\x1b[24;1H\n");
+
+    assert!(
+        term.graphics().placements().is_empty(),
+        "a placement that scrolled entirely off the screen must be destroyed"
+    );
 }
 
 #[test]

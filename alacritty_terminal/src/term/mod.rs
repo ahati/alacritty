@@ -14,7 +14,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
-use crate::graphics::{CursorAdvance, GraphicsConfig, GraphicsStore};
+use crate::graphics::{CellFootprint, GraphicsConfig, GraphicsStore};
 use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
@@ -692,7 +692,7 @@ impl<T> Term<T> {
     ///
     /// Without this, whatever the client writes next lands underneath the
     /// image, which for a large image means the shell prompt never appears.
-    fn advance_cursor_after_placement(&mut self, advance: CursorAdvance)
+    fn advance_cursor_after_placement(&mut self, advance: CellFootprint)
     where
         T: EventListener,
     {

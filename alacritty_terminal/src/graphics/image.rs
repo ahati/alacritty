@@ -30,6 +30,9 @@ pub struct ImageData {
     /// Bumped whenever the image data is replaced, so renderers can invalidate
     /// cached textures.
     pub generation: u64,
+    /// Whether the client marked the image as transient (`N=1`), which makes it
+    /// a preferred eviction candidate.
+    pub transient: bool,
 }
 
 impl ImageData {
@@ -142,6 +145,25 @@ impl ImageStore {
         self.images.iter().map(|(internal_id, image)| (*internal_id, image))
     }
 
+    /// Internal identifiers ordered oldest first.
+    ///
+    /// "Oldest" is the generation the image data was written at, so an image
+    /// that was re-transmitted counts as recently used.
+    pub fn by_age(&self) -> Vec<u32> {
+        let mut images: Vec<(bool, u64, u32)> = self
+            .images
+            .iter()
+            .map(|(internal_id, image)| {
+                // Transient images sort first, so they are evicted first
+                // regardless of age.
+                (!image.transient, image.generation, *internal_id)
+            })
+            .collect();
+        images.sort_unstable();
+
+        images.into_iter().map(|(_, _, internal_id)| internal_id).collect()
+    }
+
     /// Whether storing `bytes` more pixel data would exceed the quota.
     pub fn is_full(&self, bytes: usize) -> bool {
         self.used.saturating_add(bytes) > self.limit
@@ -158,6 +180,7 @@ impl ImageStore {
         client_id: u32,
         number: u32,
         decoded: Decoded,
+        transient: bool,
     ) -> (u32, Arc<ImageData>) {
         let internal_id = match self.by_client_id.get(&client_id) {
             Some(internal_id) if client_id != 0 => {
@@ -182,6 +205,7 @@ impl ImageStore {
             height: decoded.height,
             pixels: decoded.pixels.into(),
             generation: self.generation,
+            transient,
         });
 
         self.used += image.byte_len();
@@ -424,12 +448,12 @@ mod tests {
         let decoded = || Decoded { width: 1, height: 1, pixels: vec![0; 4] };
 
         let mut store = ImageStore::new(1024);
-        let (first, image) = store.insert(5, 0, decoded());
+        let (first, image) = store.insert(5, 0, decoded(), false);
         assert_eq!(image.generation, 1);
         assert_eq!(store.used(), 4);
 
         // Re-transmitting the same client id replaces in place.
-        let (second, replaced) = store.insert(5, 0, decoded());
+        let (second, replaced) = store.insert(5, 0, decoded(), false);
         assert_eq!(first, second);
         assert!(replaced.generation > image.generation);
         assert_eq!(store.len(), 1);
@@ -445,12 +469,12 @@ mod tests {
         let mut store = ImageStore::new(1024);
         let decoded = Decoded { width: 1, height: 1, pixels: vec![0; 4] };
 
-        let (by_id, _) = store.insert(7, 0, decoded);
+        let (by_id, _) = store.insert(7, 0, decoded, false);
         assert_eq!(store.resolve(7, 0), Some(by_id));
         assert_eq!(store.resolve(0, 0), None);
 
         let decoded = Decoded { width: 1, height: 1, pixels: vec![0; 4] };
-        let (by_number, _) = store.insert(0, 3, decoded);
+        let (by_number, _) = store.insert(0, 3, decoded, false);
         assert_eq!(store.resolve(0, 3), Some(by_number));
         assert_eq!(store.resolve(0, 4), None);
     }

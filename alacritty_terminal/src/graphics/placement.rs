@@ -18,6 +18,13 @@ pub struct SourceRect {
     pub height: u32,
 }
 
+/// Size of a placement in cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellFootprint {
+    pub columns: u16,
+    pub rows: u16,
+}
+
 /// A placement of an image, anchored to the cell it was put at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
@@ -27,6 +34,8 @@ pub struct Placement {
     pub placement_id: u32,
     /// Cell the placement is anchored to, in absolute grid coordinates.
     pub anchor: Point,
+    /// Resolved size in cells, used for scrolling and cursor movement.
+    pub footprint: CellFootprint,
     /// Horizontal offset inside the anchor cell, in pixels.
     pub offset_x: u16,
     /// Vertical offset inside the anchor cell, in pixels.
@@ -177,6 +186,16 @@ impl PlacementStore {
                 placement.anchor.line = region.start;
             }
         }
+
+        // The reference implementation destroys a placement once it has
+        // scrolled entirely off the top of the screen, even though the image
+        // data survives in the scrollback. Keeping them would pile up images
+        // that can never come back into view, and would keep their data
+        // permanently un-evictable.
+        self.placements.retain(|placement| {
+            let bottom = placement.anchor.line.0 + i32::from(placement.footprint.rows);
+            bottom > 0
+        });
     }
 
     /// Drop placements anchored outside the given line range.
@@ -212,6 +231,7 @@ mod tests {
             internal_id,
             placement_id: 0,
             anchor: Point::new(Line(line), Column(column)),
+            footprint: CellFootprint { columns: 2, rows: 2 },
             offset_x: 0,
             offset_y: 0,
             columns: 2,
@@ -279,6 +299,21 @@ mod tests {
         assert!(!placement.contains(Point::new(Line(6), Column(3))));
         assert!(!placement.contains(Point::new(Line(4), Column(5))));
         assert!(!placement.contains(Point::new(Line(3), Column(3))));
+    }
+
+    #[test]
+    fn a_placement_scrolled_off_the_screen_is_destroyed() {
+        let mut store = PlacementStore::new();
+        store.put(placement(1, 0, 1));
+
+        // Still partly on screen after scrolling up by two.
+        store.scroll(&(Line(0)..Line(24)), 2);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.iter().next().unwrap().anchor.line, Line(-1));
+
+        // Now entirely above the top of the screen.
+        store.scroll(&(Line(0)..Line(24)), 2);
+        assert_eq!(store.len(), 0, "the reference implementation destroys it");
     }
 
     #[test]

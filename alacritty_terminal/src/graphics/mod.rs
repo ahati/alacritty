@@ -32,6 +32,8 @@ use crate::index::{Line, Point};
 
 use self::command::{Action, Command, Compression, CursorMovement, Medium};
 use self::image::{ImageData, ImageStore};
+pub use self::placement::CellFootprint;
+
 use self::placement::{Placement, PlacementStore, SourceRect};
 
 /// Byte introducing an APC graphics command.
@@ -159,17 +161,7 @@ pub struct GraphicsUpdate {
     /// Whether displayed content changed and needs damage.
     pub changed: bool,
     /// Cells the cursor must advance by, if an image was placed.
-    pub cursor_advance: Option<CursorAdvance>,
-}
-
-/// Number of cells the cursor moves after an image is displayed.
-///
-/// The protocol requires the cursor to end up past the placement, otherwise
-/// whatever the client writes next is drawn underneath the image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CursorAdvance {
-    pub columns: u16,
-    pub rows: u16,
+    pub cursor_advance: Option<CellFootprint>,
 }
 
 /// Which part of an APC string is currently being received.
@@ -504,7 +496,8 @@ impl GraphicsStore {
             self.placements.remove_image(existing);
         }
 
-        let (internal_id, _) = self.images.insert(command.image_id, command.image_number, decoded);
+        let (internal_id, _) =
+            self.images.insert(command.image_id, command.image_number, decoded, command.transient);
 
         Ok(internal_id)
     }
@@ -528,7 +521,7 @@ impl GraphicsStore {
         command: &Command,
         internal_id: u32,
         cursor: Point,
-    ) -> Result<Option<CursorAdvance>, GraphicsError> {
+    ) -> Result<Option<CellFootprint>, GraphicsError> {
         let image = self.images.get(internal_id).ok_or(GraphicsError::NotFound)?;
 
         let (width, height) = (image.width, image.height);
@@ -539,10 +532,12 @@ impl GraphicsStore {
             height: if command.src_height == 0 { height } else { command.src_height },
         };
 
+        let footprint = resolve_footprint(command, source, self.cell_size);
         let placement = Placement {
             internal_id,
             placement_id: command.placement_id,
             anchor: cursor,
+            footprint,
             offset_x: clamp_to_u16(command.cell_offset_x),
             offset_y: clamp_to_u16(command.cell_offset_y),
             // A size of zero means "as many cells as needed", which the renderer
@@ -555,8 +550,7 @@ impl GraphicsStore {
         };
 
         let advance = if command.cursor_movement == CursorMovement::Move && !placement.is_virtual {
-            let footprint = resolve_footprint(command, source, self.cell_size);
-            Some(CursorAdvance { columns: footprint.0, rows: footprint.1 })
+            Some(placement.footprint)
         } else {
             None
         };
@@ -658,16 +652,30 @@ impl GraphicsStore {
             return Ok(());
         }
 
-        // Evict anything no placement refers to before giving up.
+        // Prefer images nothing refers to.
         let referenced: Vec<u32> =
             self.placements.iter().map(|placement| placement.internal_id).collect();
         let is_referenced = |internal_id: u32| referenced.contains(&internal_id);
 
         if self.images.evict_unreferenced(needed, &is_referenced) {
-            Ok(())
-        } else {
-            Err(GraphicsError::NoSpace)
+            return Ok(());
         }
+
+        // Everything left is on screen, so images have to go, along with their
+        // placements. Dropping the newest instead would silently discard the
+        // image the client just asked to display.
+        //
+        // Images the client marked as transient (`N=1`) go first, regardless of
+        // age, as the protocol and the reference implementation require.
+        for internal_id in self.images.by_age() {
+            if !self.images.is_full(needed) {
+                break;
+            }
+            self.placements.remove_image(internal_id);
+            self.images.remove(internal_id);
+        }
+
+        if self.images.is_full(needed) { Err(GraphicsError::NoSpace) } else { Ok(()) }
     }
 
     /// Build a successful response.
@@ -730,7 +738,11 @@ fn clamp_to_u16(value: u32) -> u16 {
 /// Mirrors the reference implementation: a cell count of zero means "as many
 /// cells as needed". With neither axis given the footprint covers the image's
 /// pixel size, and with one axis given the other follows from the aspect ratio.
-fn resolve_footprint(command: &Command, source: SourceRect, cell_size: (u16, u16)) -> (u16, u16) {
+fn resolve_footprint(
+    command: &Command,
+    source: SourceRect,
+    cell_size: (u16, u16),
+) -> CellFootprint {
     /// Smallest footprint that can hold anything.
     const MIN_CELLS: f64 = 1.;
 
@@ -765,7 +777,10 @@ fn resolve_footprint(command: &Command, source: SourceRect, cell_size: (u16, u16
         };
     }
 
-    (clamp_to_u16(columns.max(MIN_CELLS) as u32), clamp_to_u16(rows.max(MIN_CELLS) as u32))
+    CellFootprint {
+        columns: clamp_to_u16(columns.max(MIN_CELLS) as u32),
+        rows: clamp_to_u16(rows.max(MIN_CELLS) as u32),
+    }
 }
 
 /// Reject transmission features this implementation does not support.
@@ -856,7 +871,7 @@ mod tests {
 
         let update = apc(&mut store, &sequence);
 
-        assert_eq!(update.cursor_advance, Some(CursorAdvance { columns: 3, rows: 3 }));
+        assert_eq!(update.cursor_advance, Some(CellFootprint { columns: 3, rows: 3 }));
     }
 
     #[test]
@@ -870,7 +885,7 @@ mod tests {
 
         let update = apc(&mut store, &sequence);
 
-        assert_eq!(update.cursor_advance, Some(CursorAdvance { columns: 7, rows: 2 }));
+        assert_eq!(update.cursor_advance, Some(CellFootprint { columns: 7, rows: 2 }));
     }
 
     #[test]
@@ -1069,21 +1084,42 @@ mod tests {
     }
 
     #[test]
-    fn quota_is_enforced() {
+    fn the_oldest_images_are_evicted_first() {
+        // Room for exactly one 1x1 RGBA image.
         let config = GraphicsConfig { memory_limit: 4, ..GraphicsConfig::default() };
         let mut store = GraphicsStore::new(config);
 
         let first = format!("Gf=32,s=1,v=1,a=T,i=1;{}", red_pixel());
         assert_eq!(apc(&mut store, &first).response.as_deref(), Some("\x1b_Gi=1;OK\x1b\\"));
 
-        // The second image cannot fit while the first is referenced.
+        // The second image cannot fit alongside the first, so the oldest one is
+        // dropped rather than the new one being rejected: the client is asking
+        // to display the new one now.
         let second = format!("Gf=32,s=1,v=1,a=T,i=2;{}", red_pixel());
-        let update = apc(&mut store, &second);
+        assert_eq!(apc(&mut store, &second).response.as_deref(), Some("\x1b_Gi=2;OK\x1b\\"));
+
+        assert_eq!(store.memory_used(), 4);
+        let placements = store.placements();
+        assert_eq!(placements.len(), 1, "the evicted image's placement is dropped too");
+        assert_eq!(store.image(placements[0].internal_id).unwrap().client_id, 2);
+    }
+
+    #[test]
+    fn an_image_larger_than_the_limit_is_still_rejected() {
+        let config = GraphicsConfig { memory_limit: 4, ..GraphicsConfig::default() };
+        let mut store = GraphicsStore::new(config);
+
+        // Two pixels of RGBA: nothing can be evicted to make room for it.
+        let pixels = BASE64.encode([0u8; 8]);
+        let sequence = format!("Gf=32,s=2,v=1,a=T,i=3;{pixels}");
+
+        let update = apc(&mut store, &sequence);
+
         assert_eq!(
             update.response.as_deref(),
-            Some("\x1b_Gi=2;ENOSPC:image storage limit reached\x1b\\")
+            Some("\x1b_Gi=3;ENOSPC:image storage limit reached\x1b\\")
         );
-        assert_eq!(store.memory_used(), 4);
+        assert!(store.placements().is_empty());
     }
 
     #[test]
