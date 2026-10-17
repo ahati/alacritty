@@ -36,6 +36,16 @@
 >    terminal reporting a bare `6`. Corrected to `ESC [ ? 6 ; 22 c` (VT102 plus
 >    ANSI colour — no capability is claimed that the terminal lacks). This is
 >    independent of graphics support and would equally affect a stock Alacritty.
+> 8. **Placing an image must move the cursor**, and a client relies on it. Omitting
+>    it meant the shell prompt was written underneath the image: with a large image
+>    the prompt was completely invisible, which looks like the terminal hanging.
+>    Kitty moves the cursor by the placement's cell footprint and *scrolls* when
+>    that passes the last line; clamping instead leaves the cursor inside the
+>    image. Resolving the footprint needs the cell size in pixels, which the core
+>    did not have — the display now reports it via `Term::set_cell_size`.
+> 9. **Skipping placements whose anchor is off-screen is wrong.** Only the anchor's
+>    line is tested, but an image may be many rows tall, so an image that has
+>    scrolled partly off the top must be clipped by the window, not dropped.
 
 Status: analysis / proposal. Nothing in this document is implemented yet.
 Base: `/workspaces/alacritty-fork` @ `54214706` (`alacritty 0.18.0-dev`, `alacritty_terminal 0.26.1-dev`).

@@ -14,7 +14,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
-use crate::graphics::{GraphicsConfig, GraphicsStore};
+use crate::graphics::{CursorAdvance, GraphicsConfig, GraphicsStore};
 use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
@@ -678,6 +678,43 @@ impl<T> Term<T> {
         &self.graphics
     }
 
+    /// Report the size of a single cell in pixels.
+    ///
+    /// The core only knows its dimensions in cells, but the graphics protocol
+    /// resolves image sizes given in cells from the pixel size of a cell.
+    #[inline]
+    pub fn set_cell_size(&mut self, width: u16, height: u16) {
+        self.graphics.set_cell_size(width, height);
+        self.inactive_graphics.set_cell_size(width, height);
+    }
+
+    /// Move the cursor past an image that was just displayed.
+    ///
+    /// Without this, whatever the client writes next lands underneath the
+    /// image, which for a large image means the shell prompt never appears.
+    fn advance_cursor_after_placement(&mut self, advance: CursorAdvance)
+    where
+        T: EventListener,
+    {
+        let rows = i32::from(advance.rows.saturating_sub(1));
+        let last_line = self.screen_lines() as i32 - 1;
+        let target = self.grid.cursor.point.line.0 + rows;
+
+        // When the image ends below the last line the screen scrolls, as in the
+        // reference implementation. Clamping instead would leave the cursor
+        // inside the image, hiding whatever the client writes next.
+        if target > last_line {
+            self.scroll_up((target - last_line) as usize);
+            self.grid.cursor.point.line = Line(last_line);
+        } else {
+            self.grid.cursor.point.line = Line(target);
+        }
+
+        let last_column = self.last_column();
+        self.grid.cursor.point.column =
+            cmp::min(self.grid.cursor.point.column + usize::from(advance.columns), last_column);
+    }
+
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
         let old_cols = self.columns();
@@ -1120,6 +1157,10 @@ impl<T: EventListener> Handler for Term<T> {
 
         if let Some(response) = update.response {
             self.event_proxy.send_event(Event::PtyWrite(response));
+        }
+
+        if let Some(advance) = update.cursor_advance {
+            self.advance_cursor_after_placement(advance);
         }
 
         if update.changed {

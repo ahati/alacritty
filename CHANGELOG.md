@@ -20,6 +20,10 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 - Primary device attributes reply (`CSI ? 6 c`) not being recognised by `kitten icat`,
   which requires a reply longer than three bytes and otherwise times out
+- Images not moving the cursor past the placement, which left the shell prompt and
+  any following output hidden underneath the image
+- Images disappearing once their anchor scrolled above the viewport, instead of
+  being clipped by the window
 
 ### Packaging
 

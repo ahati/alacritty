@@ -720,6 +720,10 @@ impl Display {
             self.window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
         }
 
+        // The graphics protocol resolves image sizes given in cells from the
+        // pixel size of a cell, which only the display knows.
+        terminal.set_cell_size(cell_width.max(1.) as u16, cell_height.max(1.) as u16);
+
         // Resize when terminal when its dimensions have changed.
         if self.size_info.screen_lines() != new_size.screen_lines
             || self.size_info.columns() != new_size.columns()

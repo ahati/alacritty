@@ -30,7 +30,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::index::{Line, Point};
 
-use self::command::{Action, Command, Compression, Medium};
+use self::command::{Action, Command, Compression, CursorMovement, Medium};
 use self::image::{ImageData, ImageStore};
 use self::placement::{Placement, PlacementStore, SourceRect};
 
@@ -55,6 +55,12 @@ pub const DEFAULT_MAX_IMAGE_DIMENSION: u32 = 10_000;
 
 /// Default maximum bytes of decoded image data to keep resident.
 pub const DEFAULT_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
+
+/// Cell size assumed until the display reports the real one.
+///
+/// It only affects how image sizes given in cells are resolved, so a wrong
+/// guess merely moves the cursor by an odd number of cells.
+const DEFAULT_CELL_SIZE: (u16, u16) = (1, 1);
 
 /// Configuration for graphics support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +158,18 @@ pub struct GraphicsUpdate {
     pub response: Option<String>,
     /// Whether displayed content changed and needs damage.
     pub changed: bool,
+    /// Cells the cursor must advance by, if an image was placed.
+    pub cursor_advance: Option<CursorAdvance>,
+}
+
+/// Number of cells the cursor moves after an image is displayed.
+///
+/// The protocol requires the cursor to end up past the placement, otherwise
+/// whatever the client writes next is drawn underneath the image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorAdvance {
+    pub columns: u16,
+    pub rows: u16,
 }
 
 /// Which part of an APC string is currently being received.
@@ -223,6 +241,11 @@ pub struct GraphicsStore {
     config: GraphicsConfig,
     images: ImageStore,
     placements: PlacementStore,
+    /// Size of a single cell in pixels.
+    ///
+    /// The core has no font metrics of its own, so the display reports this.
+    /// The protocol resolves image sizes given in cells from it.
+    cell_size: (u16, u16),
     /// Transmission currently being assembled, if any.
     transfer: Option<Transfer>,
     /// Control data of the APC currently being received.
@@ -250,6 +273,7 @@ impl GraphicsStore {
             images: ImageStore::new(config.memory_limit),
             config,
             placements: PlacementStore::new(),
+            cell_size: DEFAULT_CELL_SIZE,
             transfer: None,
             control: Vec::new(),
             chars: Vec::new(),
@@ -257,6 +281,14 @@ impl GraphicsStore {
             started: false,
             ignoring: false,
         }
+    }
+
+    /// Report the size of a single cell in pixels.
+    ///
+    /// The core has no font metrics, so the display supplies these. They only
+    /// affect how image sizes given in cells are resolved.
+    pub fn set_cell_size(&mut self, width: u16, height: u16) {
+        self.cell_size = (width.max(1), height.max(1));
     }
 
     /// Current configuration.
@@ -427,22 +459,28 @@ impl GraphicsStore {
     /// Carry out a parsed command.
     fn dispatch(&mut self, command: &Command, data: Vec<u8>, cursor: Point) -> GraphicsUpdate {
         let outcome = match command.action {
-            Action::Transmit => self.transmit(command, data).map(|_| true),
+            Action::Transmit => self.transmit(command, data).map(|_| (true, None)),
             Action::TransmitAndDisplay => self
                 .transmit(command, data)
                 .and_then(|internal_id| self.place(command, internal_id, cursor))
-                .map(|()| true),
+                .map(|advance| (true, advance)),
             Action::Put => match self.resolve(command) {
-                Some(internal_id) => self.place(command, internal_id, cursor).map(|()| true),
+                Some(internal_id) => {
+                    self.place(command, internal_id, cursor).map(|advance| (true, advance))
+                },
                 None => Err(GraphicsError::NotFound),
             },
-            Action::Query => self.validate(command, data).map(|()| false),
-            Action::Delete => self.delete(command, cursor).map(|()| true),
+            Action::Query => self.validate(command, data).map(|()| (false, None)),
+            Action::Delete => self.delete(command, cursor).map(|()| (true, None)),
             Action::Frame | Action::Animate | Action::Compose => Err(GraphicsError::Unsupported),
         };
 
         match outcome {
-            Ok(changed) => self.success(command, changed),
+            Ok((changed, cursor_advance)) => {
+                let mut update = self.success(command, changed);
+                update.cursor_advance = cursor_advance;
+                update
+            },
             Err(error) => self.failure(command, error),
         }
     }
@@ -490,7 +528,7 @@ impl GraphicsStore {
         command: &Command,
         internal_id: u32,
         cursor: Point,
-    ) -> Result<(), GraphicsError> {
+    ) -> Result<Option<CursorAdvance>, GraphicsError> {
         let image = self.images.get(internal_id).ok_or(GraphicsError::NotFound)?;
 
         let (width, height) = (image.width, image.height);
@@ -507,8 +545,8 @@ impl GraphicsStore {
             anchor: cursor,
             offset_x: clamp_to_u16(command.cell_offset_x),
             offset_y: clamp_to_u16(command.cell_offset_y),
-            // A size of zero means "as many cells as needed", which only the
-            // renderer can resolve because the core has no font metrics.
+            // A size of zero means "as many cells as needed", which the renderer
+            // resolves. The cell footprint is only needed to move the cursor.
             columns: clamp_to_u16(command.columns),
             rows: clamp_to_u16(command.rows),
             src: source,
@@ -516,9 +554,16 @@ impl GraphicsStore {
             is_virtual: command.virtual_placement,
         };
 
+        let advance = if command.cursor_movement == CursorMovement::Move && !placement.is_virtual {
+            let footprint = resolve_footprint(command, source, self.cell_size);
+            Some(CursorAdvance { columns: footprint.0, rows: footprint.1 })
+        } else {
+            None
+        };
+
         self.placements.put(placement);
 
-        Ok(())
+        Ok(advance)
     }
 
     /// Delete images and placements (`a=d`).
@@ -630,6 +675,7 @@ impl GraphicsStore {
         GraphicsUpdate {
             response: if command.suppresses_ok() { None } else { self.response(command, "OK") },
             changed,
+            cursor_advance: None,
         }
     }
 
@@ -643,7 +689,7 @@ impl GraphicsStore {
             self.response(command, &message)
         };
 
-        GraphicsUpdate { response, changed: false }
+        GraphicsUpdate { response, changed: false, cursor_advance: None }
     }
 
     /// Format a response, if the client asked for one.
@@ -677,6 +723,49 @@ impl GraphicsStore {
 /// Clamp a client supplied value into the range a placement can hold.
 fn clamp_to_u16(value: u32) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+/// Resolve the cell footprint of a placement, in columns and rows.
+///
+/// Mirrors the reference implementation: a cell count of zero means "as many
+/// cells as needed". With neither axis given the footprint covers the image's
+/// pixel size, and with one axis given the other follows from the aspect ratio.
+fn resolve_footprint(command: &Command, source: SourceRect, cell_size: (u16, u16)) -> (u16, u16) {
+    /// Smallest footprint that can hold anything.
+    const MIN_CELLS: f64 = 1.;
+
+    let cell_width = f64::from(cell_size.0.max(1));
+    let cell_height = f64::from(cell_size.1.max(1));
+    let offset_x = f64::from(command.cell_offset_x);
+    let offset_y = f64::from(command.cell_offset_y);
+    let source_width = f64::from(source.width.max(1));
+    let source_height = f64::from(source.height.max(1));
+
+    let auto_columns = command.columns == 0;
+    let auto_rows = command.rows == 0;
+
+    let mut columns = f64::from(command.columns);
+    let mut rows = f64::from(command.rows);
+
+    if auto_columns {
+        columns = if auto_rows {
+            ((source_width + offset_x) / cell_width).ceil()
+        } else {
+            let height = cell_height * rows + offset_y;
+            (height * source_width / source_height / cell_width).ceil()
+        };
+    }
+
+    if auto_rows {
+        rows = if auto_columns {
+            ((source_height + offset_y) / cell_height).ceil()
+        } else {
+            let width = cell_width * columns + offset_x;
+            (width * source_height / source_width / cell_height).ceil()
+        };
+    }
+
+    (clamp_to_u16(columns.max(MIN_CELLS) as u32), clamp_to_u16(rows.max(MIN_CELLS) as u32))
 }
 
 /// Reject transmission features this implementation does not support.
@@ -752,6 +841,50 @@ mod tests {
         let update = apc(&mut store, &payload);
 
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=6;OK\x1b\\"));
+        assert_eq!(store.placements().len(), 1);
+    }
+
+    #[test]
+    fn placing_an_image_reports_the_cursor_advance() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        store.set_cell_size(10, 20);
+
+        // A 25x45 image covers 3x3 cells at a 10x20 cell size.
+        let pixels = vec![0u8; 25 * 45 * 3];
+        let payload = BASE64.encode(&pixels);
+        let sequence = format!("Gf=24,s=25,v=45,a=T,i=20;{payload}");
+
+        let update = apc(&mut store, &sequence);
+
+        assert_eq!(update.cursor_advance, Some(CursorAdvance { columns: 3, rows: 3 }));
+    }
+
+    #[test]
+    fn an_explicit_cell_size_overrides_the_resolved_one() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        store.set_cell_size(10, 20);
+
+        let pixels = vec![0u8; 25 * 45 * 3];
+        let payload = BASE64.encode(&pixels);
+        let sequence = format!("Gf=24,s=25,v=45,a=T,i=21,c=7,r=2;{payload}");
+
+        let update = apc(&mut store, &sequence);
+
+        assert_eq!(update.cursor_advance, Some(CursorAdvance { columns: 7, rows: 2 }));
+    }
+
+    #[test]
+    fn the_cursor_can_be_pinned_in_place() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        store.set_cell_size(10, 20);
+
+        let pixels = vec![0u8; 25 * 45 * 3];
+        let payload = BASE64.encode(&pixels);
+        let sequence = format!("Gf=24,s=25,v=45,a=T,i=22,C=1;{payload}");
+
+        let update = apc(&mut store, &sequence);
+
+        assert_eq!(update.cursor_advance, None, "C=1 must not move the cursor");
         assert_eq!(store.placements().len(), 1);
     }
 

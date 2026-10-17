@@ -199,6 +199,40 @@ fn transmits_a_png_image() {
 }
 
 #[test]
+fn placing_an_image_moves_the_cursor_past_it() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A 30x40 image covers 3x2 cells at a 10x20 cell size.
+    let pixels = vec![0u8; 30 * 40 * 3];
+    let sequence = format!("\x1b_Gf=24,s=30,v=40,a=T,i=1;{}\x1b\\", BASE64.encode(&pixels));
+
+    let before = term.grid().cursor.point;
+    feed(&mut term, &mut parser, sequence.as_bytes());
+    let after = term.grid().cursor.point;
+
+    assert_eq!(after.column.0, before.column.0 + 3);
+    assert_eq!(after.line, before.line + 1);
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=1;OK\x1b\\".to_owned()]);
+}
+
+#[test]
+fn pinning_the_cursor_keeps_it_in_place() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let pixels = vec![0u8; 30 * 40 * 3];
+    let sequence = format!("\x1b_Gf=24,s=30,v=40,a=T,i=1,C=1;{}\x1b\\", BASE64.encode(&pixels));
+
+    let before = term.grid().cursor.point;
+    feed(&mut term, &mut parser, sequence.as_bytes());
+
+    assert_eq!(term.grid().cursor.point, before);
+}
+
+#[test]
 fn reset_clears_graphics() {
     let (mut term, _recorder) = terminal();
     let mut parser = Processor::new();

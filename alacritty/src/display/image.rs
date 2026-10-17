@@ -9,8 +9,6 @@ use std::sync::Arc;
 use alacritty_terminal::graphics::GraphicsStore;
 use alacritty_terminal::graphics::image::ImageData;
 use alacritty_terminal::graphics::placement::Placement;
-use alacritty_terminal::index::Point;
-use alacritty_terminal::term;
 
 use crate::display::SizeInfo;
 use crate::gl::types::GLuint;
@@ -77,10 +75,7 @@ pub fn collect(
         let Some(image) = store.image(placement.internal_id) else {
             continue;
         };
-        let Some(viewport) = term::point_to_viewport(display_offset, placement.anchor) else {
-            continue;
-        };
-        let Some(rendered) = resolve(placement, image, viewport, size_info) else {
+        let Some(rendered) = resolve(placement, image, display_offset, size_info) else {
             continue;
         };
 
@@ -98,7 +93,7 @@ pub fn collect(
 fn resolve(
     placement: &Placement,
     image: &Arc<ImageData>,
-    viewport: Point<usize>,
+    display_offset: usize,
     size_info: &SizeInfo,
 ) -> Option<RenderableImage> {
     let cell_width = size_info.cell_width();
@@ -125,15 +120,26 @@ fn resolve(
     let (width, height) =
         fit(box_width, box_height, source_width as f32, source_height as f32, columns, rows);
 
+    // Lines are absolute, so a placement that has scrolled partly off the top
+    // has a negative viewport row. It must still be drawn, clipped by the
+    // window, rather than dropped.
+    let viewport_line = placement.anchor.line.0 + display_offset as i32;
+
     // Centre a letterboxed image inside the box it was given.
-    let x = viewport.column.0 as f32 * cell_width
+    let x = placement.anchor.column.0 as f32 * cell_width
         + size_info.padding_x()
         + f32::from(placement.offset_x)
         + (box_width - width) / 2.;
-    let y = viewport.line as f32 * cell_height
+    let y = viewport_line as f32 * cell_height
         + size_info.padding_y()
         + f32::from(placement.offset_y)
         + (box_height - height) / 2.;
+
+    // Skip images that are entirely outside the window.
+    let (window_width, window_height) = (size_info.width(), size_info.height());
+    if y + height <= 0. || y >= window_height || x + width <= 0. || x >= window_width {
+        return None;
+    }
 
     let image_width = image.width as f32;
     let image_height = image.height as f32;
