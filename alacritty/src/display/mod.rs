@@ -871,6 +871,7 @@ impl Display {
                     image.key,
                     image.image.width,
                     image.image.height,
+                    image.image.format,
                     &image.image.pixels,
                 );
             }

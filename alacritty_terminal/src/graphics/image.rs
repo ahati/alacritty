@@ -1,8 +1,10 @@
 //! Decoded image data and its storage.
 //!
-//! Images are held as straight-alpha RGBA8 so that the renderer can upload them
-//! verbatim, and are shared with the renderer through an [`Arc`] to avoid
-//! copying pixel data every frame.
+//! Pixels are kept in the layout the client transmitted them in, so an
+//! uncompressed transmission is stored without any per-pixel work: RGB8 stays
+//! three channels and RGBA8 four. Alpha, where present, is straight
+//! (unpremultiplied). Images are shared with the renderer through an [`Arc`] so
+//! that pixel data is never copied per frame.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,11 +12,39 @@ use std::sync::Arc;
 use super::GraphicsError;
 use super::command::Format;
 
-/// Number of channels in the internal RGBA representation.
+/// Number of channels in a greyscale pixel.
+const GRAYSCALE_CHANNELS: usize = 1;
+
+/// Number of channels in a greyscale pixel with alpha.
+const GRAYSCALE_ALPHA_CHANNELS: usize = 2;
+
+/// Number of channels in a three-channel pixel.
+pub const RGB_CHANNELS: usize = 3;
+
+/// Number of channels in a four-channel pixel.
 pub const RGBA_CHANNELS: usize = 4;
 
-/// Largest channel value, used as an opaque alpha.
-const OPAQUE: u8 = u8::MAX;
+/// Channel layout of stored pixel data.
+///
+/// Alpha forces four channels and its absence three, which is also how the
+/// protocol's `f=32` and `f=24` transmissions differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Red, green and blue, without alpha.
+    Rgb,
+    /// Red, green, blue and straight alpha.
+    Rgba,
+}
+
+impl PixelFormat {
+    /// Number of bytes one pixel occupies in this layout.
+    pub const fn channels(self) -> usize {
+        match self {
+            Self::Rgb => RGB_CHANNELS,
+            Self::Rgba => RGBA_CHANNELS,
+        }
+    }
+}
 
 /// A decoded image, shared with the renderer.
 #[derive(Debug)]
@@ -25,7 +55,9 @@ pub struct ImageData {
     pub number: u32,
     pub width: u32,
     pub height: u32,
-    /// Tightly packed, 8-bit RGBA with straight (unpremultiplied) alpha.
+    /// Channel layout of `pixels`.
+    pub format: PixelFormat,
+    /// Tightly packed 8-bit pixels in [`format`](Self::format).
     pub pixels: Arc<[u8]>,
     /// Bumped whenever the image data is replaced, so renderers can invalidate
     /// cached textures.
@@ -47,6 +79,7 @@ impl ImageData {
 pub struct Decoded {
     pub width: u32,
     pub height: u32,
+    pub format: PixelFormat,
     pub pixels: Vec<u8>,
 }
 
@@ -203,6 +236,7 @@ impl ImageStore {
             number,
             width: decoded.width,
             height: decoded.height,
+            format: decoded.format,
             pixels: decoded.pixels.into(),
             generation: self.generation,
             transient,
@@ -270,7 +304,10 @@ impl ImageStore {
     }
 }
 
-/// Decode a transmission's payload into RGBA pixels.
+/// Decode a transmission's payload into pixels.
+///
+/// The layout of the returned data follows the source rather than a single
+/// internal representation, so callers must consult [`Decoded::format`].
 pub fn decode(
     format: Format,
     data: &[u8],
@@ -284,7 +321,7 @@ pub fn decode(
     }
 }
 
-/// Decode a PNG stream into RGBA pixels.
+/// Decode a PNG stream into pixels.
 fn decode_png(data: &[u8], max_dimension: u32) -> Result<Decoded, GraphicsError> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -303,12 +340,15 @@ fn decode_png(data: &[u8], max_dimension: u32) -> Result<Decoded, GraphicsError>
     let length = stride.checked_mul(info.height as usize).ok_or(GraphicsError::TooLarge)?;
     let data = buffer.get(..length).ok_or(GraphicsError::BadData)?;
 
-    let pixels = expand_to_rgba(data, stride, info.color_type, info.width, info.height)?;
+    let (format, pixels) = normalize(data, stride, info.color_type, info.width, info.height)?;
 
-    Ok(Decoded { width: info.width, height: info.height, pixels })
+    Ok(Decoded { width: info.width, height: info.height, format, pixels })
 }
 
-/// Decode uncompressed RGB or RGBA pixels into RGBA.
+/// Decode uncompressed RGB or RGBA pixels.
+///
+/// The transmitted layout is also the stored one, so the payload is kept as it
+/// arrived.
 fn decode_raw(
     format: Format,
     data: &[u8],
@@ -318,18 +358,17 @@ fn decode_raw(
 ) -> Result<Decoded, GraphicsError> {
     check_dimensions(width, height, max_dimension)?;
 
-    let channels = format.bytes_per_pixel().ok_or(GraphicsError::Invalid)?;
-    let stride = (width as usize).checked_mul(channels).ok_or(GraphicsError::TooLarge)?;
-    let length = stride.checked_mul(height as usize).ok_or(GraphicsError::TooLarge)?;
-    let data = data.get(..length).ok_or(GraphicsError::NotEnoughData)?;
-
-    let pixels = match format {
-        Format::Rgba => data.to_vec(),
-        Format::Rgb => expand_to_rgba(data, stride, png::ColorType::Rgb, width, height)?,
+    let format = match format {
+        Format::Rgb => PixelFormat::Rgb,
+        Format::Rgba => PixelFormat::Rgba,
         Format::Png => return Err(GraphicsError::Invalid),
     };
 
-    Ok(Decoded { width, height, pixels })
+    let stride = (width as usize).checked_mul(format.channels()).ok_or(GraphicsError::TooLarge)?;
+    let length = stride.checked_mul(height as usize).ok_or(GraphicsError::TooLarge)?;
+    let data = data.get(..length).ok_or(GraphicsError::NotEnoughData)?;
+
+    Ok(Decoded { width, height, format, pixels: data.to_vec() })
 }
 
 /// Reject dimensions the terminal refuses to allocate.
@@ -343,43 +382,69 @@ fn check_dimensions(width: u32, height: u32, max_dimension: u32) -> Result<(), G
     Ok(())
 }
 
-/// Convert any 8-bit colour type into tightly packed RGBA.
-fn expand_to_rgba(
+/// Convert decoded PNG scanlines into a tightly packed [`PixelFormat`].
+///
+/// Only greyscale sources need per-pixel work. Palette, bit depth and 16-to-8
+/// bit conversions have already been done by the decoder's `normalize_to_color8`
+/// transform, and the remaining colour types either already match the target
+/// layout or differ from it only by an alpha channel.
+fn normalize(
     data: &[u8],
     stride: usize,
     color_type: png::ColorType,
     width: u32,
     height: u32,
-) -> Result<Vec<u8>, GraphicsError> {
-    let channels = match color_type {
-        png::ColorType::Grayscale => 1,
-        png::ColorType::GrayscaleAlpha => 2,
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
-        // Palette images are converted by the `normalize_to_color8` transform.
+) -> Result<(PixelFormat, Vec<u8>), GraphicsError> {
+    let source_channels = match color_type {
+        png::ColorType::Grayscale => GRAYSCALE_CHANNELS,
+        png::ColorType::GrayscaleAlpha => GRAYSCALE_ALPHA_CHANNELS,
+        png::ColorType::Rgb => RGB_CHANNELS,
+        png::ColorType::Rgba => RGBA_CHANNELS,
+        // Palette images are expanded by the `normalize_to_color8` transform.
         png::ColorType::Indexed => return Err(GraphicsError::BadData),
     };
 
+    let format = match source_channels {
+        GRAYSCALE_CHANNELS | RGB_CHANNELS => PixelFormat::Rgb,
+        _ => PixelFormat::Rgba,
+    };
+    let target_channels = format.channels();
+
     let width = width as usize;
     let height = height as usize;
-    let row_length = width * channels;
+    let row_length = width * source_channels;
     if stride < row_length || stride == 0 || data.len() < stride * height {
         return Err(GraphicsError::BadData);
     }
 
-    let mut pixels = Vec::with_capacity(width * height * RGBA_CHANNELS);
-    for row in data.chunks_exact(stride).take(height) {
-        for pixel in row[..row_length].chunks_exact(channels) {
-            match channels {
-                1 => pixels.extend_from_slice(&[pixel[0], pixel[0], pixel[0], OPAQUE]),
-                2 => pixels.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]),
-                3 => pixels.extend_from_slice(&[pixel[0], pixel[1], pixel[2], OPAQUE]),
-                _ => pixels.extend_from_slice(pixel),
+    // Rows that are already tightly packed with the target channel count need no
+    // conversion at all, which is the case for RGB and RGBA PNGs.
+    if source_channels == target_channels && stride == row_length {
+        return Ok((format, data.to_vec()));
+    }
+
+    debug_assert!(
+        source_channels <= GRAYSCALE_ALPHA_CHANNELS,
+        "only greyscale sources should need expanding",
+    );
+
+    let mut pixels = vec![0; width * height * target_channels];
+    for (row, source) in data.chunks_exact(stride).take(height).enumerate() {
+        let row_start = row * width * target_channels;
+        for (column, pixel) in source[..row_length].chunks_exact(source_channels).enumerate() {
+            let start = row_start + column * target_channels;
+            // Greyscale is replicated across the colour channels, and greyscale
+            // with alpha carries that alpha in its second component.
+            pixels[start] = pixel[0];
+            pixels[start + 1] = pixel[0];
+            pixels[start + 2] = pixel[0];
+            if target_channels == RGBA_CHANNELS {
+                pixels[start + 3] = pixel[1];
             }
         }
     }
 
-    Ok(pixels)
+    Ok((format, pixels))
 }
 
 #[cfg(test)]
@@ -402,28 +467,52 @@ mod tests {
     }
 
     #[test]
-    fn decodes_png_to_rgba() {
+    fn decodes_an_rgb_png_without_converting_it() {
         let data = [10, 20, 30, 40, 50, 60];
         let png = encode_png(2, 1, png::ColorType::Rgb, &data);
 
         let decoded = decode(Format::Png, &png, 0, 0, MAX_DIMENSION).unwrap();
         assert_eq!((decoded.width, decoded.height), (2, 1));
-        assert_eq!(decoded.pixels, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+        assert_eq!(decoded.format, PixelFormat::Rgb);
+        assert_eq!(decoded.pixels, vec![10, 20, 30, 40, 50, 60]);
+    }
+
+    #[test]
+    fn decodes_an_rgba_png_without_converting_it() {
+        let data = [1, 2, 3, 4, 5, 6, 7, 8];
+        let png = encode_png(1, 2, png::ColorType::Rgba, &data);
+
+        let decoded = decode(Format::Png, &png, 0, 0, MAX_DIMENSION).unwrap();
+        assert_eq!(decoded.format, PixelFormat::Rgba);
+        assert_eq!(decoded.pixels, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
     fn decodes_grayscale_png() {
         let png = encode_png(2, 1, png::ColorType::Grayscale, &[7, 9]);
+
         let decoded = decode(Format::Png, &png, 0, 0, MAX_DIMENSION).unwrap();
-        assert_eq!(decoded.pixels, vec![7, 7, 7, 255, 9, 9, 9, 255]);
+        assert_eq!(decoded.format, PixelFormat::Rgb);
+        assert_eq!(decoded.pixels, vec![7, 7, 7, 9, 9, 9]);
+    }
+
+    #[test]
+    fn decodes_grayscale_alpha_png() {
+        let png = encode_png(2, 1, png::ColorType::GrayscaleAlpha, &[7, 1, 9, 2]);
+
+        let decoded = decode(Format::Png, &png, 0, 0, MAX_DIMENSION).unwrap();
+        assert_eq!(decoded.format, PixelFormat::Rgba);
+        assert_eq!(decoded.pixels, vec![7, 7, 7, 1, 9, 9, 9, 2]);
     }
 
     #[test]
     fn decodes_raw_rgb_and_rgba() {
         let rgb = decode(Format::Rgb, &[1, 2, 3], 1, 1, MAX_DIMENSION).unwrap();
-        assert_eq!(rgb.pixels, vec![1, 2, 3, 255]);
+        assert_eq!(rgb.format, PixelFormat::Rgb);
+        assert_eq!(rgb.pixels, vec![1, 2, 3]);
 
         let rgba = decode(Format::Rgba, &[1, 2, 3, 4], 1, 1, MAX_DIMENSION).unwrap();
+        assert_eq!(rgba.format, PixelFormat::Rgba);
         assert_eq!(rgba.pixels, vec![1, 2, 3, 4]);
     }
 
@@ -445,7 +534,8 @@ mod tests {
 
     #[test]
     fn insert_replaces_and_tracks_quota() {
-        let decoded = || Decoded { width: 1, height: 1, pixels: vec![0; 4] };
+        let decoded =
+            || Decoded { width: 1, height: 1, format: PixelFormat::Rgba, pixels: vec![0; 4] };
 
         let mut store = ImageStore::new(1024);
         let (first, image) = store.insert(5, 0, decoded(), false);
@@ -467,13 +557,15 @@ mod tests {
     #[test]
     fn resolves_by_client_id_and_number() {
         let mut store = ImageStore::new(1024);
-        let decoded = Decoded { width: 1, height: 1, pixels: vec![0; 4] };
+        let decoded =
+            Decoded { width: 1, height: 1, format: PixelFormat::Rgba, pixels: vec![0; 4] };
 
         let (by_id, _) = store.insert(7, 0, decoded, false);
         assert_eq!(store.resolve(7, 0), Some(by_id));
         assert_eq!(store.resolve(0, 0), None);
 
-        let decoded = Decoded { width: 1, height: 1, pixels: vec![0; 4] };
+        let decoded =
+            Decoded { width: 1, height: 1, format: PixelFormat::Rgba, pixels: vec![0; 4] };
         let (by_number, _) = store.insert(0, 3, decoded, false);
         assert_eq!(store.resolve(0, 3), Some(by_number));
         assert_eq!(store.resolve(0, 4), None);

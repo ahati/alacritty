@@ -4,9 +4,10 @@
 //! [`ImageTextureCache`] which owns one GL texture object per image, and an [`ImageRenderer`]
 //! which draws textured quads.
 //!
-//! Images are always uploaded with straight (unpremultiplied) alpha, which means the caller is
-//! responsible for setting up a blend function that multiplies the source color by the source
-//! alpha, exactly like [`RectRenderer`] is set up by `Renderer::draw_rects`.
+//! Images are uploaded in the layout the terminal stores them in, with straight (unpremultiplied)
+//! alpha where present, which means the caller is responsible for setting up a blend function that
+//! multiplies the source color by the source alpha, exactly like [`RectRenderer`] is set up by
+//! `Renderer::draw_rects`.
 //!
 //! [`RectRenderer`]: crate::renderer::rects::RectRenderer
 
@@ -14,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::{mem, ptr};
 
 use ahash::RandomState;
+
+use alacritty_terminal::graphics::image::PixelFormat;
 
 use crate::display::SizeInfo;
 use crate::gl::types::*;
@@ -39,11 +42,19 @@ const POSITION_COMPONENTS: GLint = 2;
 /// Number of `f32` components in a vertex texture coordinate.
 const UV_COMPONENTS: GLint = 2;
 
-/// Number of bytes per pixel of the RGBA data uploaded into the cache.
-const BYTES_PER_PIXEL: usize = 4;
-
 /// Number of vertices required to draw a single quad as two triangles.
 const VERTICES_PER_QUAD: usize = 6;
+
+/// GL pixel format matching the layout of stored image data.
+///
+/// `TexImage2D` gives three-channel data an alpha of one when it is sampled, so
+/// an image without an alpha channel is drawn opaque.
+fn gl_format(format: PixelFormat) -> GLenum {
+    match format {
+        PixelFormat::Rgb => gl::RGB,
+        PixelFormat::Rgba => gl::RGBA,
+    }
+}
 
 /// Index of the texture unit the image sampler reads from.
 const IMAGE_TEXTURE_UNIT_INDEX: GLint = 0;
@@ -110,15 +121,22 @@ impl ImageTextureCache {
         Self { textures: HashMap::default(), max_texture_size: None }
     }
 
-    /// Upload `rgba` (tightly packed, 8-bit RGBA, **straight/unpremultiplied** alpha) as a 2D
-    /// texture for `key`, replacing any previous entry.
+    /// Upload `pixels` (tightly packed 8-bit data in `format`, with straight/unpremultiplied
+    /// alpha where present) as a 2D texture for `key`, replacing any previous entry.
     ///
     /// Returns the GL texture handle, which stays valid until the entry is replaced, evicted by
     /// [`retain`](Self::retain), removed by [`remove`](Self::remove), or the cache is dropped.
     ///
     /// Empty images, images whose dimensions exceed `GL_MAX_TEXTURE_SIZE` and data which does not
-    /// match `width`/`height` are rejected; `0` is returned in that case.
-    pub fn upload(&mut self, key: ImageKey, width: u32, height: u32, rgba: &[u8]) -> GLuint {
+    /// match `width`/`height`/`format` are rejected; `0` is returned in that case.
+    pub fn upload(
+        &mut self,
+        key: ImageKey,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        pixels: &[u8],
+    ) -> GLuint {
         if width == 0 || height == 0 {
             debug_assert!(width > 0 && height > 0, "cannot upload an empty image");
             return 0;
@@ -126,9 +144,9 @@ impl ImageTextureCache {
 
         let expected_len = (width as usize)
             .checked_mul(height as usize)
-            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL));
+            .and_then(|pixels| pixels.checked_mul(format.channels()));
 
-        if expected_len != Some(rgba.len()) {
+        if expected_len != Some(pixels.len()) {
             debug_assert!(false, "image data length does not match its dimensions");
             return 0;
         }
@@ -159,13 +177,13 @@ impl ImageTextureCache {
             gl::TexImage2D(
                 gl::TEXTURE_2D,
                 0,
-                gl::RGBA as i32,
+                gl_format(format) as i32,
                 width as i32,
                 height as i32,
                 0,
-                gl::RGBA,
+                gl_format(format),
                 gl::UNSIGNED_BYTE,
-                rgba.as_ptr() as *const _,
+                pixels.as_ptr() as *const _,
             );
 
             // Images are sampled with linear filtering, without any mipmaps.
