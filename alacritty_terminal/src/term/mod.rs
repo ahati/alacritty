@@ -14,6 +14,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
+use crate::graphics::{GraphicsConfig, GraphicsStore};
 use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
@@ -325,6 +326,12 @@ pub struct Term<T> {
     /// Information about damaged cells.
     damage: TermDamageState,
 
+    /// Kitty graphics displayed on the active screen.
+    graphics: GraphicsStore,
+
+    /// Kitty graphics belonging to the inactive screen.
+    inactive_graphics: GraphicsStore,
+
     /// Config directly for the terminal.
     config: Config,
 }
@@ -351,6 +358,9 @@ pub struct Config {
 
     /// OSC52 support mode.
     pub osc52: Osc52,
+
+    /// Kitty graphics protocol support.
+    pub graphics: GraphicsConfig,
 }
 
 impl Default for Config {
@@ -362,6 +372,7 @@ impl Default for Config {
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            graphics: GraphicsConfig::default(),
         }
     }
 }
@@ -422,6 +433,9 @@ impl<T> Term<T> {
         // Initialize terminal damage, covering the entire terminal upon launch.
         let damage = TermDamageState::new(num_cols, num_lines);
 
+        let graphics_config = config.graphics;
+        let graphics = GraphicsStore::new(graphics_config);
+
         Term {
             inactive_grid,
             scroll_region,
@@ -429,6 +443,8 @@ impl<T> Term<T> {
             damage,
             config,
             grid,
+            inactive_graphics: GraphicsStore::new(graphics_config),
+            graphics,
             tabs,
             inactive_keyboard_mode_stack: Default::default(),
             keyboard_mode_stack: Default::default(),
@@ -519,6 +535,11 @@ impl<T> Term<T> {
             self.keyboard_mode_stack = Vec::new();
             self.inactive_keyboard_mode_stack = Vec::new();
             self.mode.remove(TermMode::KITTY_KEYBOARD_PROTOCOL);
+        }
+
+        if self.config.graphics != old_config.graphics {
+            self.graphics.set_config(self.config.graphics);
+            self.inactive_graphics.set_config(self.config.graphics);
         }
 
         // Damage everything on config updates.
@@ -651,6 +672,12 @@ impl<T> Term<T> {
         &mut self.grid
     }
 
+    /// Kitty graphics displayed on the active screen.
+    #[inline]
+    pub fn graphics(&self) -> &GraphicsStore {
+        &self.graphics
+    }
+
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
         let old_cols = self.columns();
@@ -683,11 +710,21 @@ impl<T> Term<T> {
 
             // Recreate tabs list.
             self.tabs.resize(num_cols);
+
+            // Placements are anchored to cells, and reflow moves those cells
+            // individually, so they cannot be tracked across a column change.
+            // This mirrors the selection policy above.
+            self.graphics.clear();
+            self.inactive_graphics.clear();
         } else if let Some(selection) = self.selection.take() {
             let max_lines = cmp::max(num_lines, old_lines) as i32;
             let range = Line(0)..Line(max_lines);
             self.selection = selection.rotate(self, &range, -delta);
         }
+
+        // Drop graphics that have scrolled out of the buffer entirely.
+        let (top, bottom) = (self.topmost_line(), self.bottommost_line());
+        self.graphics.prune(top, bottom);
 
         // Clamp vi cursor to viewport.
         let vi_point = self.vi_mode_cursor.point;
@@ -729,6 +766,7 @@ impl<T> Term<T> {
         self.set_keyboard_mode(keyboard_mode, KeyboardModesApplyBehavior::Replace);
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
+        mem::swap(&mut self.graphics, &mut self.inactive_graphics);
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
         self.mark_fully_damaged();
@@ -750,6 +788,9 @@ impl<T> Term<T> {
         // Scroll selection.
         self.selection =
             self.selection.take().and_then(|s| s.rotate(self, &region, -(lines as i32)));
+
+        // Scroll graphics with the text.
+        self.graphics.scroll(&region, -(lines as i32));
 
         // Scroll vi mode cursor.
         let line = &mut self.vi_mode_cursor.point.line;
@@ -776,6 +817,9 @@ impl<T> Term<T> {
 
         // Scroll selection.
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
+
+        // Scroll graphics with the text.
+        self.graphics.scroll(&region, lines as i32);
 
         self.grid.scroll_up(&region, lines);
 
@@ -1057,6 +1101,32 @@ impl<T> Dimensions for Term<T> {
 }
 
 impl<T: EventListener> Handler for Term<T> {
+    /// Start of an APC string, which carries Kitty graphics commands.
+    #[inline]
+    fn apc_start(&mut self) {
+        self.graphics.apc_start();
+    }
+
+    /// A byte of the APC string started by [`Handler::apc_start`].
+    #[inline]
+    fn apc_put(&mut self, byte: u8) {
+        self.graphics.apc_put(byte);
+    }
+
+    /// End of an APC string, applying the command it carried.
+    #[inline]
+    fn apc_end(&mut self) {
+        let update = self.graphics.apc_end(self.grid.cursor.point);
+
+        if let Some(response) = update.response {
+            self.event_proxy.send_event(Event::PtyWrite(response));
+        }
+
+        if update.changed {
+            self.mark_fully_damaged();
+        }
+    }
+
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
@@ -1801,6 +1871,8 @@ impl<T: EventListener> Handler for Term<T> {
                 }
 
                 self.selection = None;
+
+                self.graphics.clear();
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
                 self.grid.clear_history();
@@ -1809,6 +1881,8 @@ impl<T: EventListener> Handler for Term<T> {
                     self.vi_mode_cursor.point.line.grid_clamp(self, Boundary::Cursor);
 
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(..Line(0)));
+
+                self.graphics.clear();
             },
             // We have no history to clear.
             ansi::ClearMode::Saved => (),
@@ -1848,6 +1922,8 @@ impl<T: EventListener> Handler for Term<T> {
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
+        self.graphics.clear();
+        self.inactive_graphics.clear();
 
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;

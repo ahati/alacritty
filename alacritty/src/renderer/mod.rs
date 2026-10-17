@@ -20,9 +20,11 @@ use crate::display::SizeInfo;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
 use crate::gl;
+use crate::renderer::images::{ImageQuad, ImageRenderer};
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
+pub mod images;
 pub mod platform;
 pub mod rects;
 mod shader;
@@ -89,6 +91,7 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    image_renderer: ImageRenderer,
     robustness: bool,
 }
 
@@ -161,6 +164,9 @@ impl Renderer {
             (text_renderer, rect_renderer)
         };
 
+        let shader_version = if use_glsl3 { ShaderVersion::Glsl3 } else { ShaderVersion::Gles2 };
+        let image_renderer = ImageRenderer::new(shader_version)?;
+
         // Enable debug logging for OpenGL as well.
         if log::max_level() >= LevelFilter::Debug && GlExtensions::contains("GL_KHR_debug") {
             debug!("Enabled debug logging for OpenGL");
@@ -171,7 +177,7 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, robustness })
+        Ok(Self { text_renderer, rect_renderer, image_renderer, robustness })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -261,6 +267,56 @@ impl Renderer {
 
             // Restore viewport with padding.
             self.set_viewport(size_info);
+        }
+    }
+
+    /// Draw image quads in the order given.
+    ///
+    /// The caller is expected to have split the quads into those that belong
+    /// behind the text and those that belong in front of it, and to call this
+    /// at the matching point in the frame.
+    pub fn draw_images(&mut self, size_info: &SizeInfo, quads: &[ImageQuad]) {
+        if quads.is_empty() {
+            return;
+        }
+
+        // Prepare image rendering state.
+        unsafe {
+            // Remove padding from viewport.
+            gl::Viewport(0, 0, size_info.width() as i32, size_info.height() as i32);
+            // Images are uploaded with straight alpha.
+            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+        }
+
+        self.image_renderer.draw(size_info, quads);
+
+        // Activate regular state again.
+        unsafe {
+            // Reset blending strategy.
+            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+
+            // Restore viewport with padding.
+            self.set_viewport(size_info);
+        }
+
+        // Drawing images left their texture bound, which the text renderer does
+        // not know about.
+        self.invalidate_texture_binding();
+    }
+
+    /// Forget the text renderer's cached texture binding.
+    ///
+    /// Must be called after any code outside the text renderer changes the
+    /// `GL_TEXTURE_2D` binding on the active texture unit, otherwise the next
+    /// text batch may skip its own bind and sample the wrong texture.
+    pub fn invalidate_texture_binding(&mut self) {
+        match &mut self.text_renderer {
+            TextRendererProvider::Gles2(text_renderer) => {
+                text_renderer.invalidate_texture_binding();
+            },
+            TextRendererProvider::Glsl3(text_renderer) => {
+                text_renderer.invalidate_texture_binding();
+            },
         }
     }
 

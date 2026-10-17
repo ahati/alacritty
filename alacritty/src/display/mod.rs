@@ -2,6 +2,7 @@
 //! GPU drawing.
 
 use std::cmp;
+use std::collections::HashSet;
 use std::fmt::{self, Formatter};
 use std::mem::{self, ManuallyDrop};
 use std::num::NonZeroU32;
@@ -52,6 +53,7 @@ use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
+use crate::renderer::images::{ImageKey, ImageQuad, ImageTextureCache};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -61,6 +63,7 @@ pub mod color;
 pub mod content;
 pub mod cursor;
 pub mod hint;
+pub mod image;
 pub mod window;
 
 mod bell;
@@ -396,6 +399,7 @@ pub struct Display {
     context: ManuallyDrop<PossiblyCurrentContext>,
 
     glyph_cache: GlyphCache,
+    image_cache: ImageTextureCache,
     meter: Meter,
 }
 
@@ -525,6 +529,7 @@ impl Display {
             raw_window_handle,
             damage_tracker,
             glyph_cache,
+            image_cache: ImageTextureCache::new(),
             hint_state,
             size_info,
             font_size,
@@ -599,6 +604,11 @@ impl Display {
         self.renderer.resize(&self.size_info);
 
         self.reset_glyph_cache();
+
+        // Textures belong to the context that was just lost, so drop the
+        // references without deleting them against the new context.
+        self.image_cache.forget();
+
         self.damage_tracker.frame().mark_fully_damaged();
 
         debug!("Recovered window {:?} from gpu reset", self.window.id());
@@ -811,6 +821,17 @@ impl Display {
         }
         terminal.reset_damage();
 
+        // Collect graphics before the terminal lock is dropped.
+        let images = image::collect(terminal.graphics(), &size_info, display_offset);
+
+        // Textures are retained for every image the terminal still holds, not
+        // just the visible ones, so that scrolling does not re-upload them.
+        let live: HashSet<ImageKey> = terminal
+            .graphics()
+            .images()
+            .map(|(internal_id, image)| image::image_key(internal_id, image.generation))
+            .collect();
+
         // Drop terminal as early as possible to free lock.
         drop(terminal);
 
@@ -836,6 +857,35 @@ impl Display {
         self.make_current();
 
         self.renderer.clear(background_color, config.window_opacity());
+
+        // Upload textures for images we have not seen before and release those
+        // the terminal no longer holds.
+        self.image_cache.retain(&live);
+        for image in &images {
+            if self.image_cache.get(image.key).is_none() {
+                self.image_cache.upload(
+                    image.key,
+                    image.image.width,
+                    image.image.height,
+                    &image.image.pixels,
+                );
+            }
+        }
+
+        // Uploading left the image texture bound, which the text renderer does
+        // not know about.
+        self.renderer.invalidate_texture_binding();
+
+        // Images with a negative z-index are drawn behind the text. They are
+        // visible through default-background cells because the text shader
+        // discards those fragments.
+        let (behind, in_front): (Vec<_>, Vec<_>) =
+            images.iter().partition(|image| image.z_index < 0);
+        let behind_quads = image_quads(&behind, &self.image_cache);
+        let front_quads = image_quads(&in_front, &self.image_cache);
+
+        self.renderer.draw_images(&size_info, &behind_quads);
+
         let mut lines = RenderLines::new();
 
         // Optimize loop hint comparator.
@@ -877,6 +927,10 @@ impl Display {
             });
             self.renderer.draw_cells(&size_info, glyph_cache, cells);
         }
+
+        // Images with a non-negative z-index are drawn over the text, but
+        // below the cursor, selection and other UI elements.
+        self.renderer.draw_images(&size_info, &front_quads);
 
         let mut rects = lines.rects(&metrics, &size_info);
 
@@ -1605,6 +1659,17 @@ impl FrameTimer {
 ///
 /// This will return a tuple of the cell width and height.
 #[inline]
+/// Pair each renderable image with its uploaded texture.
+///
+/// Images whose texture is missing are skipped, which can only happen when the
+/// upload was rejected.
+fn image_quads(images: &[&image::RenderableImage], cache: &ImageTextureCache) -> Vec<ImageQuad> {
+    images
+        .iter()
+        .filter_map(|image| cache.get(image.key).map(|texture| image.quad(texture)))
+        .collect()
+}
+
 fn compute_cell_size(config: &UiConfig, metrics: &crossfont::Metrics) -> (f32, f32) {
     let offset_x = f64::from(config.font.offset.x);
     let offset_y = f64::from(config.font.offset.y);

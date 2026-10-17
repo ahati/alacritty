@@ -14,6 +14,7 @@ use winit::keyboard::{Key, ModifiersState};
 
 use alacritty_config::SerdeReplace;
 use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
+use alacritty_terminal::graphics::GraphicsConfig;
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::tty::{Options as PtyOptions, Shell};
@@ -124,6 +125,7 @@ impl UiConfig {
             default_cursor_style: self.cursor.style(),
             osc52: self.terminal.osc52.0,
             kitty_keyboard: true,
+            graphics: GraphicsConfig::from(&self.terminal.graphics),
         }
     }
 

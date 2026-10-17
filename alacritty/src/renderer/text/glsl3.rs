@@ -187,6 +187,10 @@ impl<'a> TextRenderer<'a> for Glsl3Renderer {
         &self.program
     }
 
+    fn invalidate_texture_binding(&mut self) {
+        self.active_tex = 0;
+    }
+
     fn loader_api(&mut self) -> LoaderApi<'_> {
         LoaderApi {
             active_tex: &mut self.active_tex,

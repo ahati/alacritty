@@ -1,5 +1,32 @@
 # Kitty Graphics Protocol in Alacritty — Feasibility Analysis & Implementation Plan
 
+> **Status: implemented.** Phases 0–3 of the plan below are complete and verified
+> by rendering into an Xvfb display: a 96×96 PNG and a 64×64 PNG placed by
+> `a=T` came out pixel-exact (9216 and 4096 px) alongside text. `cargo test
+> --workspace` is green (317 tests). See the container `README.md` for the
+> supported command set, configuration, and known limitations. Phase 4 (client
+> conformance against `kitten icat`, `timg`, `chafa`) and phase 5 (hardening,
+> `t=f`/`t=s`, zlib, placeholders, animation) remain outstanding.
+>
+> Design corrections found during implementation, which supersede the text below:
+> 1. **There is no DCS variant of the kitty graphics protocol.** Every command is
+>    APC (`ESC _ G … ESC \`); DCS is sixel. Only the APC parser change was needed.
+> 2. **DCS was a red herring for this feature**, though it is indeed unusable in
+>    Alacritty (see §2.3) — irrelevant to kitty graphics.
+> 3. **A third blocker was discovered that the plan did not anticipate**: the text
+>    renderer caches the bound `GL_TEXTURE_2D` name and skips redundant binds, so
+>    uploading image textures behind its back makes it sample an incomplete
+>    texture and all text disappears permanently. Fixed by adding
+>    `TextRenderer::invalidate_texture_binding`. Any future code that touches
+>    texture bindings from outside the text renderer must do the same.
+> 4. **The core cannot resolve `c`/`r` auto-sizing**, because `Term` has no font
+>    metrics (only rows/columns). Placements therefore store the requested cell
+>    counts and the display layer resolves `0 = auto` at draw time. This is
+>    arguably better than kitty's placement-time resolution, since images re-flow
+>    when the font size changes.
+> 5. The payload of `t=f`/`t=t`/`t=s` is a **path, not base64**, so unsupported
+>    mediums must be refused *before* base64 decoding.
+
 Status: analysis / proposal. Nothing in this document is implemented yet.
 Base: `/workspaces/alacritty-fork` @ `54214706` (`alacritty 0.18.0-dev`, `alacritty_terminal 0.26.1-dev`).
 

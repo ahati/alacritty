@@ -264,6 +264,15 @@ brevity.
 :  Rejected
 :[ _CSI ? 2026 h/l_ is used instead
 
+# APC (Application Program Command) - ESC _
+
+[[ *ESCAPE*
+:[ *STATUS*
+:[ *NOTE*
+|  _APC G_
+:  Implemented
+:[ Kitty graphics protocol. Requires `terminal.graphics.enabled`.
+
 # SEE ALSO
 
 *alacritty*(1), *alacritty-msg*(1), *alacritty*(5), *alacritty-bindings*(5)

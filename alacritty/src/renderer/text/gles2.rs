@@ -177,6 +177,10 @@ impl<'a> TextRenderer<'a> for Gles2Renderer {
         &self.program
     }
 
+    fn invalidate_texture_binding(&mut self) {
+        self.active_tex = 0;
+    }
+
     fn with_api<'b: 'a, F, T>(&'b mut self, _: &'b SizeInfo, func: F) -> T
     where
         F: FnOnce(Self::RenderApi) -> T,

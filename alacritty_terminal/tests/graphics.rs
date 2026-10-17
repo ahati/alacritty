@@ -1,0 +1,214 @@
+//! End-to-end tests for Kitty graphics protocol support.
+//!
+//! These drive the real VT parser into a real [`Term`], so they cover the
+//! parser change that makes APC payloads reachable as well as the protocol
+//! handling itself.
+
+use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::vte::ansi::Processor;
+
+/// Encoded payload of a single opaque white pixel.
+const WHITE_PIXEL: &str = "/////w==";
+
+/// Terminal size used by every test.
+const COLUMNS: usize = 80;
+const LINES: usize = 24;
+
+/// Records the events a terminal emits.
+#[derive(Clone, Default)]
+struct Recorder {
+    events: Arc<Mutex<Vec<Event>>>,
+}
+
+impl Recorder {
+    /// Every PTY write the terminal requested.
+    fn pty_writes(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::PtyWrite(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl EventListener for Recorder {
+    fn send_event(&self, event: Event) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+/// Build a terminal together with its event recorder.
+fn terminal() -> (Term<Recorder>, Recorder) {
+    let recorder = Recorder::default();
+    let size = TermSize::new(COLUMNS, LINES);
+    let term = Term::new(Config::default(), &size, recorder.clone());
+    (term, recorder)
+}
+
+/// Feed raw bytes through the real parser.
+fn feed(term: &mut Term<Recorder>, parser: &mut Processor, bytes: &[u8]) {
+    parser.advance(term, bytes);
+}
+
+/// Build a complete `a=T` graphics escape sequence.
+fn transmit(image_id: u32, payload: &str) -> Vec<u8> {
+    format!("\x1b_Gf=32,s=1,v=1,a=T,i={image_id};{payload}\x1b\\").into_bytes()
+}
+
+#[test]
+fn apc_payload_reaches_the_terminal() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    feed(&mut term, &mut parser, &transmit(7, WHITE_PIXEL));
+
+    // The image was stored and placed at the cursor.
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(term.graphics().memory_used(), 4);
+
+    // And the client was acknowledged.
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=7;OK\x1b\\".to_owned()]);
+}
+
+#[test]
+fn payload_split_across_parser_calls_reassembles() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    let sequence = transmit(9, WHITE_PIXEL);
+    for byte in &sequence {
+        feed(&mut term, &mut parser, &[*byte]);
+    }
+
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=9;OK\x1b\\".to_owned()]);
+}
+
+#[test]
+fn chunked_transmission_reassembles_across_apc_strings() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Two chunks: the first declares the image, the second completes it.
+    let first = format!("\x1b_Gf=32,s=1,v=1,a=T,i=4,m=1;{}\x1b\\", &WHITE_PIXEL[..4]);
+    let second = format!("\x1b_Gm=0;{}\x1b\\", &WHITE_PIXEL[4..]);
+
+    feed(&mut term, &mut parser, first.as_bytes());
+    assert!(term.graphics().placements().is_empty());
+
+    feed(&mut term, &mut parser, second.as_bytes());
+
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=4;OK\x1b\\".to_owned()]);
+}
+
+#[test]
+fn graphics_scroll_with_the_text() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Place an image, then move the cursor to the last line and scroll up.
+    feed(&mut term, &mut parser, &transmit(1, WHITE_PIXEL));
+    let anchor = term.graphics().placements()[0].anchor;
+
+    feed(&mut term, &mut parser, b"\x1b[24;1H\n");
+
+    let moved = term.graphics().placements()[0].anchor;
+    assert_eq!(moved.line, anchor.line - 1);
+}
+
+#[test]
+fn non_graphics_apc_is_ignored() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // An unrelated APC must not be mistaken for a graphics command, and text
+    // after it must still be printed.
+    feed(&mut term, &mut parser, b"\x1b_Xnot graphics\x1b\\hello");
+
+    assert!(term.graphics().placements().is_empty());
+    assert!(recorder.pty_writes().is_empty());
+
+    let cell =
+        &term.grid()[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(0)];
+    assert_eq!(cell.c, 'h');
+}
+
+#[test]
+fn query_is_answered_without_storing() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    let query = format!("\x1b_Gf=32,s=1,v=1,a=q,i=31;{WHITE_PIXEL}\x1b\\");
+    feed(&mut term, &mut parser, query.as_bytes());
+
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=31;OK\x1b\\".to_owned()]);
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(term.graphics().memory_used(), 0);
+}
+
+#[test]
+fn malformed_graphics_command_is_dropped_silently() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    feed(&mut term, &mut parser, b"\x1b_Gf=32,bogus=1,i=3;/////w==\x1b\\");
+
+    assert!(term.graphics().placements().is_empty());
+    assert!(recorder.pty_writes().is_empty());
+}
+
+/// Encode a base64 PNG of a single opaque pixel, the format real clients use.
+fn png_pixel() -> String {
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[10, 20, 30, 255]).unwrap();
+    }
+
+    BASE64.encode(&png)
+}
+
+#[test]
+fn transmits_a_png_image() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // This is the shape of the command emitted by icat, timg and chafa: a PNG
+    // direct transmission with no explicit source dimensions.
+    let sequence = format!("\x1b_Gf=100,a=T,i=12;{}\x1b\\", png_pixel());
+    feed(&mut term, &mut parser, sequence.as_bytes());
+
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=12;OK\x1b\\".to_owned()]);
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(term.graphics().memory_used(), 4);
+}
+
+#[test]
+fn reset_clears_graphics() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+
+    feed(&mut term, &mut parser, &transmit(5, WHITE_PIXEL));
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    // RIS.
+    feed(&mut term, &mut parser, b"\x1bc");
+
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(term.graphics().memory_used(), 0);
+}

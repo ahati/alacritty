@@ -10,6 +10,12 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 ## 0.18.0-dev
 
+### Added
+
+- Support for inline images through the Kitty graphics protocol (`f=24`, `f=32` and
+  `f=100`, direct transmission, placements, z-index, deletion and chunked transfers),
+  configurable through `terminal.graphics`
+
 ### Packaging
 
 - Fixed `alacritty-escapes(7)` manpage missing from macOS install

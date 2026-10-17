@@ -74,6 +74,14 @@ pub trait TextRenderer<'a> {
 
     fn program(&self) -> &Self::Shader;
 
+    /// Forget the cached texture binding.
+    ///
+    /// The text renderer skips redundant `GL_TEXTURE_2D` binds, so any code
+    /// outside it that changes the binding on the active texture unit must call
+    /// this. Otherwise the next batch skips its own bind and samples whatever
+    /// texture was left bound.
+    fn invalidate_texture_binding(&mut self);
+
     /// Resize the text rendering.
     fn resize(&self, size: &SizeInfo) {
         unsafe {
