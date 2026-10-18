@@ -105,6 +105,11 @@ pub fn read(source: &FileSource, max_to_read: usize) -> Result<Vec<u8>, Graphics
         Ok(data)
     });
 
+    // Close the descriptor before deleting anything: Windows refuses to
+    // remove a file that is still open, so a temporary file would be left
+    // behind if the removal happened while the handle were alive.
+    drop(file);
+
     if source.temp {
         remove_temp(&source.path, &canonical);
     }
@@ -125,13 +130,10 @@ fn check_opened(path: &Path, file: &File) -> Result<(), GraphicsError> {
         GraphicsError::FileUnreadable
     })?;
 
-    let canonical = canonical_allowed(path).ok_or_else(|| {
+    // The policy is checked once more against the canonical name, even where
+    // the identity check below cannot run.
+    let _canonical = canonical_allowed(path).ok_or_else(|| {
         log::debug!("Refusing to read graphics image file {}", path.display());
-        GraphicsError::FileUnreadable
-    })?;
-
-    let named = canonical.metadata().map_err(|error| {
-        log::debug!("Failed to inspect graphics image file {}: {error}", canonical.display());
         GraphicsError::FileUnreadable
     })?;
 
@@ -140,9 +142,18 @@ fn check_opened(path: &Path, file: &File) -> Result<(), GraphicsError> {
         return Err(GraphicsError::FileUnreadable);
     }
 
+    // The identity check needs the file's device and inode, which stay out of
+    // reach on the platforms that do not expose them; the policy check above
+    // has already been repeated against the canonical path there.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+
+        let named = _canonical.metadata().map_err(|error| {
+            log::debug!("Failed to inspect graphics image file {}: {error}", _canonical.display());
+            GraphicsError::FileUnreadable
+        })?;
+
         if metadata.dev() != named.dev() || metadata.ino() != named.ino() {
             log::debug!("Graphics image file {} changed under the terminal", path.display());
             return Err(GraphicsError::FileUnreadable);
@@ -185,7 +196,50 @@ fn canonical_allowed(path: &Path) -> Option<PathBuf> {
         }
     }
 
+    #[cfg(windows)]
+    {
+        if !windows_allowed(&canonical) {
+            return None;
+        }
+    }
+
     Some(canonical)
+}
+
+/// Whether a canonical Windows path may be read.
+///
+/// The device namespace reaches raw disks, volumes and the kernel's own object
+/// tree, which the protocol has no business reading, and the reserved DOS names
+/// refer to devices even when they look like ordinary files. Only a drive-path
+/// canonical form is accepted, so anything reached through another namespace is
+/// refused by construction.
+#[cfg(windows)]
+fn windows_allowed(canonical: &Path) -> bool {
+    let text = canonical.as_os_str().to_string_lossy();
+
+    // `canonicalize` yields the verbatim form, `\\?\C:\...`, for ordinary
+    // files; a device path keeps its own prefix and is refused here.
+    let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let bytes = stripped.as_bytes();
+    let drive_path = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+
+    if !drive_path || text.starts_with(r"\\.\") {
+        return false;
+    }
+
+    // Reserved device names are devices wherever they appear.
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
+    canonical
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_ascii_uppercase())
+        .is_none_or(|stem| !RESERVED.contains(&stem.as_str()))
 }
 
 /// Open a file the terminal only reads.
