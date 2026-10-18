@@ -7,6 +7,9 @@ Platform:
 InstallerType: portable
 Commands:
 - alacritty
+Dependencies:
+  PackageDependencies:
+  - PackageIdentifier: Microsoft.VCRedist.2015+.x64
 Installers:
 - Architecture: x64
   InstallerUrl: {{INSTALLER_URL}}

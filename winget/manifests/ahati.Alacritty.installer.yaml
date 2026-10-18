@@ -7,9 +7,12 @@ Platform:
 InstallerType: portable
 Commands:
 - alacritty
+Dependencies:
+  PackageDependencies:
+  - PackageIdentifier: Microsoft.VCRedist.2015+.x64
 Installers:
 - Architecture: x64
-  InstallerUrl: https://github.com/ahati/alacritty/releases/download/v0.18.0/Alacritty-v0.18.0-portable-mingw.exe
-  InstallerSha256: B7542E48B3F6DAE49478A40D8C2CC180317A5C83657F1C345AADF76FD901DC27
+  InstallerUrl: https://github.com/ahati/alacritty/releases/download/v0.18.0/Alacritty-v0.18.0-portable.exe
+  InstallerSha256: 34978C2806B8A4F356E9AB792FB754349691CFB95469EA75CFE54407BB39A56C
 ManifestType: installer
 ManifestVersion: 1.12.0
