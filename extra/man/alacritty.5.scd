@@ -625,6 +625,42 @@ Windows: _"powershell"_
 
 	Default: _"OnlyCopy"_
 
+*[terminal.graphics]*
+
+	This section documents the *[terminal.graphics]* table, which configures
+	the _Kitty graphics protocol_ for inline images.
+
+*enabled* = _true_ | _false_
+
+	Whether inline images are handled at all.
+
+	Default: _true_
+
+*max_image_dimension* = _<integer>_
+
+	Maximum width or height of an image, in pixels. Larger images are rejected.
+
+	Default: _10000_
+
+*memory_limit* = _<integer>_
+
+	Maximum number of bytes of decoded image data to keep in memory. Images that
+	no placement refers to are dropped first when the limit is reached.
+
+	Default: _320000000_
+
+*allow_network_paths* = _true_ | _false_
+
+	Whether a file transmission may name a path that leaves this machine. On
+	Windows a _UNC_ path names the host to read from, so a program running in the
+	terminal could make Alacritty contact a machine of its choosing merely by
+	printing an escape sequence. Setting this to _false_ refuses such a path from
+	the bytes the client sent, before anything is resolved, so no connection is
+	attempted at all. Network filesystems are mounted as ordinary directories on
+	other platforms, where the setting has no effect.
+
+	Default: _true_
+
 # MOUSE
 
 This section documents the *[mouse]* table of the configuration file.

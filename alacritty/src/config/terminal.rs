@@ -1,9 +1,9 @@
-use serde::{Deserialize, Deserializer, Serialize, de};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use toml::Value;
 
 use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
 use alacritty_terminal::graphics::{
-    DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MEMORY_LIMIT, GraphicsConfig,
+    GraphicsConfig, DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MEMORY_LIMIT,
 };
 use alacritty_terminal::term::Osc52;
 
@@ -46,6 +46,15 @@ pub struct Graphics {
     /// Images that no placement refers to are dropped first when the limit is
     /// reached.
     pub memory_limit: usize,
+
+    /// Whether a file transmission may name a path that leaves this machine.
+    ///
+    /// On Windows a UNC path names the host to read from, so a program in the
+    /// terminal could make it contact a machine of its choosing; disabling
+    /// this keeps the connection from being attempted at all. Other platforms
+    /// mount network filesystems as ordinary directories, where the setting
+    /// has no effect.
+    pub allow_network_paths: bool,
 }
 
 impl Default for Graphics {
@@ -54,6 +63,7 @@ impl Default for Graphics {
             enabled: true,
             max_image_dimension: DEFAULT_MAX_IMAGE_DIMENSION,
             memory_limit: DEFAULT_MEMORY_LIMIT,
+            allow_network_paths: true,
         }
     }
 }
@@ -64,6 +74,7 @@ impl From<&Graphics> for GraphicsConfig {
             enabled: graphics.enabled,
             max_image_dimension: graphics.max_image_dimension,
             memory_limit: graphics.memory_limit,
+            allow_network_paths: graphics.allow_network_paths,
         }
     }
 }

@@ -78,6 +78,15 @@ pub struct GraphicsConfig {
     pub max_image_dimension: u32,
     /// Maximum bytes of decoded image data to keep.
     pub memory_limit: usize,
+    /// Whether a file transmission may name a path that leaves this machine.
+    ///
+    /// On Windows a UNC path names the host to read from, so a client can make
+    /// the terminal contact a machine of its choosing. Refusing such paths also
+    /// keeps the connection from being attempted at all, since resolving the
+    /// path is what reaches out. Network filesystems are mounted paths on other
+    /// platforms, which cannot be told apart from local ones, so the setting has
+    /// no effect there.
+    pub allow_network_paths: bool,
 }
 
 impl Default for GraphicsConfig {
@@ -86,6 +95,7 @@ impl Default for GraphicsConfig {
             enabled: true,
             max_image_dimension: DEFAULT_MAX_IMAGE_DIMENSION,
             memory_limit: DEFAULT_MEMORY_LIMIT,
+            allow_network_paths: true,
         }
     }
 }
@@ -96,6 +106,7 @@ impl GraphicsConfig {
         enabled: false,
         max_image_dimension: DEFAULT_MAX_IMAGE_DIMENSION,
         memory_limit: DEFAULT_MEMORY_LIMIT,
+        allow_network_paths: true,
     };
 }
 
@@ -692,6 +703,7 @@ impl GraphicsStore {
                     source: Source::File(file),
                     limit: decompression_limit(command, &self.config),
                     max_dimension: self.config.max_image_dimension,
+                    allow_network_paths: self.config.allow_network_paths,
                     pending: Some(Pending {
                         anchor: cursor,
                         display: command.action == Action::TransmitAndDisplay,
@@ -778,6 +790,7 @@ impl GraphicsStore {
             source: Source::Inline(data),
             limit,
             max_dimension,
+            allow_network_paths: self.config.allow_network_paths,
             pending: None,
         });
 
@@ -794,6 +807,7 @@ impl GraphicsStore {
             source,
             limit: decompression_limit(command, &self.config),
             max_dimension: self.config.max_image_dimension,
+            allow_network_paths: self.config.allow_network_paths,
             pending: None,
         });
 
@@ -1193,6 +1207,8 @@ pub struct DecodeJob {
     limit: usize,
     /// Maximum image dimension the terminal will allocate.
     max_dimension: u32,
+    /// Whether a file medium may name a path that leaves this machine.
+    allow_network_paths: bool,
     /// Transmission to complete once the payload has been decoded.
     pending: Option<Pending>,
 }
@@ -1208,9 +1224,10 @@ impl DecodeJob {
             Source::Inline(data) => {
                 decode_payload(&self.command, data, self.limit, self.max_dimension)
             },
-            Source::File(file) => file::read(&file, max_to_read).and_then(|data| {
-                decode_payload(&self.command, data, self.limit, self.max_dimension)
-            }),
+            Source::File(file) => file::read(&file, max_to_read, self.allow_network_paths)
+                .and_then(|data| {
+                    decode_payload(&self.command, data, self.limit, self.max_dimension)
+                }),
         };
 
         DecodeResult {
@@ -1705,6 +1722,19 @@ mod tests {
         let update = apc(&mut store, &payload);
         assert!(update.response.is_none());
         assert_eq!(store.memory_used(), 0);
+    }
+
+    #[test]
+    fn a_network_path_is_allowed_unless_the_configuration_refuses_it() {
+        // A client that has its pixels on a share is served by default, and the
+        // setting exists to take that away.
+        assert!(GraphicsConfig::default().allow_network_paths);
+
+        let refused = GraphicsConfig { allow_network_paths: false, ..GraphicsConfig::default() };
+        assert!(!refused.allow_network_paths);
+        // Only that one setting changes when it is turned off.
+        assert!(refused.enabled);
+        assert_eq!(refused.memory_limit, GraphicsConfig::default().memory_limit);
     }
 
     #[test]
