@@ -364,8 +364,7 @@ fn column_advance_wraps_to_the_next_line() {
     let before = term.grid().cursor.point;
 
     let pixels = vec![0u8; 200 * 100 * 3];
-    let sequence =
-        format!("\x1b_Gf=24,s=200,v=100,a=T,i=1,q=2;{}\x1b\\", BASE64.encode(&pixels));
+    let sequence = format!("\x1b_Gf=24,s=200,v=100,a=T,i=1,q=2;{}\x1b\\", BASE64.encode(&pixels));
     feed(&mut term, &mut parser, sequence.as_bytes());
 
     // Five rows tall, so the row advance reaches line 4, and the wrap adds one.
@@ -394,13 +393,13 @@ fn cursor_advance_respects_the_scroll_region() {
     // ends at line 6, so the excess must scroll the region and pin the cursor
     // to the region's last line.
     let pixels = vec![0u8; 100 * 200 * 3];
-    let sequence =
-        format!("\x1b_Gf=24,s=100,v=200,a=T,i=1,q=2;{}\x1b\\", BASE64.encode(&pixels));
+    let sequence = format!("\x1b_Gf=24,s=100,v=200,a=T,i=1,q=2;{}\x1b\\", BASE64.encode(&pixels));
     feed(&mut term, &mut parser, sequence.as_bytes());
 
     assert_eq!(term.grid().cursor.point.line.0, 6, "cursor must pin to the region end");
 
-    let cell = &term.grid()[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(0)];
+    let cell =
+        &term.grid()[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(0)];
     assert_eq!(cell.c, 't', "a region scroll must not touch lines above it");
 }
 
@@ -510,4 +509,49 @@ fn full_no_newline_sequence_keeps_every_placement() {
     assert_eq!(last.anchor.column.0, 77, "columns accumulate without a newline");
     assert_eq!(term.grid().cursor.point.line.0, bottom_row + 1);
     assert_eq!(term.grid().cursor.point.column.0, 0, "the wrap resets the column");
+}
+
+#[test]
+fn tall_images_at_the_bottom_do_not_overlap() {
+    let recorder = Recorder::default();
+    let mut term = Term::new(Config::default(), &TermSize::new(COLUMNS, 2 * LINES - 8), recorder);
+    let mut parser = Processor::new();
+    term.set_cell_size(11, 23);
+
+    // Photos scaled to the window width are far taller than the screen: 72
+    // rows on 40 lines. Placed back to back with icat's CR LF, each one has
+    // to scroll by more than a screenful, which `scroll_up` clamps to the
+    // region height. Before that clamp was worked around, every image after
+    // the cursor first reached the bottom line under-scrolled and the next
+    // one was anchored on top of it.
+    for (id, w, h) in [(1u32, 880u32, 1632u32), (2, 880, 494), (3, 880, 1632)] {
+        back_to_back(&mut term, &mut parser, id, w, h);
+        feed(&mut term, &mut parser, b"\r\n");
+    }
+
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 3);
+
+    // No placement reaches into the one below it, and the last one ends
+    // inside the screen rather than hanging below it.
+    for pair in placements.windows(2) {
+        let (first, second) = (pair[0], pair[1]);
+        let first_bottom = first.anchor.line.0 + i32::from(first.footprint.rows) - 1;
+        assert!(
+            second.anchor.line.0 > first_bottom,
+            "image at {} with {} rows overlaps the one at {}",
+            first.anchor.line.0,
+            first.footprint.rows,
+            second.anchor.line.0,
+        );
+    }
+    let last = placements.last().unwrap();
+    let last_bottom = last.anchor.line.0 + i32::from(last.footprint.rows) - 1;
+    assert!(
+        last_bottom < (2 * LINES - 8) as i32,
+        "last image hangs below the screen: {last_bottom}"
+    );
+
+    // The cursor waits below the last image for the client's next output.
+    assert_eq!(term.grid().cursor.point.line.0, (2 * LINES - 9) as i32);
 }

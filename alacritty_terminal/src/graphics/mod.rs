@@ -56,7 +56,10 @@ const BASE64_PAD: u8 = b'=';
 pub const DEFAULT_MAX_IMAGE_DIMENSION: u32 = 10_000;
 
 /// Default maximum bytes of decoded image data to keep resident.
-pub const DEFAULT_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
+///
+/// The reference implementation's storage limit, so a directory of photos
+/// behaves the same way here as there.
+pub const DEFAULT_MEMORY_LIMIT: usize = 320 * 1024 * 1024;
 
 /// Cell size assumed until the display reports the real one.
 ///

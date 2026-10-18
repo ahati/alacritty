@@ -778,7 +778,19 @@ impl<T> Term<T> {
         // reference implementation. Clamping instead would leave the cursor
         // inside the image, hiding whatever the client writes next.
         if target > last_line {
-            self.scroll_up((target - last_line) as usize);
+            // `scroll_up` clamps its line count to the scroll region's height,
+            // which is correct for text but would move an image taller than
+            // the screen by less than the excess, leaving its bottom below
+            // the viewport and the next placement overlapping it. Scroll the
+            // full excess in region-sized steps instead.
+            let region =
+                usize::try_from(self.scroll_region.end.0 - self.scroll_region.start.0).unwrap_or(1);
+            let mut excess = (target - last_line) as usize;
+            while excess > 0 {
+                let step = cmp::min(excess, region.max(1));
+                self.scroll_up(step);
+                excess -= step;
+            }
             self.grid.cursor.point.line = Line(last_line);
         } else {
             self.grid.cursor.point.line = Line(target);
