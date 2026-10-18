@@ -6,7 +6,10 @@ if [ $# -lt 2 ]; then
     exit 1
 fi
 
-repo="alacritty/alacritty"
+# The repository to publish to. Upstream's release process names itself
+# explicitly; a fork runs this same workflow and has to publish to itself,
+# rather than attempt a write to upstream that its token cannot make.
+repo="${GITHUB_REPOSITORY:-alacritty/alacritty}"
 file_path=$1
 bearer=$2
 
