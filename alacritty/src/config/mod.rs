@@ -412,6 +412,28 @@ mod tests {
         toml::from_str::<UiConfig>("").unwrap();
     }
 
+    #[test]
+    fn graphics_settings_are_read_and_default_to_allowing_network_paths() {
+        // The defaults are what a user gets without saying anything, and a
+        // network path is one a client may name.
+        let default = toml::from_str::<UiConfig>("").unwrap();
+        assert!(default.terminal.graphics.enabled);
+        assert!(default.terminal.graphics.allow_network_paths);
+
+        // Both spellings of the setting, in its own section.
+        let refused =
+            toml::from_str::<UiConfig>("[terminal.graphics]\nallow_network_paths = false\n")
+                .unwrap();
+        assert!(!refused.terminal.graphics.allow_network_paths);
+        assert!(refused.terminal.graphics.enabled);
+
+        // And it reaches the terminal core's own configuration.
+        use alacritty_terminal::graphics::GraphicsConfig;
+
+        assert!(!GraphicsConfig::from(&refused.terminal.graphics).allow_network_paths);
+        assert!(GraphicsConfig::from(&default.terminal.graphics).allow_network_paths);
+    }
+
     fn yaml_to_toml(contents: &str) -> String {
         let mut value: serde_yaml::Value = serde_yaml::from_str(contents).unwrap();
         prune_yaml_nulls(&mut value, false);
