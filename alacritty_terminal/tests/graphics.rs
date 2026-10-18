@@ -1456,3 +1456,512 @@ fn rejects_unreadable_png_payloads() {
         assert_eq!(term.graphics().memory_used(), 0);
     }
 }
+
+#[test]
+#[ignore = "benchmark: run explicitly with --release -- --ignored --nocapture"]
+fn bench_real_stream_phases() {
+    let data = match std::fs::read("/tmp/icat_bytes.bin") {
+        Ok(data) => data,
+        Err(_) => return,
+    };
+    let recorder = Recorder::default();
+    let mut term = Term::new(Config::default(), &TermSize::new(COLUMNS, 2 * LINES - 8), recorder);
+    let mut parser: Processor = Processor::new();
+    term.set_cell_size(11, 23);
+
+    let t0 = std::time::Instant::now();
+    let mut parse = std::time::Duration::ZERO;
+    let mut decode = std::time::Duration::ZERO;
+    for chunk in data.chunks(4096) {
+        let p0 = std::time::Instant::now();
+        parser.advance(&mut term, chunk);
+        parse += p0.elapsed();
+        let d0 = std::time::Instant::now();
+        settle(&mut term);
+        decode += d0.elapsed();
+    }
+    eprintln!(
+        "stream={}MB parse={parse:?} decode={decode:?} total={:?}",
+        data.len() / 1_000_000,
+        t0.elapsed()
+    );
+}
+
+/// Raw RGB bytes whose pixels are all distinct.
+///
+/// The file-medium tests read a window out of a larger buffer, so the pixels
+/// have to differ from the surrounding garbage for a wrong offset or size to
+/// show up in the stored image.
+fn rgb_bytes(width: u32, height: u32) -> Vec<u8> {
+    (0..width * height * 3).map(|byte| byte as u8).collect()
+}
+
+/// The base64 payload a client sends to name `path` for a file medium.
+///
+/// `kitten icat` base64-encodes the path and the parser decodes it again before
+/// the file is opened, so a path travels exactly like image data. The decoded
+/// payload carries no NUL terminator.
+fn path_payload(path: &Path) -> String {
+    BASE64.encode(path.as_os_str().as_encoded_bytes())
+}
+
+/// A temporary file that removes itself when the guard is dropped.
+struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    /// Path of the file, as a client would name it in a `t=f` command.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether the file is still on disk.
+    fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
+    /// Base64 payload naming this file.
+    fn payload(&self) -> String {
+        path_payload(&self.path)
+    }
+
+    /// Number of bytes the path occupies once the payload is decoded.
+    fn payload_len(&self) -> usize {
+        self.path.as_os_str().as_encoded_bytes().len()
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Write `bytes` to a fresh file under the system temporary directory.
+///
+/// The reference implementation only removes a `t=t` file whose path contains
+/// `tty-graphics-protocol`, so `name` selects whether the path is marked for
+/// deletion.
+fn temp_file(name: &str, bytes: &[u8]) -> TempFile {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join(format!("alacritty-graphics-{}-{unique}-{name}", std::process::id()));
+    std::fs::write(&path, bytes).expect("failed to write the temporary test file");
+    TempFile { path }
+}
+
+/// Dimensions and pixels of the stored image with the given client id.
+fn stored_image(term: &Term<Recorder>, client_id: u32) -> (u32, u32, Vec<u8>) {
+    let image = term
+        .graphics()
+        .images()
+        .map(|(_, image)| image)
+        .find(|image| image.client_id == client_id)
+        .expect("the image must be stored");
+    (image.width, image.height, image.pixels.to_vec())
+}
+
+#[test]
+fn reads_a_raw_image_from_a_file() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // `kitten icat` can name a file (the `f` medium) instead of sending the
+    // pixels inline, leaving `S` out so the whole file is read. The file
+    // belongs to the client, so the terminal never deletes a `t=f` file, even
+    // one it is allowed to clean up.
+    let pixels = rgb_bytes(2, 2);
+    let file = temp_file("tty-graphics-protocol-raw.bin", &pixels);
+    let control = "a=T,f=24,s=2,v=2,i=1,t=f";
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, control, &file.payload()),
+        vec!["\x1b_Gi=1;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(stored_image(&term, 1), (2, 2, pixels));
+    assert!(file.exists(), "a `t=f` file must not be deleted by the terminal");
+}
+
+#[test]
+fn a_file_transmission_with_only_a_number_is_assigned_an_id() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A number-only transmission is answered with the identifier the terminal
+    // assigned, exactly as for an inline payload.
+    let pixels = rgb_bytes(2, 2);
+    let file = temp_file("tty-graphics-protocol-number.bin", &pixels);
+    let control = format!("a=T,f=24,s=2,v=2,I=1,t=f,S={}", file.payload_len());
+
+    let replies = command(&mut term, &mut parser, &recorder, &control, &file.payload());
+    let assigned = term.graphics().images().next().expect("the image must be stored").1.client_id;
+    assert_ne!(assigned, 0, "the terminal assigns an id to a numbered image");
+    assert_eq!(replies, vec![format!("\x1b_Gi={assigned},I=1;OK\x1b\\")]);
+    assert_eq!(stored_image(&term, assigned).2, pixels);
+}
+
+#[test]
+fn reads_a_png_image_from_a_file() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A PNG names its own dimensions, so `S` may be left out and the whole
+    // file is read; the header supplies the size.
+    let pixels = vec![7u8; 5 * 3 * 3];
+    let png = png_bytes(5, 3, png::ColorType::Rgb, &pixels);
+    let file = temp_file("tty-graphics-protocol-png.bin", &png);
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=100,i=2,t=f", &file.payload()),
+        vec!["\x1b_Gi=2;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(stored_image(&term, 2), (5, 3, pixels));
+}
+
+#[test]
+fn reads_a_compressed_image_from_a_temporary_file() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // The reference test writes a zlib-compressed payload to a marked temp
+    // file, transmits it with `t=t,o=z`, and expects the file to be gone.
+    let pixels = rgb_bytes(2, 2);
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&pixels, 6);
+    let file = temp_file("tty-graphics-protocol-zlib.bin", &compressed);
+    let control = format!("a=T,f=24,s=2,v=2,i=3,t=t,o=z,S={}", compressed.len());
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, &control, &file.payload()),
+        vec!["\x1b_Gi=3;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(stored_image(&term, 3).2, pixels);
+    assert!(!file.exists(), "a `t=t` file is removed once it has been read");
+}
+
+#[test]
+fn removes_a_marked_temporary_file_after_reading_it() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // The `t` medium asks the terminal to delete the file after reading it.
+    let pixels = rgb_bytes(2, 2);
+    let file = temp_file("tty-graphics-protocol-temp.bin", &pixels);
+    let control = format!("a=T,f=24,s=2,v=2,i=4,t=t,S={}", pixels.len());
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, &control, &file.payload()),
+        vec!["\x1b_Gi=4;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(stored_image(&term, 4).2, pixels);
+    assert!(!file.exists(), "the terminal must delete the temporary file");
+}
+
+#[test]
+fn keeps_a_temporary_file_whose_path_is_not_marked() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Only files whose path contains `tty-graphics-protocol` are removed, so an
+    // unmarked `t=t` path keeps the terminal from deleting an arbitrary file.
+    let pixels = rgb_bytes(2, 2);
+    let file = temp_file("unmarked.bin", &pixels);
+    let control = format!("a=T,f=24,s=2,v=2,i=5,t=t,S={}", pixels.len());
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, &control, &file.payload()),
+        vec!["\x1b_Gi=5;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(stored_image(&term, 5).2, pixels);
+    assert!(file.exists(), "an unmarked `t=t` path must not be deleted");
+}
+
+#[test]
+fn removes_a_marked_temporary_file_even_when_loading_fails() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // The reference unlinks an opened `t=t` file whether or not its contents
+    // turned out to be a usable image, so a broken transfer leaves nothing
+    // behind to accumulate.
+    let file = temp_file("tty-graphics-protocol-short.bin", &[1, 2, 3, 4, 5, 6, 7]);
+    let control = "a=T,f=24,s=2,v=2,i=6,t=t,S=12";
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, control, &file.payload()),
+        vec!["\x1b_Gi=6;EBADF:Failed to read image file\x1b\\".to_owned()],
+    );
+
+    assert!(!file.exists(), "an opened `t=t` file is removed even on failure");
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn reads_a_file_window_at_the_given_offset() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // The reference test frames the image with garbage and reads it with a non
+    // page aligned offset; both the leading and trailing bytes must be skipped.
+    let pixels = rgb_bytes(2, 2);
+    let mut contents = vec![0xee; 3];
+    contents.extend_from_slice(&pixels);
+    contents.extend_from_slice(&[0xdd; 5]);
+    let file = temp_file("tty-graphics-protocol-window.bin", &contents);
+    let control = format!("a=T,f=24,s=2,v=2,i=7,t=f,S={},O=3", pixels.len());
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, &control, &file.payload()),
+        vec!["\x1b_Gi=7;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(stored_image(&term, 7).2, pixels);
+}
+
+#[test]
+fn the_offset_and_size_pick_one_image_out_of_several() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // `S` bounds how much is read, so together with `O` it selects a single
+    // image out of a file holding several back to back.
+    let first = rgb_bytes(2, 2);
+    let mut second = rgb_bytes(2, 2);
+    for byte in &mut second {
+        *byte ^= 0xff;
+    }
+    let mut contents = first.clone();
+    contents.extend_from_slice(&second);
+    let file = temp_file("tty-graphics-protocol-packed.bin", &contents);
+    let control = format!("a=T,f=24,s=2,v=2,i=8,t=f,S={},O={}", second.len(), first.len());
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, &control, &file.payload()),
+        vec!["\x1b_Gi=8;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(stored_image(&term, 8).2, second);
+}
+
+#[test]
+fn a_declared_size_smaller_than_the_image_is_reported_as_unreadable() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // `S` limits the read, so a size below what the declared pixels need is a
+    // short read even though the file itself holds a whole image.
+    let pixels = rgb_bytes(2, 2);
+    let mut contents = pixels.clone();
+    contents.extend_from_slice(&[0xab; 10]);
+    let file = temp_file("tty-graphics-protocol-partial.bin", &contents);
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=24,s=2,v=2,i=9,t=f,S=6", &file.payload()),
+        vec!["\x1b_Gi=9;EBADF:Failed to read image file\x1b\\".to_owned()],
+    );
+
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn a_short_file_without_a_declared_size_is_reported_as_unreadable() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // With no `S` the file's own length is read, and a file too short for the
+    // declared pixels is still a generic failure rather than an error that
+    // leaks how large it was.
+    let file = temp_file("tty-graphics-protocol-truncated.bin", &[1, 2, 3, 4, 5, 6, 7]);
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=24,s=2,v=2,i=17,t=f", &file.payload()),
+        vec!["\x1b_Gi=17;EBADF:Failed to read image file\x1b\\".to_owned()],
+    );
+
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn every_unreadable_file_reports_the_same_generic_error() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // The reference reports one identical error for a missing file, a
+    // directory and a file that is too short, so a client cannot use the reply
+    // to probe the filesystem for existence, type or size.
+    let missing = temp_file("tty-graphics-protocol-gone.bin", b"");
+    std::fs::remove_file(missing.path()).expect("failed to remove the temporary test file");
+    let too_short = temp_file("tty-graphics-protocol-small.bin", &[1, 2, 3, 4, 5, 6, 7]);
+    let directory = std::env::temp_dir();
+
+    for (image_id, path) in
+        [(10u32, missing.path()), (11, directory.as_path()), (12, too_short.path())]
+    {
+        let control = format!("a=T,f=24,s=2,v=2,i={image_id},t=f,S=12");
+        assert_eq!(
+            command(&mut term, &mut parser, &recorder, &control, &path_payload(path)),
+            vec![format!("\x1b_Gi={image_id};EBADF:Failed to read image file\x1b\\")],
+            "unexpected reply for path {path:?}",
+        );
+    }
+
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn an_offset_past_the_end_of_a_file_reports_the_generic_error() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Past the end there is nothing left to read, so the command fails the same
+    // way whether or not the client declared a size.
+    let file = temp_file("tty-graphics-protocol-past-end.bin", &rgb_bytes(2, 2));
+
+    assert_eq!(
+        command(
+            &mut term,
+            &mut parser,
+            &recorder,
+            "a=T,f=24,s=2,v=2,i=13,t=f,O=4096",
+            &file.payload()
+        ),
+        vec!["\x1b_Gi=13;EBADF:Failed to read image file\x1b\\".to_owned()],
+    );
+    assert_eq!(
+        command(
+            &mut term,
+            &mut parser,
+            &recorder,
+            "a=T,f=24,s=2,v=2,i=14,t=f,S=12,O=4096",
+            &file.payload(),
+        ),
+        vec!["\x1b_Gi=14;EBADF:Failed to read image file\x1b\\".to_owned()],
+    );
+
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn rejects_a_filename_longer_than_two_kilobytes() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A payload naming a file is refused once it decodes to more than 2048
+    // bytes, before the path is interpreted at all.
+    let too_long = "a".repeat(2049);
+    assert_eq!(
+        command(
+            &mut term,
+            &mut parser,
+            &recorder,
+            "a=T,f=24,s=2,v=2,i=15,t=f",
+            &path_payload(Path::new(&too_long)),
+        ),
+        vec!["\x1b_Gi=15;EINVAL:Filename too long\x1b\\".to_owned()],
+    );
+
+    // Exactly 2048 bytes is not too long, so the command proceeds and fails
+    // only because no such file exists.
+    let boundary = "b".repeat(2048);
+    assert_eq!(
+        command(
+            &mut term,
+            &mut parser,
+            &recorder,
+            "a=T,f=24,s=2,v=2,i=16,t=f",
+            &path_payload(Path::new(&boundary)),
+        ),
+        vec!["\x1b_Gi=16;EBADF:Failed to read image file\x1b\\".to_owned()],
+    );
+
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn a_query_without_an_identifier_reads_nothing_and_answers_nothing() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let file = temp_file("tty-graphics-protocol-query", &[1, 2, 3]);
+    let payload = path_payload(&file.path);
+
+    // No `i=` and no `I=`: the reference logs the command, reads no file and
+    // sends no response. A number does not qualify either; only an id does.
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=q,f=24,s=1,v=1,t=t", &payload),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=q,f=24,s=1,v=1,t=t,I=9", &payload),
+        Vec::<String>::new()
+    );
+    assert!(file.exists(), "the file was never read, so it is not removed");
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn a_zero_dimension_image_is_rejected_before_any_file_is_read() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let file = temp_file("tty-graphics-protocol-zero", &[1, 2, 3]);
+    let payload = path_payload(&file.path);
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=24,s=0,v=1,t=t,i=1", &payload),
+        vec!["\x1b_Gi=1;EINVAL:Zero width/height not allowed\x1b\\".to_owned()],
+    );
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=24,s=20001,v=1,t=t,i=2", &payload),
+        vec![
+            "\x1b_Gi=2;EINVAL:Image too large, width or height greater than 10000\x1b\\".to_owned()
+        ],
+    );
+    assert!(file.exists(), "the dimension checks precede the read");
+}
+
+#[test]
+fn compressed_file_data_inflating_short_is_its_own_error() {
+    // A zlib stream that inflates to 6 of the 12 bytes a 2x2 raw image needs:
+    // the file was read completely, so the reference reports the inflation
+    // mismatch rather than an unreadable file.
+    let compressed: [u8; 11] = [120, 156, 99, 96, 0, 1, 0, 0, 6, 0, 1];
+
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let file = temp_file("tty-graphics-protocol-short-inflate", &compressed);
+    let payload = path_payload(&file.path);
+
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=24,s=2,v=2,t=t,i=80,o=z", &payload),
+        vec!["\x1b_Gi=80;EINVAL:Image data size post inflation does not match expected size\x1b\\"
+            .to_owned()],
+    );
+    assert!(!file.exists(), "a marked temporary file is removed once opened");
+}
