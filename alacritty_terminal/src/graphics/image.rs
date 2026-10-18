@@ -115,8 +115,8 @@ struct Stored {
 ///
 /// A deferred decode reserves this much before it knows which layout the
 /// payload will decode to, and corrects the accounting when it finishes.
-pub fn max_pixel_bytes(width: u32, height: u32) -> usize {
-    (width as usize).saturating_mul(height as usize).saturating_mul(RGBA_CHANNELS)
+pub fn max_pixel_bytes(width: u32, height: u32, channels: usize) -> usize {
+    (width as usize).saturating_mul(height as usize).saturating_mul(channels)
 }
 
 /// Images and the memory quota that bounds them.
@@ -390,10 +390,33 @@ impl ImageStore {
             self.by_client_id.remove(&image.client_id);
         }
         if image.number != 0 && self.by_number.get(&image.number) == Some(&internal_id) {
-            self.by_number.remove(&image.number);
+            // Numbers are not unique keys: a later image with the same number
+            // coexists with an earlier one, and lookups resolve to the newest.
+            // Removing the newest hands the number back to its predecessor.
+            let number = image.number;
+            self.by_number.remove(&number);
+            if let Some((newest, _)) = self
+                .images
+                .iter()
+                .filter(|(_, image)| image.number == number)
+                .max_by_key(|(internal_id, _)| *internal_id)
+            {
+                self.by_number.insert(number, *newest);
+            }
         }
 
         true
+    }
+
+    /// The smallest client identifier not taken, as the reference
+    /// implementation assigns one to a transmission identified only by
+    /// number.
+    pub fn free_client_id(&self) -> u32 {
+        let mut candidate = 1;
+        while self.by_client_id.contains_key(&candidate) {
+            candidate += 1;
+        }
+        candidate
     }
 
     /// Evict images that no placement refers to until `needed` bytes fit.

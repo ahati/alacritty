@@ -173,6 +173,13 @@ impl PlacementStore {
         let carries_scrollback = region.start == Line(0);
 
         for placement in &mut self.placements {
+            // A virtual placement backs Unicode placeholder cells rather than
+            // being anchored to the grid, so scrolling never moves it and only
+            // an explicit delete or a reset removes it, as in the reference.
+            if placement.is_virtual {
+                continue;
+            }
+
             let line = placement.anchor.line;
             if !(carries_scrollback || line >= region.start) || line >= region.end {
                 continue;
@@ -217,10 +224,29 @@ impl PlacementStore {
     /// buffer, which is what makes an image taller than the screen survive.
     pub fn retain_within(&mut self, top: Line, bottom: Line) {
         self.placements.retain(|placement| {
+            // Virtual placements are pinned to their cells by the client, so
+            // buffer bounds do not apply to them.
+            if placement.is_virtual {
+                return true;
+            }
+
             let start = placement.anchor.line;
             let end = Line(start.0 + i32::from(placement.footprint.rows));
 
             start <= bottom && end > top
+        });
+    }
+
+    /// Drop the placements that are on the screen, keeping the ones that live
+    /// entirely in the scrollback.
+    ///
+    /// Screen clears and resets take only what is visible, as the reference
+    /// implementation's `clear_filter_func` does: a placement whose bottom
+    /// edge is at or above the top of the buffer belongs to history.
+    pub fn retain_scrollback(&mut self) {
+        self.placements.retain(|placement| {
+            let end = Line(placement.anchor.line.0 + i32::from(placement.footprint.rows));
+            end <= Line(0)
         });
     }
 

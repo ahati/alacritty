@@ -405,9 +405,13 @@ impl GraphicsStore {
 
         let mut transfer = match self.transfer.take() {
             Some(mut transfer) => {
-                // A continuation chunk carries only `m` and `q`.
+                // A continuation chunk carries only `m` and `q`. A chunk that
+                // carries no `q` of its own leaves the transmission's alone, so
+                // the quiet policy of the first chunk governs the reply.
                 transfer.command.more = command.more;
-                transfer.command.quiet = command.quiet;
+                if command.quiet != 0 {
+                    transfer.command.quiet = command.quiet;
+                }
                 transfer
             },
             None => Transfer::new(command),
@@ -451,6 +455,29 @@ impl GraphicsStore {
     /// Drop state that has scrolled out of the grid.
     pub fn prune(&mut self, top: Line, bottom: Line) {
         self.placements.retain_within(top, bottom);
+        self.drop_orphaned_images();
+    }
+
+    /// Release images that lost their last placement and can never be
+    /// addressed again because the client gave them no identity.
+    ///
+    /// The reference implementation frees such an image as soon as its last
+    /// reference scrolls out of the buffer, rather than holding its pixels
+    /// until the quota reclaims them.
+    fn drop_orphaned_images(&mut self) {
+        let orphaned: Vec<u32> = self
+            .images
+            .iter()
+            .filter(|(internal_id, image)| {
+                image.client_id == 0
+                    && image.number == 0
+                    && !self.placements.is_referenced(*internal_id)
+            })
+            .map(|(internal_id, _)| internal_id)
+            .collect();
+        for internal_id in orphaned {
+            self.images.remove(internal_id);
+        }
     }
 
     /// Remove every image and placement.
@@ -459,6 +486,17 @@ impl GraphicsStore {
         self.placements.clear();
         self.transfer = None;
         self.jobs.clear();
+    }
+
+    /// Remove what is on the screen, keeping placements that live entirely in
+    /// the scrollback and the pixels of images the client can still address.
+    ///
+    /// Screen clears and resets take only the visible part, as the reference
+    /// implementation does; scrolling back afterwards still shows the images
+    /// the history holds.
+    pub fn clear_visible(&mut self) {
+        self.placements.retain_scrollback();
+        self.drop_orphaned_images();
     }
 
     /// Take the decodes queued since the last call.
@@ -510,6 +548,12 @@ impl GraphicsStore {
 
     /// Carry out a parsed command.
     fn dispatch(&mut self, command: &Command, data: Vec<u8>, cursor: Point) -> GraphicsUpdate {
+        // The identifier and the number are two different addressing schemes,
+        // and the reference rejects a command that mixes them.
+        if command.image_id != 0 && command.image_number != 0 {
+            return self.failure(command, GraphicsError::Invalid);
+        }
+
         let outcome = match command.action {
             Action::Transmit => self.transmit(command, data).map(|_| (true, None)),
             Action::TransmitAndDisplay => self
@@ -553,7 +597,7 @@ impl GraphicsStore {
         // them in a header, which a compressed payload has to be expanded to
         // reach; raw formats declare theirs in the control data and stay
         // compressed until the worker runs.
-        let (data, command, (width, height)) = match (command.format, command.compression) {
+        let (data, mut command, (width, height)) = match (command.format, command.compression) {
             (Format::Png, Some(_)) => {
                 let data = decompress(command, data, limit)?;
                 let mut expanded = command.clone();
@@ -577,14 +621,32 @@ impl GraphicsStore {
         };
 
         // The payload has not been decoded, so the layout it will produce is
-        // not known yet and the largest one is reserved for it.
-        let reserved = image::max_pixel_bytes(width, height);
+        // not known yet and the largest one is reserved for it. A raw
+        // transmission already fixes its layout, so it reserves exactly what
+        // it will occupy; a PNG may still turn out to have an alpha channel.
+        let channels = if command.format == Format::Rgb {
+            image::PixelFormat::Rgb.channels()
+        } else {
+            image::PixelFormat::Rgba.channels()
+        };
+        let reserved = image::max_pixel_bytes(width, height, channels);
         self.make_room(reserved)?;
 
-        // Re-transmitting an identifier replaces the image and drops its
-        // existing placements, as the protocol requires.
-        if let Some(existing) = self.images.resolve(command.image_id, command.image_number) {
-            self.placements.remove_image(existing);
+        // Re-transmitting a client identifier replaces the image and drops its
+        // existing placements, as the protocol requires. A number is not an
+        // identifier: images identified by number coexist, and lookups pick
+        // the newest.
+        if command.image_id != 0 {
+            if let Some(existing) = self.images.resolve(command.image_id, 0) {
+                self.placements.remove_image(existing);
+            }
+        }
+
+        // A number-only transmission is assigned a free client identifier,
+        // as the reference implementation does, so the reply can carry it and
+        // the client can address the image by id from then on.
+        if command.image_id == 0 && command.image_number != 0 {
+            command.image_id = self.images.free_client_id();
         }
 
         let (internal_id, _) = self.images.insert_pending(
@@ -671,9 +733,22 @@ impl GraphicsStore {
         let free_data = selector.is_ascii_uppercase();
         let internal = self.images.resolve(command.image_id, command.image_number);
 
+        // The cell, column and row selectors take cursor positions, which the
+        // protocol counts from one, so the coordinates are shifted here. A
+        // value of zero is treated as the first position, as `saturating_sub`
+        // makes it indistinguishable from one.
+        let column = crate::index::Column(command.src_x.saturating_sub(1) as usize);
+        let row = Line(command.src_y.saturating_sub(1) as i32);
+        let point = Point::new(row, column);
+
+        // Images whose placements a selector below removes, so that a freeing
+        // selector can release the ones that lost their last placement.
+        let referenced: Vec<u32> =
+            self.placements.iter().map(|placement| placement.internal_id).collect();
+
         match selector.to_ascii_lowercase() {
-            // Everything visible.
-            b'a' => self.placements.clear(),
+            // Everything on the screen; scrollback placements survive.
+            b'a' => self.placements.retain_scrollback(),
             // Everything belonging to one image, optionally one placement.
             b'i' | b'n' => match internal {
                 Some(internal_id) => {
@@ -687,20 +762,11 @@ impl GraphicsStore {
             },
             // Placements intersecting a cell.
             b'c' => self.placements.remove_at(cursor),
-            b'p' => self.placements.remove_at(Point::new(
-                Line(command.src_y as i32),
-                crate::index::Column(command.src_x as usize),
-            )),
-            b'q' => {
-                let point = Point::new(
-                    Line(command.src_y as i32),
-                    crate::index::Column(command.src_x as usize),
-                );
-                self.remove_at_with_z(point, command.z_index);
-            },
+            b'p' => self.placements.remove_at(point),
+            b'q' => self.remove_at_with_z(point, command.z_index),
             // Placements intersecting a whole column or row.
-            b'x' => self.placements.remove_column(crate::index::Column(command.src_x as usize)),
-            b'y' => self.placements.remove_row(Line(command.src_y as i32)),
+            b'x' => self.placements.remove_column(column),
+            b'y' => self.placements.remove_row(row),
             b'z' => self.placements.remove_with_z(command.z_index),
             // Animation frames are not implemented.
             b'f' => return Err(GraphicsError::Unsupported),
@@ -724,6 +790,28 @@ impl GraphicsStore {
         if free_data {
             if let Some(internal_id) = internal {
                 if !self.placements.is_referenced(internal_id) {
+                    self.images.remove(internal_id);
+                }
+            }
+
+            // A freeing selector releases the pixels of every image that lost
+            // its last placement to it, not only one resolved from an
+            // identifier, as the reference implementation's filter does.
+            for internal_id in referenced {
+                if !self.placements.is_referenced(internal_id)
+                    && self.images.get(internal_id).is_some()
+                {
+                    self.images.remove(internal_id);
+                }
+            }
+        } else {
+            // Even a non-freeing selector drops the pixels of an anonymous
+            // image it orphaned: nothing can address it again.
+            for internal_id in referenced {
+                if !self.placements.is_referenced(internal_id)
+                    && self.images.get(internal_id).is_some()
+                    && self.images.get(internal_id).is_some_and(|image| image.client_id == 0)
+                {
                     self.images.remove(internal_id);
                 }
             }

@@ -1994,7 +1994,9 @@ impl<T: EventListener> Handler for Term<T> {
 
                 self.selection = None;
 
-                self.graphics.clear();
+                // Only the visible placements go; the scrollback keeps its
+                // images, as in the reference implementation.
+                self.graphics.clear_visible();
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
                 self.grid.clear_history();
@@ -2044,8 +2046,10 @@ impl<T: EventListener> Handler for Term<T> {
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
-        self.graphics.clear();
-        self.inactive_graphics.clear();
+        // A reset takes the screen but leaves the scrollback's images alone,
+        // as the reference implementation's hard reset does.
+        self.graphics.clear_visible();
+        self.inactive_graphics.clear_visible();
 
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
