@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+
+PackageIdentifier: {{PACKAGE_IDENTIFIER}}
+PackageVersion: {{VERSION}}
+Platform:
+- Windows.Desktop
+InstallerType: wix
+Scope: machine
+InstallModes:
+- interactive
+- silent
+- silentWithProgress
+UpgradeBehavior: install
+ReleaseDate: {{RELEASE_DATE}}
+ProductCode: "{{PRODUCT_CODE}}"
+AppsAndFeaturesEntries:
+- ProductCode: "{{PRODUCT_CODE}}"
+  UpgradeCode: "{{UPGRADE_CODE}}"
+InstallationMetadata:
+  DefaultInstallLocation: "%ProgramFiles%/Alacritty"
+Installers:
+- Architecture: x64
+  InstallerUrl: {{INSTALLER_URL}}
+  InstallerSha256: {{INSTALLER_SHA256}}
+ManifestType: installer
+ManifestVersion: 1.12.0

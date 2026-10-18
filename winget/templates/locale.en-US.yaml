@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+
+PackageIdentifier: {{PACKAGE_IDENTIFIER}}
+PackageVersion: {{VERSION}}
+PackageLocale: en-US
+Publisher: {{PUBLISHER}}
+PublisherUrl: {{REPOSITORY_URL}}
+PublisherSupportUrl: {{REPOSITORY_URL}}/issues
+Author: {{PUBLISHER}}
+PackageName: {{PACKAGE_NAME}}
+PackageUrl: {{REPOSITORY_URL}}
+License: Apache-2.0
+LicenseUrl: {{REPOSITORY_URL}}/blob/HEAD/LICENSE-APACHE
+Copyright: Copyright 2020 The Alacritty Project
+CopyrightUrl: {{REPOSITORY_URL}}/blob/HEAD/LICENSE-APACHE
+ShortDescription: {{SHORT_DESCRIPTION}}
+Moniker: {{MONIKER}}
+Tags:
+- terminal
+- gpu
+- opengl
+- kitty-graphics-protocol
+- images
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0

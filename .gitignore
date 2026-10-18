@@ -1,1 +1,4 @@
 target
+
+# winget manifests are generated per release: they pin one artifact's hash
+/winget/manifests/
