@@ -80,12 +80,20 @@ pub struct GraphicsConfig {
     pub memory_limit: usize,
     /// Whether a file transmission may name a path that leaves this machine.
     ///
-    /// On Windows a UNC path names the host to read from, so a client can make
-    /// the terminal contact a machine of its choosing. Refusing such paths also
-    /// keeps the connection from being attempted at all, since resolving the
-    /// path is what reaches out. Network filesystems are mounted paths on other
-    /// platforms, which cannot be told apart from local ones, so the setting has
-    /// no effect there.
+    /// On Windows a share names the host to read from, so a client can make the
+    /// terminal contact a machine of its choosing, and authenticate to it.
+    /// Turning this off refuses such a path from the bytes the client sent,
+    /// before the path is resolved, and refuses a path that resolves to a share
+    /// as well.
+    ///
+    /// A directory junction or a folder redirect can still reach a share while
+    /// the path is being resolved, which happens before any check that needs a
+    /// file to exist; a mapped drive is reported as a drive letter, which cannot
+    /// be told from a local drive. Neither can be refused, and neither is the
+    /// connection prevented for.
+    ///
+    /// Network filesystems are ordinary mounts on other platforms, where the
+    /// setting has no effect.
     pub allow_network_paths: bool,
 }
 

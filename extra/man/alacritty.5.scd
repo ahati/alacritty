@@ -652,12 +652,17 @@ Windows: _"powershell"_
 *allow_network_paths* = _true_ | _false_
 
 	Whether a file transmission may name a path that leaves this machine. On
-	Windows a _UNC_ path names the host to read from, so a program running in the
-	terminal could make Alacritty contact a machine of its choosing merely by
-	printing an escape sequence. Setting this to _false_ refuses such a path from
-	the bytes the client sent, before anything is resolved, so no connection is
-	attempted at all. Network filesystems are mounted as ordinary directories on
-	other platforms, where the setting has no effect.
+	Windows a share names the host to read from, so a program running in the
+	terminal could make Alacritty contact, and authenticate to, a machine of its
+	choosing merely by printing an escape sequence. Setting this to _false_
+	refuses such a path from the bytes the client sent, before anything is
+	resolved, and refuses a path that resolves to a share as well.
+
+	A directory junction or a folder redirect to a share can still reach one
+	while the path is resolved, and a mapped drive cannot be told from a local
+	drive, so neither is prevented by this setting. Network filesystems are
+	mounted as ordinary directories on other platforms, where the setting has no
+	effect.
 
 	Default: _true_
 

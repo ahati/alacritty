@@ -28,6 +28,29 @@ pub const MAX_FILENAME_LEN: usize = 2048;
 /// directory, so the setting has no effect there.
 const NETWORK_PATHS_REACHABLE: bool = cfg!(windows);
 
+/// The verbatim prefix the kernel emits for a path it reached directly, `\\?\`.
+///
+/// Spelled out in one place because a prefix of this shape is easy to get wrong
+/// by a single character, and a prefix that is one character out silently turns
+/// the namespace it marks into an ordinary one.
+const VERBATIM_PREFIX: &str = "\\\\?\\";
+
+/// The device namespace, `\\.\`.
+const DEVICE_PREFIX: &str = "\\\\.\\";
+
+/// The object manager's spelling of the device namespace, `\\??\`.
+const NT_PREFIX: &str = "\\\\??\\";
+
+/// The doubled separator that begins a path naming another machine, `\\`.
+///
+/// Only the plain spelling needs it, which is judged where paths may name a
+/// machine, so it is compiled only where that check is.
+#[cfg(any(windows, test))]
+const UNC_SEPARATOR: &str = "\\\\";
+
+/// The token that follows the verbatim prefix for a share, `UNC\`.
+const UNC_TOKEN: &str = "UNC\\";
+
 /// Largest read for a payload whose size its declared pixels do not bound.
 ///
 /// A compressed payload or a PNG stream can be arbitrarily large before it is
@@ -84,11 +107,16 @@ pub fn read(
     max_to_read: usize,
     allow_network_paths: bool,
 ) -> Result<Vec<u8>, GraphicsError> {
-    // A network path is refused from the raw bytes, before the path is so much
-    // as resolved: resolving it is what reaches out to the host, so a check
-    // that ran later could not prevent the connection.
-    if !allow_network_paths && NETWORK_PATHS_REACHABLE && names_a_network_share(&source.path) {
-        log::debug!("Refusing to read graphics image file from a network path");
+    // Refuse the forms that are refused however they would resolve, before the
+    // path is resolved at all: resolving it opens it, so a device or a pipe
+    // reached this way has had its side effects by the time a later check could
+    // refuse it, and the open itself can block. A network path is included,
+    // since resolving one is what reaches out to the host.
+    if NETWORK_PATHS_REACHABLE
+        && (refused_before_resolving(&source.path)
+            || (!allow_network_paths && names_a_network_share(&source.path)))
+    {
+        log::debug!("Refusing to read graphics image file from this path");
         return Err(GraphicsError::FileUnreadable);
     }
 
@@ -97,7 +125,7 @@ pub fn read(
     // The policy check has to happen before the file is opened: merely
     // opening a file can have side effects, and whether the open succeeds
     // tells the client whether a file it may not read exists at all.
-    let canonical = canonical_allowed(&path).ok_or_else(|| {
+    let canonical = canonical_allowed(&path, allow_network_paths).ok_or_else(|| {
         log::debug!("Refusing to read graphics image file {}", path.display());
         GraphicsError::FileUnreadable
     })?;
@@ -110,7 +138,7 @@ pub fn read(
         GraphicsError::FileUnreadable
     })?;
 
-    let result = check_opened(&path, &file).and_then(|()| {
+    let result = check_opened(&path, &file, allow_network_paths).and_then(|()| {
         let data = read_window(&file, source, max_to_read)?;
         // A raw window holding less than the pixels the control data declares
         // is reported as unreadable rather than as missing data, so that a
@@ -124,9 +152,8 @@ pub fn read(
         Ok(data)
     });
 
-    // Close the descriptor before deleting anything: Windows refuses to
-    // remove a file that is still open, so a temporary file would be left
-    // behind if the removal happened while the handle were alive.
+    // Nothing is reading the file any more, so it may be removed without
+    // leaving the outcome to the platform's delete-sharing rules.
     drop(file);
 
     if source.temp {
@@ -139,42 +166,57 @@ pub fn read(
 /// Check a freshly opened file again, now that its descriptor is held.
 ///
 /// The name could have been pointed at a different file between the policy
-/// check that preceded the open and the open itself, so the checks run once
-/// more against what was actually opened: the canonical path is resolved and
-/// judged by the same policy, it must still name the file that was opened
-/// (by device and inode on unix), and that file must be a regular one.
-fn check_opened(path: &Path, file: &File) -> Result<(), GraphicsError> {
+/// check that preceded the open and the open itself, so the file is judged once
+/// more, this time by what was actually opened: on unix the canonical name must
+/// still be the same file, by device and inode, and on Windows the name the
+/// kernel reports for the handle itself is judged by the same policy.
+fn check_opened(path: &Path, file: &File, allow_network_paths: bool) -> Result<(), GraphicsError> {
     let metadata = file.metadata().map_err(|error| {
         log::debug!("Failed to inspect graphics image file {}: {error}", path.display());
         GraphicsError::FileUnreadable
     })?;
 
-    // The policy is checked once more against the canonical name, even where
-    // the identity check below cannot run.
-    let _canonical = canonical_allowed(path).ok_or_else(|| {
-        log::debug!("Refusing to read graphics image file {}", path.display());
-        GraphicsError::FileUnreadable
-    })?;
-
+    // A directory is not an image, and on unix the test also rules out the
+    // devices, pipes and sockets that must not be read. On Windows the same
+    // test is weaker, since only directories and links are reported apart from
+    // files; the path policy is what rules the rest out there.
     if !metadata.is_file() {
         log::debug!("Graphics image file {} is not a regular file", path.display());
         return Err(GraphicsError::FileUnreadable);
     }
 
-    // The identity check needs the file's device and inode, which stay out of
-    // reach on the platforms that do not expose them; the policy check above
-    // has already been repeated against the canonical path there.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
-        let named = _canonical.metadata().map_err(|error| {
-            log::debug!("Failed to inspect graphics image file {}: {error}", _canonical.display());
+        let canonical = canonical_allowed(path, allow_network_paths).ok_or_else(|| {
+            log::debug!("Refusing to read graphics image file {}", path.display());
+            GraphicsError::FileUnreadable
+        })?;
+
+        let named = canonical.metadata().map_err(|error| {
+            log::debug!("Failed to inspect graphics image file {}: {error}", canonical.display());
             GraphicsError::FileUnreadable
         })?;
 
         if metadata.dev() != named.dev() || metadata.ino() != named.ino() {
             log::debug!("Graphics image file {} changed under the terminal", path.display());
+            return Err(GraphicsError::FileUnreadable);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // The name a handle resolves to is what identifies the file that will
+        // be read, so the policy is applied to that rather than to a name that
+        // is resolved a second time and may by then be a different file.
+        let opened = opened_path(file).ok_or_else(|| {
+            log::debug!("Failed to name the opened graphics image file {}", path.display());
+            GraphicsError::FileUnreadable
+        })?;
+
+        if !windows_allowed_form(&opened, allow_network_paths) {
+            log::debug!("Refusing to read graphics image file {}", opened);
             return Err(GraphicsError::FileUnreadable);
         }
     }
@@ -190,7 +232,7 @@ fn check_opened(path: &Path, file: &File) -> Result<(), GraphicsError> {
 /// kernel state and `/dev` device nodes, which the protocol has no business
 /// reading; `/dev/shm` is the exception, since shared memory objects live
 /// there.
-fn canonical_allowed(path: &Path) -> Option<PathBuf> {
+fn canonical_allowed(path: &Path, allow_network_paths: bool) -> Option<PathBuf> {
     let canonical = path.canonicalize().ok()?;
 
     #[cfg(unix)]
@@ -215,9 +257,12 @@ fn canonical_allowed(path: &Path) -> Option<PathBuf> {
         }
     }
 
+    // The setting only means anything where a path can name another machine.
+    let _ = allow_network_paths;
+
     #[cfg(windows)]
     {
-        if !windows_allowed(&canonical) {
+        if !windows_allowed(&canonical, allow_network_paths) {
             return None;
         }
     }
@@ -225,80 +270,187 @@ fn canonical_allowed(path: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
-/// Whether a canonical Windows path may be read.
+/// The name the kernel reports for an open file, or `None` when it cannot.
+///
+/// This is the file that will be read, whatever the name it was opened through
+/// now points at, which is what makes it usable as an identity for the policy.
 #[cfg(windows)]
-fn windows_allowed(canonical: &Path) -> bool {
-    windows_allowed_form(&canonical.as_os_str().to_string_lossy())
+fn opened_path(file: &File) -> Option<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+
+    let handle = file.as_raw_handle() as _;
+
+    // The call reports the length it needs when the buffer is too small, so it
+    // is retried with a buffer that size rather than guessed at.
+    let mut buffer = vec![0u16; 512];
+
+    loop {
+        let written = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                VOLUME_NAME_DOS,
+            )
+        };
+
+        if written == 0 {
+            return None;
+        }
+
+        // The length excludes the terminating NUL.
+        let written = written as usize;
+        if written < buffer.len() {
+            return Some(String::from_utf16_lossy(&buffer[..written]));
+        }
+
+        buffer.resize(written + 1, 0);
+    }
 }
 
-/// Whether a canonical Windows path, as text, may be read.
+/// Whether a canonical Windows path may be read.
+///
+/// `allow_network_paths` is applied here as well as to the bytes the client
+/// sent, so that a path which *resolves* to a share is refused even when it was
+/// not written as one: a directory junction or a folder redirect reaches a
+/// share through a local-looking name.
+#[cfg(windows)]
+fn windows_allowed(canonical: &Path, allow_network_paths: bool) -> bool {
+    windows_allowed_form(&canonical.as_os_str().to_string_lossy(), allow_network_paths)
+}
+
+/// Whether a path form may be read, judging only its text.
 ///
 /// Both a drive path and a share on a host name an ordinary file the user can
-/// reach, and both are accepted. The device namespace reaches raw disks, whole
-/// volumes and the kernel's own object tree, which the protocol has no business
-/// reading, and the reserved DOS names are devices however ordinary they look,
-/// so those are refused.
+/// reach. The device namespace names something that is not a file at all —
+/// raw disks, whole volumes, the kernel's own object tree, pipes — and the
+/// reserved DOS names are devices however ordinary they look, so those are
+/// refused.
 ///
-/// Compiled everywhere, even where the path form it judges cannot occur, so that
-/// the judgement itself can be tested.
+/// Compiled everywhere, even where the path forms it judges cannot occur, so
+/// that the judgement itself can be tested.
 #[cfg(any(windows, test))]
-fn windows_allowed_form(canonical: &str) -> bool {
-    // A device path names a device in every spelling.
-    if canonical.starts_with(r"\\.\") {
+fn windows_allowed_form(canonical: &str, allow_network_paths: bool) -> bool {
+    // Separators are interchangeable, so the namespace is read from one
+    // spelling. `\??\` is the NT spelling of the device namespace.
+    let unified = canonical.replace('/', "\\");
+
+    if unified.starts_with(DEVICE_PREFIX) || unified.starts_with(NT_PREFIX) {
         return false;
     }
 
-    // `canonicalize` yields the verbatim form for the paths it reaches
-    // directly: `\\?\C:\...` for a drive and `\\?\UNC\host\share\...` for a
-    // share. Judging the familiar spelling underneath is what makes the two
-    // comparable, and a verbatim path that is neither is a volume, a device or
-    // a pipe rather than a file, so it stays refused.
-    let body = canonical.strip_prefix(r"\\?\").unwrap_or(canonical);
-
-    let drive_path = {
-        let bytes = body.as_bytes();
-        bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && (bytes[2] == b'\\' || bytes[2] == b'/')
+    // `canonicalize` emits the verbatim prefix, `\\?\`, for the paths it
+    // reaches directly: `\\?\C:\...` for a drive and `\\?\UNC\host\share\...`
+    // for a share. Judging the familiar spelling underneath is what makes the
+    // two comparable; a verbatim path that is neither is a volume, a device or
+    // a pipe, and stays refused.
+    let (body, was_verbatim) = match unified.strip_prefix(VERBATIM_PREFIX) {
+        Some(rest) => (rest, true),
+        None => (unified.as_str(), false),
     };
 
-    let share_path =
-        if let Some(share) = body.strip_prefix(r"UNC\").or_else(|| body.strip_prefix("UNC/")) {
-            names_a_host_and_share(share)
-        } else if canonical == body {
-            // The path needed no canonicalizing, so it may carry the plain spelling.
-            body.strip_prefix(r"\\")
-                .or_else(|| body.strip_prefix("//"))
-                .is_some_and(names_a_host_and_share)
-        } else {
-            false
-        };
+    let drive_path = is_drive_path(body);
+
+    let share_path = if let Some(share) = strip_unc_prefix(body) {
+        names_a_host_and_share(share)
+    } else if was_verbatim {
+        false
+    } else {
+        // The path needed no canonicalizing, so the plain spelling is allowed
+        // alongside the verbatim one.
+        body.strip_prefix(UNC_SEPARATOR).is_some_and(names_a_host_and_share)
+    };
 
     if !drive_path && !share_path {
         return false;
     }
 
-    // Reserved device names are devices wherever they appear.
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
+    // A share names the host to contact, which the user may refuse outright.
+    if share_path && !allow_network_paths {
+        return false;
+    }
 
-    let name = body.rsplit(['\\', '/']).find(|part| !part.is_empty()).unwrap_or(body);
-    let stem = name.split('.').next().unwrap_or(name);
+    !is_reserved_device_name(body)
+}
 
-    !RESERVED.contains(&stem.to_ascii_uppercase().as_str())
+/// Whether the bytes a client sent name something that is refused whatever they
+/// resolve to.
+///
+/// This runs on the raw bytes, before the path is resolved, because resolving a
+/// path opens it: a device or a pipe that is opened before the policy is
+/// consulted has already had its side effects, and can block while it is
+/// opened. Only forms that are wrong however they would resolve are refused
+/// here, so that a relative path or one with `.` components still works.
+fn refused_before_resolving(path: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(path);
+    let unified = text.replace('/', "\\");
+
+    // The device namespace and its NT spelling name devices, not files.
+    if unified.starts_with(DEVICE_PREFIX) || unified.starts_with(NT_PREFIX) {
+        return true;
+    }
+
+    // A verbatim path may only be a drive or a share; `\\?\Volume{...}`,
+    // `\\?\GLOBALROOT\...` and `\\?\PIPE\...` are none of those.
+    if let Some(rest) = unified.strip_prefix(VERBATIM_PREFIX) {
+        if !is_drive_path(rest) && !strip_unc_prefix(rest).is_some_and(names_a_host_and_share) {
+            return true;
+        }
+    }
+
+    is_reserved_device_name(&unified)
+}
+
+/// Whether the text names a drive path, as `C:\...`.
+fn is_drive_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+/// The rest of a `UNC\host\share` path, if that is what the text begins with.
+///
+/// The token is compared without regard to case, since that is how the path
+/// conversion reads it.
+fn strip_unc_prefix(text: &str) -> Option<&str> {
+    let (token, rest) = text.split_at_checked(4)?;
+
+    token.eq_ignore_ascii_case(UNC_TOKEN).then_some(rest)
 }
 
 /// Whether a share path names both a host and a share on it.
 ///
 /// Anything shorter names no file at all.
-#[cfg(any(windows, test))]
 fn names_a_host_and_share(share: &str) -> bool {
-    let mut parts = share.split(['\\', '/']).filter(|part| !part.is_empty());
+    let mut parts = share.split('\\').filter(|part| !part.is_empty());
 
     parts.next().is_some() && parts.next().is_some()
+}
+
+/// Whether the final component of the text is one of the reserved DOS names.
+///
+/// Those names refer to devices wherever they appear, and the system strips
+/// trailing spaces and periods from a component before deciding, so a name may
+/// look ordinary and still name a device. A name that merely begins like one is
+/// an ordinary file.
+fn is_reserved_device_name(text: &str) -> bool {
+    const RESERVED: [&str; 24] = [
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+        "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+        "LPT8", "LPT9",
+    ];
+
+    let Some(component) = text.rsplit('\\').find(|part| !part.is_empty()) else {
+        return false;
+    };
+
+    // A stream name follows a colon, and a device name ends at the first period
+    // or the first colon, whichever comes first.
+    let name = component.split(['.', ':']).next().unwrap_or(component);
+    let name = name.trim_end_matches([' ', '.']);
+
+    RESERVED.contains(&name.to_ascii_uppercase().as_str())
 }
 
 /// Whether the client named a path that leaves this machine.
@@ -449,14 +601,31 @@ fn native_path(path: &[u8]) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Whether the policy accepts a canonical path, with network shares allowed.
+    fn allowed(canonical: &str) -> bool {
+        windows_allowed_form(canonical, true)
+    }
+
+    #[test]
+    fn the_path_prefixes_are_what_they_claim() {
+        // A prefix one character out would silently turn the namespace it
+        // marks into an ordinary path, so the exact sequences are pinned.
+        let chars = |text: &str| text.chars().collect::<Vec<_>>();
+
+        assert_eq!(chars(VERBATIM_PREFIX), ['\\', '\\', '?', '\\']);
+        assert_eq!(chars(DEVICE_PREFIX), ['\\', '\\', '.', '\\']);
+        assert_eq!(chars(NT_PREFIX), ['\\', '\\', '?', '?', '\\']);
+        assert_eq!(chars(UNC_SEPARATOR), ['\\', '\\']);
+        assert_eq!(chars(UNC_TOKEN), ['U', 'N', 'C', '\\']);
+    }
+
     #[test]
     fn a_network_share_is_named_by_a_doubled_separator() {
-        // Both spellings reach out to a host, so both are refused when the
-        // configuration says paths may not leave this machine.
+        // Both spellings reach out to a host.
         assert!(names_a_network_share(br"\\host\share\pic.png"));
         assert!(names_a_network_share(b"//host/share/pic.png"));
 
-        // Ordinary paths are not network paths, in either direction.
+        // An ordinary path is not a network path, in either direction.
         assert!(!names_a_network_share(br"C:\pic.png"));
         assert!(!names_a_network_share(b"/tmp/pic.png"));
         assert!(!names_a_network_share(br"\pic.png"));
@@ -464,45 +633,117 @@ mod tests {
 
     #[test]
     fn an_ordinary_windows_file_is_allowed() {
-        assert!(windows_allowed_form(r"\\?\C:\Users\me\pic.png"));
-        assert!(windows_allowed_form(r"C:\Users\me\pic.png"));
-        assert!(windows_allowed_form("C:/Users/me/pic.png"));
+        assert!(allowed(r"\\?\C:\Users\me\pic.png"));
+        assert!(allowed(r"C:\Users\me\pic.png"));
+        assert!(allowed("C:/Users/me/pic.png"));
 
-        // A mapped network drive is an ordinary drive path.
-        assert!(windows_allowed_form(r"\\?\Z:\photos\pic.png"));
+        // A mapped network drive is an ordinary drive path: the kernel reports
+        // it as a drive letter, so it cannot be told from a local one.
+        assert!(allowed(r"\\?\Z:\photos\pic.png"));
     }
 
     #[test]
     fn a_windows_network_share_is_allowed() {
-        // `canonicalize` yields the verbatim spelling, which must be accepted
-        // just as the familiar one is.
-        assert!(windows_allowed_form(r"\\?\UNC\host\share\pic.png"));
-        assert!(windows_allowed_form(r"\\host\share\pic.png"));
-        assert!(windows_allowed_form("//host/share/pic.png"));
-        assert!(windows_allowed_form(r"\\?\UNC\host\share"));
+        // `canonicalize` yields the verbatim spelling, which is accepted just
+        // as the familiar one is.
+        assert!(allowed(r"\\?\UNC\host\share\pic.png"));
+        assert!(allowed(r"\\host\share\pic.png"));
+        assert!(allowed("//host/share/pic.png"));
+        assert!(allowed(r"\\?\UNC\host\share"));
+        assert!(allowed(r"\\?\UNC\host\c$\Windows\win.ini"));
+
+        // The token is read without regard to case, and either separator may
+        // follow it.
+        assert!(allowed(r"\\?\unc\host\share\pic.png"));
+        assert!(allowed(r"\\?\Unc\host\share\pic.png"));
+        assert!(allowed(r"\\?\UNC/host/share/pic.png"));
+
+        // A share path has to name a share on a host.
+        assert!(!allowed(r"\\?\UNC\host"));
+        assert!(!allowed(r"\\host"));
+        assert!(!allowed("//host"));
+    }
+
+    #[test]
+    fn a_share_is_refused_when_the_configuration_says_so() {
+        // The setting takes away the paths that name another machine, in every
+        // spelling, while leaving local files alone.
+        for share in [
+            r"\\?\UNC\host\share\pic.png",
+            r"\\host\share\pic.png",
+            "//host/share/pic.png",
+            r"\\?\unc\host\share\pic.png",
+        ] {
+            assert!(!windows_allowed_form(share, false), "{share} must be refused");
+            assert!(windows_allowed_form(share, true), "{share} is allowed by default");
+        }
+
+        assert!(windows_allowed_form(r"\\?\C:\Users\me\pic.png", false));
     }
 
     #[test]
     fn the_windows_device_namespace_is_refused() {
         // These are not files, however much they look like paths: raw disks,
-        // whole volumes and the kernel's own object tree.
-        assert!(!windows_allowed_form(r"\\.\PhysicalDrive0"));
-        assert!(!windows_allowed_form(r"\\?\GLOBALROOT\Device\HarddiskVolume1\pic.png"));
-        assert!(!windows_allowed_form(r"\\?\Volume{b75e2c83-0000-0000-0000-602f00000000}\pic.png"));
-        // A share path has to name a share on a host.
-        assert!(!windows_allowed_form(r"\\host"));
-        assert!(!windows_allowed_form("//host"));
+        // whole volumes, the kernel's own object tree and pipes.
+        assert!(!allowed(r"\\.\PhysicalDrive0"));
+        assert!(!allowed(r"\\.\PIPE\pic"));
+        assert!(!allowed(r"\\?\PIPE\pic"));
+        assert!(!allowed(r"\\?\GLOBALROOT\Device\HarddiskVolume1\pic.png"));
+        assert!(!allowed(r"\\?\Volume{b75e2c83-0000-0000-0000-602f00000000}\pic.png"));
+
+        // The NT spellings of the same namespaces, and the separator variants
+        // the path conversion treats as equivalent.
+        assert!(!allowed(r"\\??\C:\Windows\win.ini"));
+        assert!(!allowed(r"\\??\UNC\host\share\pic.png"));
+        assert!(!allowed("//./C:/Windows/win.ini"));
+        assert!(!allowed(r"\\.\C:"));
     }
 
     #[test]
     fn the_reserved_device_names_are_refused() {
-        assert!(!windows_allowed_form(r"C:\Users\me\NUL"));
-        assert!(!windows_allowed_form(r"\\.\CON"));
-        assert!(!windows_allowed_form(r"\\?\C:\COM1"));
-        assert!(!windows_allowed_form(r"C:\Users\me\nul.png"));
+        assert!(!allowed(r"C:\Users\me\NUL"));
+        assert!(!allowed(r"C:\Users\me\NUL."));
+        assert!(!allowed(r"C:\Users\me\COM1"));
+        assert!(!allowed(r"\\?\C:\COM1"));
+        assert!(!allowed(r"C:\Users\me\LPT9"));
 
-        // A name that merely begins like a device is an ordinary file.
-        assert!(windows_allowed_form(r"C:\Users\me\console.png"));
-        assert!(windows_allowed_form(r"C:\Users\me\nulled.png"));
+        // A device name reaches through a stream or a trailing space as well,
+        // and the console devices are named like devices too.
+        assert!(!allowed(r"C:\Users\me\NUL:ads"));
+        assert!(!allowed(r"C:\Users\me\CONIN$"));
+        assert!(!allowed(r"C:\Users\me\CONOUT$"));
+
+        // A name that merely begins like a device is an ordinary file, and a
+        // stream on an ordinary file is ordinary.
+        assert!(allowed(r"C:\Users\me\console.png"));
+        assert!(allowed(r"C:\Users\me\nulled.png"));
+        assert!(allowed(r"C:\Users\me\pic.png:hidden"));
+    }
+
+    #[test]
+    fn a_refused_form_is_refused_before_it_is_resolved() {
+        // Whatever these would resolve to, the client asked for something that
+        // is not a file, so nothing may open them.
+        assert!(refused_before_resolving(br"\\.\PIPE\pic"));
+        assert!(refused_before_resolving(br"//./C:/Windows/win.ini"));
+        assert!(refused_before_resolving(br"\\.\PhysicalDrive0"));
+        assert!(refused_before_resolving(br"\\??\C:\Windows\win.ini"));
+        assert!(refused_before_resolving(br"\\?\PIPE\pic"));
+        assert!(refused_before_resolving(br"\\?\Volume{b75e2c83-0000}\pic.png"));
+        assert!(refused_before_resolving(br"\\?\GLOBALROOT\Device\HarddiskVolume1\pic"));
+        assert!(refused_before_resolving(br"C:\Users\me\NUL"));
+        assert!(refused_before_resolving(br"ConOut$"));
+        assert!(refused_before_resolving(br"C:\Users\me\NUL "));
+
+        // A path that is not yet resolved is not judged by its form: a relative
+        // path, a path with `..`, and a share are all left to the checks that
+        // can see where they lead.
+        assert!(!refused_before_resolving(b"pic.png"));
+        assert!(!refused_before_resolving(br"..\..\Windows\win.ini"));
+        assert!(!refused_before_resolving(br"\\host\share\pic.png"));
+        assert!(!refused_before_resolving(br"\\?\C:\Users\me\pic.png"));
+        assert!(!refused_before_resolving(br"\\?\UNC\host\share\pic.png"));
+        assert!(!refused_before_resolving(br"C:\Users\me\console.png"));
+        assert!(!refused_before_resolving(br"C:\Users\me\pic.png:hidden"));
     }
 }

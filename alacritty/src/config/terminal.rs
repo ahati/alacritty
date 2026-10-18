@@ -49,11 +49,15 @@ pub struct Graphics {
 
     /// Whether a file transmission may name a path that leaves this machine.
     ///
-    /// On Windows a UNC path names the host to read from, so a program in the
-    /// terminal could make it contact a machine of its choosing; disabling
-    /// this keeps the connection from being attempted at all. Other platforms
-    /// mount network filesystems as ordinary directories, where the setting
-    /// has no effect.
+    /// On Windows a share names the host to read from, so a program in the
+    /// terminal could make it contact, and authenticate to, a machine of its
+    /// choosing. Disabling this refuses such a path before it is resolved, and
+    /// refuses a path that resolves to a share too. A junction or a folder
+    /// redirect to a share can still reach one while the path is resolved, and
+    /// a mapped drive cannot be told from a local one, so neither is prevented.
+    ///
+    /// Other platforms mount network filesystems as ordinary directories, where
+    /// the setting has no effect.
     pub allow_network_paths: bool,
 }
 
