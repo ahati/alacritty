@@ -303,11 +303,12 @@ fn reset_clears_graphics() {
     feed(&mut term, &mut parser, &transmit(5, WHITE_PIXEL));
     assert_eq!(term.graphics().placements().len(), 1);
 
-    // RIS.
+    // RIS takes the placement but keeps the pixels of an image the client can
+    // still address by its identifier, as the reference implementation does.
     feed(&mut term, &mut parser, b"\x1bc");
 
     assert!(term.graphics().placements().is_empty());
-    assert_eq!(term.graphics().memory_used(), 0);
+    assert_eq!(term.graphics().memory_used(), 4);
 }
 
 /// Transmit an image the way a viewer or gallery does when it positions the
@@ -554,4 +555,902 @@ fn tall_images_at_the_bottom_do_not_overlap() {
 
     // The cursor waits below the last image for the client's next output.
     assert_eq!(term.grid().cursor.point.line.0, (2 * LINES - 9) as i32);
+}
+
+/// Base64 payload of an opaque raw RGB image of the given pixel size.
+fn rgb_payload(width: u32, height: u32) -> String {
+    BASE64.encode(vec![0u8; (width * height * 3) as usize])
+}
+
+/// Base64 payload of an opaque raw RGBA image of the given pixel size.
+fn rgba_payload(width: u32, height: u32) -> String {
+    BASE64.encode(vec![0u8; (width * height * 4) as usize])
+}
+
+/// Build a complete graphics escape sequence from control data and payload.
+fn sequence(control: &str, payload: &str) -> Vec<u8> {
+    if payload.is_empty() {
+        format!("\x1b_G{control}\x1b\\").into_bytes()
+    } else {
+        format!("\x1b_G{control};{payload}\x1b\\").into_bytes()
+    }
+}
+
+/// Send one graphics command and return the responses it produced.
+fn command(
+    term: &mut Term<Recorder>,
+    parser: &mut Processor,
+    recorder: &Recorder,
+    control: &str,
+    payload: &str,
+) -> Vec<String> {
+    let sent = recorder.pty_writes().len();
+    feed(term, parser, &sequence(control, payload));
+    recorder.pty_writes().split_off(sent)
+}
+
+/// Transmit and display (`a=T`) a raw RGB image, with extra control keys.
+fn put(
+    term: &mut Term<Recorder>,
+    parser: &mut Processor,
+    recorder: &Recorder,
+    image_id: u32,
+    width: u32,
+    height: u32,
+    extra: &str,
+) -> Vec<String> {
+    let control = format!("a=T,f=24,s={width},v={height},i={image_id}{extra}");
+    command(term, parser, recorder, &control, &rgb_payload(width, height))
+}
+
+/// Display an already stored image again (`a=p`), with extra control keys.
+fn put_reference(
+    term: &mut Term<Recorder>,
+    parser: &mut Processor,
+    recorder: &Recorder,
+    image_id: u32,
+    extra: &str,
+) -> Vec<String> {
+    command(term, parser, recorder, &format!("a=p,i={image_id}{extra}"), "")
+}
+
+/// Number of stored images, whether placed or not.
+fn image_count(term: &Term<Recorder>) -> usize {
+    term.graphics().images().count()
+}
+
+/// Client identifiers of the stored images, ascending.
+fn image_ids(term: &Term<Recorder>) -> Vec<u32> {
+    let mut ids: Vec<u32> = term.graphics().images().map(|(_, image)| image.client_id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Client identifiers the current placements refer to, ascending.
+fn placed_image_ids(term: &Term<Recorder>) -> Vec<u32> {
+    let mut ids: Vec<u32> = term
+        .graphics()
+        .placements()
+        .into_iter()
+        .filter_map(|placement| term.graphics().image(placement.internal_id))
+        .map(|image| image.client_id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Index the whole screen `count` times, one line each.
+fn scroll_screen(term: &mut Term<Recorder>, parser: &mut Processor, count: usize) {
+    for _ in 0..count {
+        feed(term, parser, format!("\x1b[{LINES};1H\n").as_bytes());
+    }
+}
+
+/// Index the scrolling region ending on 1-based row `bottom` `count` times.
+fn scroll_margin(term: &mut Term<Recorder>, parser: &mut Processor, bottom: usize, count: usize) {
+    feed(term, parser, format!("\x1b[{bottom};1H").as_bytes());
+    for _ in 0..count {
+        feed(term, parser, b"\n");
+    }
+}
+
+/// Encode a PNG image with the given pixel layout.
+fn png_bytes(width: u32, height: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(color);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(data).unwrap();
+    }
+    output
+}
+
+/// Base64 payload of a PNG image with the given pixel layout.
+fn png_payload(width: u32, height: u32, color: png::ColorType, data: &[u8]) -> String {
+    BASE64.encode(png_bytes(width, height, color, data))
+}
+
+#[test]
+fn images_outside_a_scroll_region_are_never_scrolled() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // One image at the top of the screen and one at the bottom.
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, "");
+    feed(&mut term, &mut parser, b"\x1b[24;1H");
+    put(&mut term, &mut parser, &recorder, 2, 10, 20, "");
+    assert_eq!(term.graphics().placements().len(), 2);
+
+    // A seven-line region (rows 2 to 6, 1-based) that covers neither image.
+    feed(&mut term, &mut parser, b"\x1b[2;6r");
+    for _ in 0..LINES + 5 {
+        scroll_margin(&mut term, &mut parser, 6, 1);
+        assert_eq!(term.graphics().placements().len(), 2, "a region scroll must not drop them");
+    }
+
+    let mut anchors: Vec<i32> =
+        term.graphics().placements().into_iter().map(|p| p.anchor.line.0).collect();
+    anchors.sort_unstable();
+    assert_eq!(anchors, vec![0, LINES as i32 - 1], "a region scroll must not move them");
+}
+
+#[test]
+#[ignore = "divergence: the fork pins an image to the top margin, kitty clips it and drops it"]
+fn a_placement_scrolled_past_a_margin_is_dropped() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Rows 2 to 4 (1-based), so lines 1 to 4.
+    feed(&mut term, &mut parser, b"\x1b[2;4r");
+    feed(&mut term, &mut parser, b"\x1b[2;1H");
+
+    // A two-cell-tall image inside the region, at its top.
+    put(&mut term, &mut parser, &recorder, 1, 10, 40, ",z=-1");
+    assert_eq!(term.graphics().placements()[0].footprint.rows, 2);
+
+    // Kitty clips the top row on the first two scrolls and drops the placement
+    // on the third, because an image may not leave the scrolling region. This
+    // fork has no margin clipping: it clamps the anchor to the region start and
+    // keeps the placement, so the count never drops.
+    scroll_margin(&mut term, &mut parser, 4, 3);
+    assert!(
+        term.graphics().placements().is_empty(),
+        "kitty drops a placement that scrolled past the top margin"
+    );
+}
+
+#[test]
+fn image_data_is_freed_when_its_last_placement_leaves_the_buffer() {
+    let recorder = Recorder::default();
+    let mut config = Config::default();
+    config.scrolling_history = 4;
+    let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder.clone());
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Anonymous: once nothing refers to it, no client can address it again,
+    // so the reference implementation frees it with its last placement. An
+    // image with an identifier survives, addressable for a later `a=p`.
+    command(&mut term, &mut parser, &recorder, "a=T,f=24,s=10,v=20", &rgb_payload(10, 20));
+
+    // Scrolling the image off the screen keeps it, because its line now lives
+    // in the history buffer and scrolling back shows it again.
+    scroll_screen(&mut term, &mut parser, 2);
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(image_count(&term), 1, "its line is still in the history");
+
+    // Once the history has been discarded the reference drops the image data.
+    scroll_screen(&mut term, &mut parser, 4);
+    assert_eq!(image_count(&term), 0, "kitty frees the data with its last placement");
+}
+
+#[test]
+fn reset_keeps_images_that_scrolled_into_the_history() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // An image on screen loses its placement to the reset; its pixels stay,
+    // because the client can still address the image by its identifier.
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, "");
+    feed(&mut term, &mut parser, b"\x1bc");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_count(&term), 1);
+
+    // An image scrolled into the history survives it, because kitty's reset only
+    // removes placements that are still visible on screen.
+    put(&mut term, &mut parser, &recorder, 2, 10, 20, "");
+    scroll_screen(&mut term, &mut parser, LINES);
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(term.graphics().placements()[0].anchor.line.0, -(LINES as i32));
+
+    feed(&mut term, &mut parser, b"\x1bc");
+    assert_eq!(term.graphics().placements().len(), 1, "only the scrollback placement survives");
+    assert_eq!(image_count(&term), 2, "both named images keep their pixels");
+}
+
+#[test]
+fn delete_selector_a_clears_placements_without_freeing_data() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, "");
+
+    // `a=d` without a selector clears every placement and keeps the data.
+    command(&mut term, &mut parser, &recorder, "a=d", "");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_count(&term), 1);
+
+    // The capital form frees the data of what it deletes; there is no placement
+    // left to delete, so nothing is freed, as in the reference implementation.
+    command(&mut term, &mut parser, &recorder, "a=d,d=A", "");
+    assert_eq!(image_ids(&term), vec![1]);
+}
+
+#[test]
+fn delete_selector_capital_a_frees_the_data_of_what_it_deletes() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    put(&mut term, &mut parser, &recorder, 2, 10, 20, "");
+    command(&mut term, &mut parser, &recorder, "a=d,d=A", "");
+
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_ids(&term), Vec::<u32>::new(), "the placement's image is freed with it");
+}
+
+#[test]
+fn delete_selector_i_removes_placements_and_capital_frees_data() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    put(&mut term, &mut parser, &recorder, 7, 10, 20, "");
+
+    // A placement id that does not exist leaves both the placement and the data.
+    command(&mut term, &mut parser, &recorder, "a=d,d=I,i=7,p=7", "");
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(image_ids(&term), vec![7]);
+
+    // The lowercase form only removes the placement, so the data stays usable.
+    command(&mut term, &mut parser, &recorder, "a=d,d=i,i=7", "");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_ids(&term), vec![7]);
+    assert_eq!(
+        put_reference(&mut term, &mut parser, &recorder, 7, ""),
+        vec!["\x1b_Gi=7;OK\x1b\\".to_owned()],
+    );
+
+    // The capital form frees the data, and the image is gone for good.
+    command(&mut term, &mut parser, &recorder, "a=d,d=I,i=7", "");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_count(&term), 0);
+    assert_eq!(
+        put_reference(&mut term, &mut parser, &recorder, 7, ""),
+        vec!["\x1b_Gi=7;ENOENT:image not found\x1b\\".to_owned()],
+    );
+
+    // A named placement is deleted on its own, and its image then freed with it.
+    put(&mut term, &mut parser, &recorder, 8, 10, 20, ",p=9");
+    assert_eq!(term.graphics().placements()[0].placement_id, 9);
+    command(&mut term, &mut parser, &recorder, "a=d,d=I,i=8,p=9", "");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn delete_selector_r_covers_a_range_of_image_ids() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Transmitted-only images: the range frees their data.
+    for image_id in [11u32, 12] {
+        let control = format!("a=t,f=24,s=10,v=20,i={image_id}");
+        command(&mut term, &mut parser, &recorder, &control, &rgb_payload(10, 20));
+    }
+    assert!(term.graphics().placements().is_empty(), "a=t must not display anything");
+    assert_eq!(image_count(&term), 2);
+
+    command(&mut term, &mut parser, &recorder, "a=d,d=R,x=11,y=12", "");
+    assert_eq!(image_count(&term), 0);
+
+    // Placed images: `y` alone covers every id from zero up to it.
+    for image_id in [1u32, 2, 3] {
+        put(&mut term, &mut parser, &recorder, image_id, 10, 20, "");
+    }
+    assert_eq!(term.graphics().placements().len(), 3);
+
+    command(&mut term, &mut parser, &recorder, "a=d,d=R,y=2", "");
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(image_ids(&term), vec![3]);
+
+    command(&mut term, &mut parser, &recorder, "a=d,d=R,x=3,y=3", "");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_count(&term), 0);
+}
+
+#[test]
+fn delete_at_the_cursor_cell_and_by_z_index() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Two one-cell images, at (0, 0) and (1, 0), with the cursor now at (2, 0).
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, "");
+    put(&mut term, &mut parser, &recorder, 2, 10, 20, "");
+
+    // Nothing is under the cursor.
+    command(&mut term, &mut parser, &recorder, "a=d,d=C", "");
+    assert_eq!(term.graphics().placements().len(), 2);
+
+    // The first image is under the home cell.
+    feed(&mut term, &mut parser, b"\x1b[H");
+    command(&mut term, &mut parser, &recorder, "a=d,d=C", "");
+    assert_eq!(placed_image_ids(&term), vec![2]);
+
+    // A placement carries its stacking order, and `d=Z` selects on it.
+    put(&mut term, &mut parser, &recorder, 3, 10, 20, ",z=9");
+    assert_eq!(term.graphics().placements().len(), 2);
+    command(&mut term, &mut parser, &recorder, "a=d,d=Z,z=9", "");
+    assert_eq!(placed_image_ids(&term), vec![2]);
+}
+
+#[test]
+fn delete_point_column_and_row_selectors_use_one_based_cells() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, "");
+    put(&mut term, &mut parser, &recorder, 2, 10, 20, "");
+
+    // `x=1,y=1` is the top left cell, where the first image sits.
+    command(&mut term, &mut parser, &recorder, "a=d,d=P,x=1,y=1", "");
+    assert_eq!(placed_image_ids(&term), vec![2]);
+
+    // `x=2` is the second column, where the second image sits.
+    command(&mut term, &mut parser, &recorder, "a=d,d=X,x=2", "");
+    assert!(term.graphics().placements().is_empty());
+}
+
+#[test]
+fn put_after_delete_shows_the_image_again() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    put(&mut term, &mut parser, &recorder, 999_999, 10, 20, "");
+    assert_eq!(
+        put_reference(&mut term, &mut parser, &recorder, 999_999, ""),
+        vec!["\x1b_Gi=999999;OK\x1b\\".to_owned()],
+    );
+
+    // Deleting the placements keeps the data, so it can be put again.
+    command(&mut term, &mut parser, &recorder, "a=d,d=i,i=999999", "");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_count(&term), 1);
+    assert_eq!(
+        put_reference(&mut term, &mut parser, &recorder, 999_999, ""),
+        vec!["\x1b_Gi=999999;OK\x1b\\".to_owned()],
+    );
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    // Freeing the data makes the image unreachable.
+    command(&mut term, &mut parser, &recorder, "a=d,d=I,i=999999", "");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_count(&term), 0);
+    assert_eq!(
+        put_reference(&mut term, &mut parser, &recorder, 999_999, ""),
+        vec!["\x1b_Gi=999999;ENOENT:image not found\x1b\\".to_owned()],
+    );
+}
+
+#[test]
+fn deleting_one_image_keeps_the_other_images_data() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    for image_id in [9_999_999u32, 10_000_000] {
+        put(&mut term, &mut parser, &recorder, image_id, 10, 20, "");
+        put_reference(&mut term, &mut parser, &recorder, image_id, "");
+    }
+    assert_eq!(term.graphics().placements().len(), 4);
+
+    // Two placements of one image go together; the other image keeps its data.
+    command(&mut term, &mut parser, &recorder, "a=d,d=i,i=9999999", "");
+    assert_eq!(placed_image_ids(&term), vec![10_000_000; 2]);
+    assert_eq!(image_ids(&term), vec![9_999_999, 10_000_000]);
+
+    command(&mut term, &mut parser, &recorder, "a=d,d=I,i=10000000", "");
+    assert!(term.graphics().placements().is_empty());
+    assert_eq!(image_ids(&term), vec![9_999_999]);
+}
+
+#[test]
+fn image_numbers_address_the_newest_image() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A number alone is enough to store and display an image.
+    let control = "a=T,f=24,s=10,v=20,I=1";
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, control, &rgb_payload(10, 20)),
+        vec!["\x1b_Gi=1,I=1;OK\x1b\\".to_owned()],
+    );
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(image_count(&term), 1);
+
+    // Transmitting the number again stores a second image, with its own
+    // internal identifier; the number now refers to that newer one.
+    let older: Vec<u32> = term.graphics().images().map(|(internal_id, _)| internal_id).collect();
+    command(&mut term, &mut parser, &recorder, control, &rgb_payload(10, 20));
+    assert_eq!(image_count(&term), 2);
+
+    // A reference by number lands on the newest image.
+    assert_eq!(
+        put_reference_by_number(&mut term, &mut parser, &recorder, 1),
+        vec!["\x1b_GI=1;OK\x1b\\".to_owned()],
+    );
+    let placements = term.graphics().placements();
+    // Both transmissions placed their image, and the reference added a third
+    // placement of the newer one.
+    assert_eq!(placements.len(), 3);
+    let referenced = placements.last().unwrap().internal_id;
+    assert!(!older.contains(&referenced), "the number must resolve to the newest image");
+
+    // An unknown number is not found.
+    assert_eq!(
+        put_reference_by_number(&mut term, &mut parser, &recorder, 94),
+        vec!["\x1b_GI=94;ENOENT:image not found\x1b\\".to_owned()],
+    );
+    assert_eq!(term.graphics().placements().len(), 3);
+
+    // Deleting by number takes the newest image's placements, keeping the
+    // data and the older image's placement.
+    command(&mut term, &mut parser, &recorder, "a=d,d=i,I=1", "");
+    assert_eq!(image_count(&term), 2);
+    assert_eq!(term.graphics().placements().len(), 1, "the older image keeps its placement");
+
+    // The capital form frees the data as well.
+    command(&mut term, &mut parser, &recorder, "a=d,d=N,I=1", "");
+    assert_eq!(image_count(&term), 1, "the older image with that number stays stored");
+}
+
+#[test]
+fn a_number_only_transmission_gets_a_server_assigned_id() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Kitty answers with the image id it assigned, and that id addresses the
+    // image afterwards.
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=t,f=24,s=10,v=20,I=1", &rgb_payload(10, 20)),
+        vec!["\x1b_Gi=1,I=1;OK\x1b\\".to_owned()],
+    );
+    let assigned = term.graphics().images().next().unwrap().1.client_id;
+    assert_ne!(assigned, 0, "the terminal assigns an id to a numbered image");
+    assert_eq!(
+        put_reference(&mut term, &mut parser, &recorder, assigned, ""),
+        vec![format!("\x1b_Gi={assigned};OK\x1b\\")],
+    );
+}
+
+#[test]
+fn reusing_a_number_keeps_the_older_images_placements() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let control = "a=T,f=24,s=10,v=20,I=1";
+    command(&mut term, &mut parser, &recorder, control, &rgb_payload(10, 20));
+    command(&mut term, &mut parser, &recorder, control, &rgb_payload(10, 20));
+
+    assert_eq!(image_count(&term), 2);
+    assert_eq!(term.graphics().placements().len(), 2, "kitty keeps both placements");
+}
+
+/// Place a stored image by its number (`I`) instead of its id.
+fn put_reference_by_number(
+    term: &mut Term<Recorder>,
+    parser: &mut Processor,
+    recorder: &Recorder,
+    number: u32,
+) -> Vec<String> {
+    command(term, parser, recorder, &format!("a=p,I={number}"), "")
+}
+
+#[test]
+fn chunked_transmission_keeps_its_number() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A 2x2 RGBA image, split across two chunks that only carry `m` in the
+    // continuation, so the number comes from the first one.
+    let payload = rgba_payload(2, 2);
+    let (first, second) = payload.split_at(12);
+
+    let start = command(&mut term, &mut parser, &recorder, "a=t,f=32,s=2,v=2,I=93,m=1", first);
+    assert!(start.is_empty(), "a chunk carrying more data is answered at the end");
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "m=0", second),
+        vec!["\x1b_Gi=1,I=93;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(image_count(&term), 1);
+    assert_eq!(
+        put_reference_by_number(&mut term, &mut parser, &recorder, 93),
+        vec!["\x1b_GI=93;OK\x1b\\".to_owned()],
+    );
+    assert_eq!(term.graphics().placements().len(), 1);
+}
+
+#[test]
+fn deleting_the_newest_image_number_reveals_the_previous_one() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let control = "a=t,f=24,s=10,v=20,I=1117";
+    command(&mut term, &mut parser, &recorder, control, &rgb_payload(10, 20));
+    let first = term.graphics().images().map(|(internal_id, _)| internal_id).min().unwrap();
+    command(&mut term, &mut parser, &recorder, control, &rgb_payload(10, 20));
+    let second = term.graphics().images().map(|(internal_id, _)| internal_id).max().unwrap();
+    assert_ne!(first, second, "each transmission gets its own identifier");
+
+    // Deleting the newest one leaves the older one addressable by the number.
+    command(&mut term, &mut parser, &recorder, "a=d,d=N,I=1117", "");
+    assert_eq!(
+        put_reference_by_number(&mut term, &mut parser, &recorder, 1117),
+        vec!["\x1b_GI=1117;OK\x1b\\".to_owned()],
+    );
+}
+
+#[test]
+fn quiet_one_suppresses_success_but_not_errors() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A quiet level of one silences the acknowledgement.
+    assert!(put(&mut term, &mut parser, &recorder, 1, 10, 20, ",q=1").is_empty());
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    // Failures are still reported.
+    let short = BASE64.encode(vec![0u8; 4]);
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=24,s=2,v=2,i=2,q=1", &short),
+        vec!["\x1b_Gi=2;ENODATA:not enough image data\x1b\\".to_owned()],
+    );
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    // A quiet level of two silences the failure as well.
+    assert!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=24,s=2,v=2,i=3,q=2", &short).is_empty()
+    );
+    assert_eq!(term.graphics().placements().len(), 1);
+    assert_eq!(image_ids(&term), vec![1], "a failed transmission stores nothing");
+
+    // A query is answered through the same path and is silenced by `q=1`.
+    let control = "a=q,f=24,s=1,v=1,i=4,q=1";
+    assert!(command(&mut term, &mut parser, &recorder, control, &rgb_payload(1, 1)).is_empty());
+    assert_eq!(image_count(&term), 1);
+}
+
+#[test]
+fn quiet_on_the_first_chunk_sticks_to_the_whole_transmission() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let payload = rgba_payload(2, 2);
+    let (first, second) = payload.split_at(12);
+
+    let start = command(&mut term, &mut parser, &recorder, "a=T,f=32,s=2,v=2,i=5,m=1,q=1", first);
+    assert!(start.is_empty(), "a chunk carrying more data is answered at the end");
+    assert!(
+        command(&mut term, &mut parser, &recorder, "m=0", second).is_empty(),
+        "kitty answers a quiet transmission only when the first chunk is not quiet"
+    );
+}
+
+#[test]
+fn quota_evicts_the_oldest_image_and_its_placement() {
+    let recorder = Recorder::default();
+    let mut config = Config::default();
+    // Room for exactly two 3x3 RGBA images.
+    config.graphics.memory_limit = 2 * 3 * 3 * 4;
+    let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder.clone());
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let control = |image_id: u32| format!("a=T,f=32,s=3,v=3,i={image_id}");
+    for image_id in [1u32, 2] {
+        let payload = rgba_payload(3, 3);
+        assert_eq!(
+            command(&mut term, &mut parser, &recorder, &control(image_id), &payload),
+            vec![format!("\x1b_Gi={image_id};OK\x1b\\")],
+        );
+    }
+    assert_eq!(image_count(&term), 2);
+    assert_eq!(term.graphics().memory_used(), 2 * 3 * 3 * 4);
+
+    // A third image only fits once the oldest is evicted, together with the
+    // placement that referred to it.
+    let payload = rgba_payload(3, 3);
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, &control(3), &payload),
+        vec!["\x1b_Gi=3;OK\x1b\\".to_owned()],
+    );
+    assert_eq!(image_ids(&term), vec![2, 3]);
+    assert_eq!(placed_image_ids(&term), vec![2, 3]);
+    assert_eq!(term.graphics().memory_used(), 2 * 3 * 3 * 4);
+}
+
+#[test]
+fn transient_images_are_evicted_before_older_ones() {
+    let recorder = Recorder::default();
+    let mut config = Config::default();
+    config.graphics.memory_limit = 2 * 3 * 3 * 4;
+    let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder.clone());
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A transient image is loaded after an older, non-transient one.
+    let payload = rgba_payload(3, 3);
+    command(&mut term, &mut parser, &recorder, "a=T,f=32,s=3,v=3,i=1", &payload);
+    command(&mut term, &mut parser, &recorder, "a=T,f=32,s=3,v=3,i=2,N=1", &payload);
+    assert_eq!(image_count(&term), 2);
+
+    // The transient one goes first, even though it is newer.
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=32,s=3,v=3,i=3", &payload),
+        vec!["\x1b_Gi=3;OK\x1b\\".to_owned()],
+    );
+    assert_eq!(image_ids(&term), vec![1, 3]);
+    assert_eq!(placed_image_ids(&term), vec![1, 3]);
+}
+
+#[test]
+fn quota_counts_a_raw_rgb_image_as_three_bytes_per_pixel() {
+    let recorder = Recorder::default();
+    let mut config = Config::default();
+    // Room for exactly two 3x3 RGB images, as in the reference test.
+    config.graphics.memory_limit = 2 * 3 * 3 * 3;
+    let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder.clone());
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    let payload = rgb_payload(3, 3);
+    for image_id in [1u32, 2] {
+        let control = format!("a=T,f=24,s=3,v=3,i={image_id}");
+        assert_eq!(
+            command(&mut term, &mut parser, &recorder, &control, &payload),
+            vec![format!("\x1b_Gi={image_id};OK\x1b\\")],
+        );
+    }
+    assert_eq!(term.graphics().memory_used(), 2 * 3 * 3 * 3);
+
+    // Only the oldest of the two has to go to make room for a third.
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, "a=T,f=24,s=3,v=3,i=3", &payload),
+        vec!["\x1b_Gi=3;OK\x1b\\".to_owned()],
+    );
+    assert_eq!(image_ids(&term), vec![2, 3]);
+}
+
+#[test]
+fn put_records_the_source_rect_and_pixel_offsets() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A one-cell image at the top left, which moves the cursor past it.
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, "");
+    assert_eq!(term.grid().cursor.point.column.0, 1);
+
+    // A second placement of the same image, with a source rectangle, pixel
+    // offsets, a stacking order and its own placement id.
+    let control = "a=p,i=1,c=80,r=1,x=2,y=1,w=3,h=5,X=3,Y=1,z=-1,p=17";
+    assert_eq!(
+        command(&mut term, &mut parser, &recorder, control, ""),
+        vec!["\x1b_Gi=1,p=17;OK\x1b\\".to_owned()],
+    );
+
+    assert_eq!(term.graphics().placements().len(), 2);
+    let second = term
+        .graphics()
+        .placements()
+        .into_iter()
+        .find(|placement| placement.placement_id == 17)
+        .expect("the new placement must exist");
+
+    assert_eq!((second.src.x, second.src.y, second.src.width, second.src.height), (2, 1, 3, 5));
+    assert_eq!((second.offset_x, second.offset_y), (3, 1));
+    assert_eq!(second.z_index, -1);
+    assert_eq!((second.footprint.columns, second.footprint.rows), (80, 1));
+    // Anchored where the cursor was, one cell past the first image.
+    assert_eq!((second.anchor.line.0, second.anchor.column.0), (0, 1));
+
+    // Placing 80 columns from column one wraps the cursor onto the next line.
+    assert_eq!(term.grid().cursor.point.line.0, 1);
+    assert_eq!(term.grid().cursor.point.column.0, 0);
+}
+
+#[test]
+fn putting_the_same_placement_id_moves_the_placement() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, "");
+    put_reference(&mut term, &mut parser, &recorder, 1, ",p=5");
+    assert_eq!(term.graphics().placements().len(), 2);
+
+    // Re-putting the same image and placement id replaces it in place.
+    feed(&mut term, &mut parser, b"\x1b[5;5H");
+    put_reference(&mut term, &mut parser, &recorder, 1, ",p=5");
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 2);
+    let moved = placements
+        .into_iter()
+        .find(|placement| placement.placement_id == 5)
+        .expect("the named placement must exist");
+    assert_eq!((moved.anchor.line.0, moved.anchor.column.0), (4, 4));
+
+    // Anonymous placements of the same image coexist instead.
+    put_reference(&mut term, &mut parser, &recorder, 1, "");
+    assert_eq!(term.graphics().placements().len(), 3);
+    put_reference(&mut term, &mut parser, &recorder, 1, "");
+    assert_eq!(term.graphics().placements().len(), 4);
+}
+
+#[test]
+fn put_with_pixel_offsets_records_them() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // A 10x20 image pushed 5px right and down covers 2x2 cells, and leaves the
+    // cursor on the second of them.
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, ",X=5,Y=5");
+
+    let placement = term.graphics().placements()[0];
+    assert_eq!((placement.offset_x, placement.offset_y), (5, 5));
+    assert_eq!((placement.footprint.columns, placement.footprint.rows), (2, 2));
+    assert_eq!((term.grid().cursor.point.column.0, term.grid().cursor.point.line.0), (2, 1));
+}
+
+#[test]
+fn placements_record_their_z_index() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    put(&mut term, &mut parser, &recorder, 1, 10, 20, "");
+    for placement_id in [2u32, 3, 4] {
+        let z = if placement_id > 2 { ",z=-2" } else { "" };
+        let extra = format!(",c=2,r=1,p={placement_id}{z}");
+        put_reference(&mut term, &mut parser, &recorder, 1, &extra);
+    }
+    put(&mut term, &mut parser, &recorder, 2, 10, 20, ",z=-1");
+    assert_eq!(term.graphics().placements().len(), 5);
+
+    // Back to front: by stacking order, then by image and placement identity.
+    let ordered: Vec<(i32, u32)> = term
+        .graphics()
+        .placements()
+        .into_iter()
+        .map(|placement| (placement.z_index, placement.placement_id))
+        .collect();
+    assert_eq!(ordered, vec![(-2, 3), (-2, 4), (-1, 0), (0, 0), (0, 2)]);
+}
+
+#[test]
+fn virtual_placements_are_flagged_and_pinned_to_their_cells() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // `U=1` backs Unicode placeholder cells: four columns wide, two rows tall.
+    put(&mut term, &mut parser, &recorder, 42, 20, 20, ",U=1,c=4,r=2");
+
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 1, "a virtual placement is still recorded");
+    let placement = placements[0];
+    assert!(placement.is_virtual, "the renderer skips it rather than drawing it");
+    assert_eq!((placement.columns, placement.rows), (4, 2));
+    assert_eq!((placement.footprint.columns, placement.footprint.rows), (4, 2));
+
+    // It backs cells rather than being drawn at the cursor, which stays put.
+    assert_eq!((term.grid().cursor.point.line.0, term.grid().cursor.point.column.0), (0, 0));
+
+    // A reset clears it with everything else.
+    feed(&mut term, &mut parser, b"\x1bc");
+    assert!(term.graphics().placements().is_empty());
+}
+
+#[test]
+fn virtual_placements_do_not_scroll_with_the_text() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    put(&mut term, &mut parser, &recorder, 42, 20, 20, ",U=1,c=4,r=2");
+    scroll_screen(&mut term, &mut parser, 3);
+
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 1, "scrolling never removes a virtual placement");
+    assert_eq!(placements[0].anchor.line.0, 0, "a virtual placement must not move");
+}
+
+#[test]
+fn png_payloads_report_their_own_dimensions() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // RGBA, RGB and greyscale sources all report the size from the header, and
+    // are charged for the layout they are stored in.
+    let cases = [
+        (1u32, png::ColorType::Rgba, 4usize, 4 * 5 * 3),
+        (2, png::ColorType::Rgb, 3, 3 * 5 * 3),
+        (3, png::ColorType::Grayscale, 1, 3 * 5 * 3),
+    ];
+    for (image_id, color, channels, charge) in cases {
+        let data = vec![7u8; 5 * 3 * channels];
+        let payload = png_payload(5, 3, color, &data);
+        let control = format!("a=T,f=100,i={image_id}");
+        assert_eq!(
+            command(&mut term, &mut parser, &recorder, &control, &payload),
+            vec![format!("\x1b_Gi={image_id};OK\x1b\\")],
+        );
+
+        let image = term
+            .graphics()
+            .images()
+            .map(|(_, image)| image)
+            .find(|image| image.client_id == image_id)
+            .expect("the image must be stored");
+        assert_eq!((image.width, image.height), (5, 3));
+        assert_eq!(image.charge(), charge);
+    }
+
+    assert_eq!(term.graphics().placements().len(), 3);
+    assert_eq!(term.graphics().memory_used(), 4 * 5 * 3 + 2 * 3 * 5 * 3);
+}
+
+#[test]
+fn rejects_unreadable_png_payloads() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Neither random bytes nor a PNG whose trailing chunks were cut off are
+    // accepted, and a rejected payload stores nothing.
+    let garbage = BASE64.encode(b"xxxxxxxxxxxxxxxxxxxxxxxxx");
+    let truncated = {
+        let full = png_bytes(3, 3, png::ColorType::Rgba, &vec![7u8; 3 * 3 * 4]);
+        BASE64.encode(&full[..full.len() - 16])
+    };
+
+    for (image_id, payload) in [(1u32, garbage), (2, truncated)] {
+        let control = format!("a=T,f=100,i={image_id}");
+        assert_eq!(
+            command(&mut term, &mut parser, &recorder, &control, &payload),
+            vec![format!("\x1b_Gi={image_id};EBADPNG:could not decode image data\x1b\\")],
+        );
+        assert!(term.graphics().placements().is_empty());
+        assert_eq!(term.graphics().memory_used(), 0);
+    }
 }
