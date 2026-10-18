@@ -529,8 +529,14 @@ impl<T> Term<T> {
 
         if self.mode.contains(TermMode::ALT_SCREEN) {
             self.inactive_grid.update_history(self.config.scrolling_history);
+            // Shrinking the history can discard lines placements are
+            // anchored to, on the grid that is not being displayed.
+            let (top, bottom) =
+                (self.inactive_grid.topmost_line(), self.inactive_grid.bottommost_line());
+            self.inactive_graphics.prune(top, bottom);
         } else {
             self.grid.update_history(self.config.scrolling_history);
+            self.prune_graphics();
         }
 
         if self.config.kitty_keyboard != old_config.kitty_keyboard {
@@ -751,8 +757,22 @@ impl<T> Term<T> {
         T: EventListener,
     {
         let rows = i32::from(advance.rows.saturating_sub(1));
-        let last_line = self.screen_lines() as i32 - 1;
-        let target = self.grid.cursor.point.line.0 + rows;
+        // The scroll region bounds the placement, as the margins do in the
+        // reference implementation: `scroll_up` moves only the region, so a
+        // cursor pinned to the screen end would drift out of it.
+        let last_line = self.scroll_region.end.0 - 1;
+        let mut target = self.grid.cursor.point.line.0 + rows;
+
+        // A column advance past the last column wraps to the start of the next
+        // line, as in the reference implementation. Clamping to the right edge
+        // instead would pile every later placement up in that column.
+        let column = self.grid.cursor.point.column.0 + usize::from(advance.columns);
+        if column >= self.columns() {
+            target += 1;
+            self.grid.cursor.point.column = Column(0);
+        } else {
+            self.grid.cursor.point.column = Column(column);
+        }
 
         // When the image ends below the last line the screen scrolls, as in the
         // reference implementation. Clamping instead would leave the cursor
@@ -763,10 +783,6 @@ impl<T> Term<T> {
         } else {
             self.grid.cursor.point.line = Line(target);
         }
-
-        let last_column = self.last_column();
-        self.grid.cursor.point.column =
-            cmp::min(self.grid.cursor.point.column + usize::from(advance.columns), last_column);
     }
 
     /// Resize terminal to new dimensions.

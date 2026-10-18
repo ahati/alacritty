@@ -60,9 +60,10 @@ pub const DEFAULT_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 
 /// Cell size assumed until the display reports the real one.
 ///
-/// It only affects how image sizes given in cells are resolved, so a wrong
-/// guess merely moves the cursor by an odd number of cells.
-const DEFAULT_CELL_SIZE: (u16, u16) = (1, 1);
+/// The reference implementation's core is constructed with these metrics, so
+/// a terminal that never reports its own resolves cell-relative image sizes
+/// the way the reference does, rather than counting one cell per pixel.
+const DEFAULT_CELL_SIZE: (u16, u16) = (10, 20);
 
 /// Configuration for graphics support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
