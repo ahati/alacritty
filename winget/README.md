@@ -53,7 +53,9 @@ workflow's `v<major>.<minor>.<patch>` pattern.
 
 ## Generating the manifest
 
-On Windows, in PowerShell:
+Manifests for the current release are already committed under
+`winget/manifests/`, so a clone can install without generating anything. Run
+the script only when publishing a *different* release:
 
 ```powershell
 # Portable executable: no administrator rights needed to install, and it does
@@ -94,9 +96,9 @@ winget uninstall --id ahati.Alacritty
   allows *any* manifest on the machine to be installed this way, which is why
   winget gates it behind an administrator. Turn it back off with
   `winget settings --disable LocalManifestFiles` when you are done.
-- **The generated manifests are not committed.** They embed the SHA256 of one
-  specific artifact, so they describe a release rather than the source tree;
-  `winget/manifests/` is ignored by git and rebuilt by the script.
+- **The manifests under `winget/manifests/` are committed.** They pin one
+  published artifact by SHA256, so they describe a release rather than the
+  source tree; regenerate them with `generate.ps1` for a different release.
 - **The release script targets upstream, and has to be changed first.**
   `.github/workflows/upload_asset.sh` hardcodes `repo="alacritty/alacritty"`, so
   the release job on this fork would create a draft release and upload its

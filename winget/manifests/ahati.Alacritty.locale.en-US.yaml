@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+
+PackageIdentifier: ahati.Alacritty
+PackageVersion: 0.18.0
+PackageLocale: en-US
+Publisher: ahati
+PublisherUrl: https://github.com/ahati/alacritty
+PublisherSupportUrl: https://github.com/ahati/alacritty/issues
+Author: ahati
+PackageName: Alacritty (fork)
+PackageUrl: https://github.com/ahati/alacritty
+License: Apache-2.0
+LicenseUrl: https://github.com/ahati/alacritty/blob/HEAD/LICENSE-APACHE
+Copyright: Copyright 2020 The Alacritty Project
+CopyrightUrl: https://github.com/ahati/alacritty/blob/HEAD/LICENSE-APACHE
+ShortDescription: A fork of Alacritty with Kitty graphics protocol support for inline images.
+Moniker: alacritty-fork
+Tags:
+- terminal
+- gpu
+- opengl
+- kitty-graphics-protocol
+- images
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0
