@@ -309,3 +309,205 @@ fn reset_clears_graphics() {
     assert!(term.graphics().placements().is_empty());
     assert_eq!(term.graphics().memory_used(), 0);
 }
+
+/// Transmit an image the way a viewer or gallery does when it positions the
+/// cursor itself: auto-sized, with no trailing newline to absorb the
+/// cursor-advance discrepancy.
+fn back_to_back(term: &mut Term<Recorder>, parser: &mut Processor, id: u32, w: u32, h: u32) {
+    let header = format!("\x1b_Ga=T,f=24,s={w},v={h},i={id},q=2;");
+    feed(term, parser, header.as_bytes());
+    feed(term, parser, BASE64.encode(vec![0u8; (w * h * 3) as usize]).as_bytes());
+    feed(term, parser, b"\x1b\\");
+}
+
+#[test]
+fn no_newline_placements_overlap_by_exactly_one_row() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // The reference implementation moves the cursor onto the last row of the
+    // image (`rows - 1`), so a client that does not print a newline afterwards
+    // overlaps the previous image by that one row. This pins the contract: the
+    // overlap must be exactly one row, never more, and the client is expected
+    // to emit the newline, as `kitten icat` does.
+    for (id, w, h) in [(1u32, 200u32, 100u32), (2, 100, 200), (3, 200, 100)] {
+        back_to_back(&mut term, &mut parser, id, w, h);
+    }
+
+    let placements = term.graphics().placements();
+    let (first, second, third) = (placements[0], placements[1], placements[2]);
+
+    assert_eq!((first.anchor.line.0, first.footprint.rows), (0, 5));
+    assert_eq!((second.anchor.line.0, second.footprint.rows), (4, 10));
+    assert_eq!((third.anchor.line.0, third.footprint.rows), (13, 5));
+
+    // Each anchor sits one row above the previous bottom edge: kitty-identical.
+    assert_eq!(second.anchor.line.0, first.anchor.line.0 + 5 - 1);
+    assert_eq!(third.anchor.line.0, second.anchor.line.0 + 10 - 1);
+
+    // The cursor stays on the bottom row of the last image, where the
+    // reference implementation leaves it.
+    assert_eq!(term.grid().cursor.point.line.0, third.anchor.line.0 + 5 - 1);
+}
+
+#[test]
+fn column_advance_wraps_to_the_next_line() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // An image 20 columns wide anchored at column 70 ends past the last
+    // column, so the cursor must wrap to the start of the next line rather
+    // than sticking to the right edge, as in the reference implementation.
+    feed(&mut term, &mut parser, b"\x1b[1;71H");
+    let before = term.grid().cursor.point;
+
+    let pixels = vec![0u8; 200 * 100 * 3];
+    let sequence =
+        format!("\x1b_Gf=24,s=200,v=100,a=T,i=1,q=2;{}\x1b\\", BASE64.encode(&pixels));
+    feed(&mut term, &mut parser, sequence.as_bytes());
+
+    // Five rows tall, so the row advance reaches line 4, and the wrap adds one.
+    assert_eq!(term.grid().cursor.point.column.0, 0, "must wrap to column 0");
+    assert_eq!(term.grid().cursor.point.line.0, before.line.0 + 4 + 1);
+
+    // The placement itself is anchored where the cursor was, unclipped.
+    let placement = term.graphics().placements()[0];
+    assert_eq!((placement.anchor.line.0, placement.anchor.column.0), (0, 70));
+}
+
+#[test]
+fn cursor_advance_respects_the_scroll_region() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Mark the first line so a scroll of the region cannot have moved it.
+    feed(&mut term, &mut parser, b"top\r\n");
+
+    // A five-line region: lines 2..6.
+    feed(&mut term, &mut parser, b"\x1b[3;7r");
+    feed(&mut term, &mut parser, b"\x1b[3;1H");
+
+    // Ten rows tall: the row advance alone would reach line 11, but the region
+    // ends at line 6, so the excess must scroll the region and pin the cursor
+    // to the region's last line.
+    let pixels = vec![0u8; 100 * 200 * 3];
+    let sequence =
+        format!("\x1b_Gf=24,s=100,v=200,a=T,i=1,q=2;{}\x1b\\", BASE64.encode(&pixels));
+    feed(&mut term, &mut parser, sequence.as_bytes());
+
+    assert_eq!(term.grid().cursor.point.line.0, 6, "cursor must pin to the region end");
+
+    let cell = &term.grid()[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(0)];
+    assert_eq!(cell.c, 't', "a region scroll must not touch lines above it");
+}
+
+#[test]
+fn config_history_shrink_prunes_stale_placements() {
+    let recorder = Recorder::default();
+    let mut config = Config::default();
+    config.scrolling_history = 10;
+    let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder);
+    let mut parser = Processor::new();
+
+    feed(&mut term, &mut parser, &transmit(1, WHITE_PIXEL));
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    // Scroll the image's line into the history, where it survives.
+    feed(&mut term, &mut parser, b"\x1b[24;1H\n");
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    // Shrinking the history discards that line, and with it the placement.
+    let mut smaller = Config::default();
+    smaller.scrolling_history = 0;
+    term.set_options(smaller);
+
+    assert!(
+        term.graphics().placements().is_empty(),
+        "a placement whose line the config shrank away must be dropped"
+    );
+}
+
+/// Transmit an image exactly as `kitten icat` does: auto-sized (`c`/`r` unset),
+/// then a CR LF afterwards.
+fn icat_style(term: &mut Term<Recorder>, parser: &mut Processor, id: u32, w: u32, h: u32) {
+    let header = format!("\x1b_Ga=T,f=24,s={w},v={h},i={id},q=2;");
+    feed(term, parser, header.as_bytes());
+    feed(term, parser, BASE64.encode(vec![0u8; (w * h * 3) as usize]).as_bytes());
+    feed(term, parser, b"\x1b\\");
+    feed(term, parser, b"\r\n");
+}
+
+#[test]
+fn consecutive_icat_images_do_not_overlap() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // The core has no font metrics of its own; the display reports these.
+    term.set_cell_size(10, 20);
+
+    // Landscape, portrait, landscape, portrait: the mix that was reported.
+    for (id, w, h) in [(1u32, 200u32, 100u32), (2, 100, 200), (3, 200, 100), (4, 100, 200)] {
+        icat_style(&mut term, &mut parser, id, w, h);
+    }
+
+    let mut placements: Vec<_> = term.graphics().placements().into_iter().cloned().collect();
+    placements.sort_by_key(|p| p.anchor.line.0);
+
+    for pair in placements.windows(2) {
+        let (first, second) = (&pair[0], &pair[1]);
+        let first_bottom = first.anchor.line.0 + i32::from(first.footprint.rows);
+        assert!(
+            second.anchor.line.0 >= first_bottom,
+            "image {id1} at line {a1} with {r1} rows overlaps image {id2} at line {a2}",
+            id1 = first.internal_id,
+            a1 = first.anchor.line.0,
+            r1 = first.footprint.rows,
+            id2 = second.internal_id,
+            a2 = second.anchor.line.0,
+        );
+    }
+
+    // The cursor must end below the last image, or the prompt lands inside it.
+    let last = placements.last().unwrap();
+    let last_bottom = last.anchor.line.0 + i32::from(last.footprint.rows);
+    assert!(
+        term.grid().cursor.point.line.0 >= last_bottom,
+        "cursor at line {} is inside the last image (bottom {last_bottom})",
+        term.grid().cursor.point.line.0,
+    );
+}
+
+#[test]
+fn full_no_newline_sequence_keeps_every_placement() {
+    let recorder = Recorder::default();
+    let mut term = Term::new(Config::default(), &TermSize::new(COLUMNS, 2 * LINES - 8), recorder);
+    let mut parser = Processor::new();
+    term.set_cell_size(11, 23);
+
+    // The whole reported sequence: twelve images mixing landscape and
+    // portrait, back to back with no newline, on an 80x40 screen.
+    let mut order = Vec::new();
+    for n in 1..=6u32 {
+        order.push((2 * n - 1, 200u32, 100u32));
+        order.push((2 * n, 100u32, 200u32));
+    }
+    for (id, w, h) in order {
+        back_to_back(&mut term, &mut parser, id, w, h);
+    }
+
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 12, "every placement must survive: {:?}", placements);
+
+    // The last portrait is anchored at column 77, where the columns have
+    // accumulated to, so it overhangs the right edge like in the reference.
+    // Its column advance then wraps, leaving the cursor one row below the
+    // image, reset to column zero, at the screen's last line.
+    let last = placements.last().unwrap();
+    let bottom_row = last.anchor.line.0 + i32::from(last.footprint.rows) - 1;
+    assert_eq!(last.anchor.column.0, 77, "columns accumulate without a newline");
+    assert_eq!(term.grid().cursor.point.line.0, bottom_row + 1);
+    assert_eq!(term.grid().cursor.point.column.0, 0, "the wrap resets the column");
+}
