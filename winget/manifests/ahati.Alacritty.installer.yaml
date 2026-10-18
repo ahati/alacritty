@@ -9,7 +9,7 @@ Commands:
 - alacritty
 Installers:
 - Architecture: x64
-  InstallerUrl: https://github.com/ahati/alacritty/releases/download/v0.18.0/Alacritty-v0.18.0-portable.exe
+  InstallerUrl: https://github.com/ahati/alacritty/releases/download/v0.18.0/Alacritty-v0.18.0-portable-mingw.exe
   InstallerSha256: B7542E48B3F6DAE49478A40D8C2CC180317A5C83657F1C345AADF76FD901DC27
 ManifestType: installer
 ManifestVersion: 1.12.0

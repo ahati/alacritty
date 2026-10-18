@@ -45,7 +45,7 @@ Then confirm the asset is really reachable, because `generate.ps1` will
 otherwise fail while downloading it:
 
 ```sh
-curl -sI https://github.com/ahati/alacritty/releases/download/v0.18.0/Alacritty-v0.18.0-portable.exe | head -1
+curl -sI https://github.com/ahati/alacritty/releases/download/v0.18.0/Alacritty-v0.18.0-portable-mingw.exe | head -1
 ```
 
 A `404` means the release is still a draft, or the tag did not match the
