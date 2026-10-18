@@ -30,8 +30,26 @@ So the first step is to push a tag to **this fork** (nothing is sent upstream):
 git tag v0.18.0 && git push origin v0.18.0
 ```
 
-Wait for the release job to finish, then check the assets exist on the fork's
-release page.
+Two things have to be true before that produces a downloadable asset:
+
+1. **The workflow has to run at all.** No workflow run has ever appeared on this
+   fork, not even from `ci.yml`, which triggers on every push — GitHub holds
+   workflows back on a fork until its owner enables them. If the Actions tab
+   offers to enable workflows, accept it, and confirm a run appears after the
+   tag is pushed.
+2. **The release has to be published.** The workflow creates it as a *draft*
+   (that is upstream's release process), and a draft's assets are not
+   downloadable by winget. Publish the draft on the fork's releases page.
+
+Then confirm the asset is really reachable, because `generate.ps1` will
+otherwise fail while downloading it:
+
+```sh
+curl -sI https://github.com/ahati/alacritty/releases/download/v0.18.0/Alacritty-v0.18.0-portable.exe | head -1
+```
+
+A `404` means the release is still a draft, or the tag did not match the
+workflow's `v<major>.<minor>.<patch>` pattern.
 
 ## Generating the manifest
 
@@ -79,6 +97,12 @@ winget uninstall --id ahati.Alacritty
 - **The generated manifests are not committed.** They embed the SHA256 of one
   specific artifact, so they describe a release rather than the source tree;
   `winget/manifests/` is ignored by git and rebuilt by the script.
+- **The workflow used to target upstream.** `.github/workflows/upload_asset.sh`
+  hardcoded `repo="alacritty/alacritty"`, so the release job on a fork would
+  have tried to create a draft release and upload assets *to upstream*, failing
+  with the fork's token and touching a repository it has no business touching.
+  It now publishes to whichever repository the workflow runs in; upstream is
+  unaffected because its own `GITHUB_REPOSITORY` is `alacritty/alacritty`.
 - **The MSI path needs two fixes first.** `alacritty/windows/wix/alacritty.wxs`
   still carries upstream's `UpgradeCode`
   (`87c21c74-dbd5-4584-89d5-46d9cd0c40a7`) and `Manufacturer="Alacritty"`, so
