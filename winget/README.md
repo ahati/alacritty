@@ -97,12 +97,15 @@ winget uninstall --id ahati.Alacritty
 - **The generated manifests are not committed.** They embed the SHA256 of one
   specific artifact, so they describe a release rather than the source tree;
   `winget/manifests/` is ignored by git and rebuilt by the script.
-- **The workflow used to target upstream.** `.github/workflows/upload_asset.sh`
-  hardcoded `repo="alacritty/alacritty"`, so the release job on a fork would
-  have tried to create a draft release and upload assets *to upstream*, failing
-  with the fork's token and touching a repository it has no business touching.
-  It now publishes to whichever repository the workflow runs in; upstream is
-  unaffected because its own `GITHUB_REPOSITORY` is `alacritty/alacritty`.
+- **The release script targets upstream, and has to be changed first.**
+  `.github/workflows/upload_asset.sh` hardcodes `repo="alacritty/alacritty"`, so
+  the release job on this fork would create a draft release and upload its
+  assets *to upstream*: a write the fork's token cannot make, aimed at a
+  repository it has no business writing to. It needs to publish to the
+  repository the workflow runs in, which is upstream when upstream runs it and
+  the fork when the fork does: `repo="${GITHUB_REPOSITORY:-alacritty/alacritty}"`.
+  Note that changing a file under `.github/workflows/` needs a token with the
+  `workflow` scope (`gh auth refresh -s workflow`).
 - **The MSI path needs two fixes first.** `alacritty/windows/wix/alacritty.wxs`
   still carries upstream's `UpgradeCode`
   (`87c21c74-dbd5-4584-89d5-46d9cd0c40a7`) and `Manufacturer="Alacritty"`, so
