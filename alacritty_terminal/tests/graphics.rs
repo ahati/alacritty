@@ -148,8 +148,7 @@ fn graphics_scroll_with_the_text() {
 #[test]
 fn a_placement_outlives_the_screen_but_not_the_buffer() {
     let recorder = Recorder::default();
-    let mut config = Config::default();
-    config.scrolling_history = 4;
+    let config = Config { scrolling_history: 4, ..Config::default() };
     let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder);
     let mut parser = Processor::new();
 
@@ -409,8 +408,7 @@ fn cursor_advance_respects_the_scroll_region() {
 #[test]
 fn config_history_shrink_prunes_stale_placements() {
     let recorder = Recorder::default();
-    let mut config = Config::default();
-    config.scrolling_history = 10;
+    let config = Config { scrolling_history: 10, ..Config::default() };
     let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder);
     let mut parser = Processor::new();
 
@@ -422,8 +420,7 @@ fn config_history_shrink_prunes_stale_placements() {
     assert_eq!(term.graphics().placements().len(), 1);
 
     // Shrinking the history discards that line, and with it the placement.
-    let mut smaller = Config::default();
-    smaller.scrolling_history = 0;
+    let smaller = Config { scrolling_history: 0, ..Config::default() };
     term.set_options(smaller);
 
     assert!(
@@ -728,8 +725,7 @@ fn a_placement_scrolled_past_a_margin_is_dropped() {
 #[test]
 fn image_data_is_freed_when_its_last_placement_leaves_the_buffer() {
     let recorder = Recorder::default();
-    let mut config = Config::default();
-    config.scrolling_history = 4;
+    let config = Config { scrolling_history: 4, ..Config::default() };
     let mut term = Term::new(config, &TermSize::new(COLUMNS, LINES), recorder.clone());
     let mut parser = Processor::new();
     term.set_cell_size(10, 20);
@@ -1442,7 +1438,7 @@ fn rejects_unreadable_png_payloads() {
     // accepted, and a rejected payload stores nothing.
     let garbage = BASE64.encode(b"xxxxxxxxxxxxxxxxxxxxxxxxx");
     let truncated = {
-        let full = png_bytes(3, 3, png::ColorType::Rgba, &vec![7u8; 3 * 3 * 4]);
+        let full = png_bytes(3, 3, png::ColorType::Rgba, &[7u8; 3 * 3 * 4]);
         BASE64.encode(&full[..full.len() - 16])
     };
 

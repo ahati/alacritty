@@ -585,7 +585,7 @@ impl GraphicsStore {
             };
         }
 
-        let update = match result {
+        match result {
             Ok(decoded) => {
                 // A query stores nothing, so it can never change the screen. For a
                 // transmission, the image may have been evicted or deleted while
@@ -609,9 +609,7 @@ impl GraphicsStore {
 
                 self.failure(&command, error)
             },
-        };
-
-        update
+        }
     }
 
     /// Carry out a parsed command.
