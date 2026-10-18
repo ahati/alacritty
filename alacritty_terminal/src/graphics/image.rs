@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::GraphicsError;
 use super::command::Format;
+use super::GraphicsError;
 
 /// Number of channels in a greyscale pixel.
 const GRAYSCALE_CHANNELS: usize = 1;

@@ -17,6 +17,7 @@
 //! base64 group are held in memory beyond the decoded image itself.
 
 pub mod command;
+mod file;
 pub mod image;
 pub mod placement;
 
@@ -25,8 +26,8 @@ use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 
 use crate::index::{Line, Point};
 
@@ -117,6 +118,16 @@ pub enum GraphicsError {
     NoSpace,
     /// Data arrived out of order.
     BadSequence,
+    /// A file medium named a path longer than the protocol allows.
+    FilenameTooLong,
+    /// The file a file medium named could not be read.
+    FileUnreadable,
+    /// A raw image declared no width or height.
+    ZeroDimensions,
+    /// A dimension exceeded the protocol's fixed limit.
+    ImageTooLarge,
+    /// Compressed data inflated to fewer bytes than the image needs.
+    InflationSize,
     /// The command is recognised but not implemented.
     Unsupported,
     /// A referenced parent image does not exist.
@@ -135,6 +146,11 @@ impl GraphicsError {
             Self::TooLarge => "EFBIG",
             Self::NoSpace => "ENOSPC",
             Self::BadSequence => "EILSEQ",
+            Self::FilenameTooLong => "EINVAL",
+            Self::FileUnreadable => "EBADF",
+            Self::ZeroDimensions => "EINVAL",
+            Self::ImageTooLarge => "EINVAL",
+            Self::InflationSize => "EINVAL",
             Self::Unsupported => "EUNSUPPORTED",
             Self::NoParent => "ENOPARENT",
         }
@@ -151,6 +167,11 @@ impl GraphicsError {
             Self::TooLarge => "image too large",
             Self::NoSpace => "image storage limit reached",
             Self::BadSequence => "unexpected chunk sequence",
+            Self::FilenameTooLong => "Filename too long",
+            Self::FileUnreadable => "Failed to read image file",
+            Self::ZeroDimensions => "Zero width/height not allowed",
+            Self::ImageTooLarge => "Image too large, width or height greater than 10000",
+            Self::InflationSize => "Image data size post inflation does not match expected size",
             Self::Unsupported => "unsupported command",
             Self::NoParent => "parent image not found",
         }
@@ -403,6 +424,32 @@ impl GraphicsStore {
         };
         self.control.clear();
 
+        // Shared memory objects are not implemented. A client that supports
+        // them tells the difference by the response, so this stays a refusal
+        // rather than letting the payload reach the decoder. Only the actions
+        // that load data ever consult the medium, so the others pass it by.
+        if command.medium == Medium::SharedMemory && command.action.is_deferred() {
+            self.transfer = None;
+            return self.failure(&command, GraphicsError::Unsupported);
+        }
+
+        // A file medium's payload names a path rather than carrying image data,
+        // and the reference ignores `m` for it: such a command is a complete
+        // transfer of its own, never a chunk of one. Only the actions that
+        // load data interrupt a chunked transfer — a put or delete leaves the
+        // in-flight load alone, just as the reference does.
+        if command.medium != Medium::Direct && command.action.is_deferred() {
+            self.transfer = None;
+            let mut transfer = Transfer::new(command);
+            transfer.chars = mem::take(&mut self.chars);
+            let command = transfer.command.clone();
+
+            return match transfer.finish() {
+                Ok(payload) => self.dispatch(&command, payload, cursor),
+                Err(error) => self.failure(&command, error),
+            };
+        }
+
         let mut transfer = match self.transfer.take() {
             Some(mut transfer) => {
                 // A continuation chunk carries only `m` and `q`. A chunk that
@@ -416,14 +463,6 @@ impl GraphicsStore {
             },
             None => Transfer::new(command),
         };
-
-        // Reject transmission features we do not implement before touching the
-        // payload: for file and shared memory mediums the payload is a path,
-        // not base64, so it must never reach the decoder.
-        if let Err(error) = unsupported_transmission(&transfer.command) {
-            let command = transfer.command;
-            return self.failure(&command, error);
-        }
 
         transfer.chars.append(&mut self.chars);
 
@@ -515,7 +554,17 @@ impl GraphicsStore {
     /// Returns the update the caller should act on, which carries the response
     /// the client has been waiting for since it sent the payload.
     pub fn install(&mut self, result: DecodeResult) -> GraphicsUpdate {
-        let DecodeResult { internal_id, command, result } = result;
+        let DecodeResult { internal_id, command, result, pending } = result;
+
+        // A file-medium transmission was not reserved when it was parsed, since
+        // its file had not been read yet. Its image, and for `a=T` its
+        // placement, are established now that the pixels exist.
+        if let Some(pending) = pending {
+            return match result {
+                Ok(decoded) => self.store_file_transmission(&command, decoded, pending),
+                Err(error) => self.failure(&command, error),
+            };
+        }
 
         let update = match result {
             Ok(decoded) => {
@@ -554,19 +603,50 @@ impl GraphicsStore {
             return self.failure(command, GraphicsError::Invalid);
         }
 
+        // A file medium's payload is a path, and only the actions that load
+        // data consult it; the others ignore the medium entirely without so
+        // much as checking that the path is well formed, as the reference does.
+        let source = match command.medium {
+            Medium::Direct => Source::Inline(data),
+            Medium::SharedMemory if command.action.is_deferred() => {
+                return self.failure(command, GraphicsError::Unsupported)
+            },
+            Medium::File | Medium::TempFile if command.action.is_deferred() => {
+                match file::FileSource::new(command, &data) {
+                    Ok(source) => Source::File(source),
+                    Err(error) => return self.failure(command, error),
+                }
+            },
+            Medium::File | Medium::TempFile | Medium::SharedMemory => Source::Inline(Vec::new()),
+        };
+
         let outcome = match command.action {
-            Action::Transmit => self.transmit(command, data).map(|_| (true, None)),
-            Action::TransmitAndDisplay => self
-                .transmit(command, data)
-                .and_then(|internal_id| self.place(command, internal_id, cursor))
-                .map(|advance| (true, advance)),
+            Action::Transmit => self.transmit(command, source, cursor).map(|_| (true, None)),
+            Action::TransmitAndDisplay => match self.transmit(command, source, cursor) {
+                // A file medium cannot be reserved until its file has been read,
+                // so its placement is added once the decode has landed.
+                Ok(Some(internal_id)) => {
+                    self.place(command, internal_id, cursor).map(|advance| (true, advance))
+                },
+                Ok(None) => Ok((true, None)),
+                Err(error) => Err(error),
+            },
             Action::Put => match self.resolve(command) {
                 Some(internal_id) => {
                     self.place(command, internal_id, cursor).map(|advance| (true, advance))
                 },
                 None => Err(GraphicsError::NotFound),
             },
-            Action::Query => self.validate(command, data).map(|()| (false, None)),
+            Action::Query => {
+                // A query without an identifier is ignored outright: the
+                // reference logs it and answers nothing, and in particular
+                // never reads the file a file medium named.
+                if command.image_id == 0 {
+                    return GraphicsUpdate::default();
+                }
+
+                self.validate(command, source).map(|()| (false, None))
+            },
             Action::Delete => self.delete(command, cursor).map(|()| (true, None)),
             Action::Frame | Action::Animate | Action::Compose => Err(GraphicsError::Unsupported),
         };
@@ -588,7 +668,41 @@ impl GraphicsStore {
     }
 
     /// Reserve space for a transmission and queue its payload for decoding.
-    fn transmit(&mut self, command: &Command, data: Vec<u8>) -> Result<u32, GraphicsError> {
+    ///
+    /// Returns the internal identifier of the reserved image, or `None` when
+    /// the payload is a file whose read has been queued: such a transmission
+    /// cannot be reserved until the file has supplied the image's dimensions.
+    fn transmit(
+        &mut self,
+        command: &Command,
+        source: Source,
+        cursor: Point,
+    ) -> Result<Option<u32>, GraphicsError> {
+        check_dimensions(command)?;
+
+        // A file medium is read away from the event thread, so neither the
+        // dimensions a PNG states in its own header nor the pixels themselves
+        // are available yet. The image and, for `a=T`, its placement are
+        // therefore established by `install` once the decode has landed.
+        let data = match source {
+            Source::File(file) => {
+                self.jobs.push(DecodeJob {
+                    internal_id: None,
+                    command: command.clone(),
+                    source: Source::File(file),
+                    limit: decompression_limit(command, &self.config),
+                    max_dimension: self.config.max_image_dimension,
+                    pending: Some(Pending {
+                        anchor: cursor,
+                        display: command.action == Action::TransmitAndDisplay,
+                    }),
+                });
+
+                return Ok(None);
+            },
+            Source::Inline(data) => data,
+        };
+
         let limit = decompression_limit(command, &self.config);
         let max_dimension = self.config.max_image_dimension;
 
@@ -661,25 +775,84 @@ impl GraphicsStore {
         self.jobs.push(DecodeJob {
             internal_id: Some(internal_id),
             command,
-            data,
+            source: Source::Inline(data),
             limit,
             max_dimension,
+            pending: None,
         });
 
-        Ok(internal_id)
+        Ok(Some(internal_id))
     }
 
     /// Queue a validation of image data that is not stored (`a=q`).
-    fn validate(&mut self, command: &Command, data: Vec<u8>) -> Result<(), GraphicsError> {
+    fn validate(&mut self, command: &Command, source: Source) -> Result<(), GraphicsError> {
+        check_dimensions(command)?;
+
         self.jobs.push(DecodeJob {
             internal_id: None,
             command: command.clone(),
-            data,
+            source,
             limit: decompression_limit(command, &self.config),
             max_dimension: self.config.max_image_dimension,
+            pending: None,
         });
 
         Ok(())
+    }
+
+    /// Store and, for `a=T`, anchor an image that was read from a file.
+    ///
+    /// The image could not be reserved while the command was parsed, because a
+    /// PNG states its dimensions in its own header and those only exist once
+    /// the file has been read, so the accounting is charged here instead.
+    fn store_file_transmission(
+        &mut self,
+        command: &Command,
+        decoded: Decoded,
+        pending: Pending,
+    ) -> GraphicsUpdate {
+        let mut command = command.clone();
+
+        if let Err(error) = self.make_room(decoded.pixels.len()) {
+            return self.failure(&command, error);
+        }
+
+        // Re-transmitting a client identifier replaces the image and drops its
+        // placements, exactly as an inline transmission does.
+        if command.image_id != 0 {
+            if let Some(existing) = self.images.resolve(command.image_id, 0) {
+                self.placements.remove_image(existing);
+            }
+        }
+
+        // A number-only transmission is assigned a free client identifier so
+        // that the reply can carry it.
+        if command.image_id == 0 && command.image_number != 0 {
+            command.image_id = self.images.free_client_id();
+        }
+
+        let (internal_id, _) =
+            self.images.insert(command.image_id, command.image_number, decoded, command.transient);
+
+        let advance = match if pending.display {
+            self.place(&command, internal_id, pending.anchor)
+        } else {
+            Ok(None)
+        } {
+            Ok(advance) => advance,
+            Err(error) => {
+                // The placement is the transmission's visible outcome, so its
+                // failure fails the transmission just as it does inline.
+                self.placements.remove_image(internal_id);
+                self.images.remove(internal_id);
+                return self.failure(&command, error);
+            },
+        };
+
+        let mut update = self.success(&command, true);
+        update.cursor_advance = advance;
+
+        update
     }
 
     /// Anchor a placement of a stored image at the cursor.
@@ -868,7 +1041,11 @@ impl GraphicsStore {
             self.images.remove(internal_id);
         }
 
-        if self.images.is_full(needed) { Err(GraphicsError::NoSpace) } else { Ok(()) }
+        if self.images.is_full(needed) {
+            Err(GraphicsError::NoSpace)
+        } else {
+            Ok(())
+        }
     }
 
     /// Build a successful response.
@@ -976,24 +1153,48 @@ fn resolve_footprint(
     }
 }
 
+/// Where a decode takes its payload from.
+#[derive(Debug)]
+enum Source {
+    /// Payload bytes the command carried inline.
+    Inline(Vec<u8>),
+    /// A window of a file the command named, yet to be read.
+    File(file::FileSource),
+}
+
+/// A transmission whose image is only established once its payload is known.
+///
+/// The payload of a file medium cannot be measured while the command is
+/// parsed, since neither the pixels nor, for a PNG, the dimensions that live
+/// in the file's own header are available until it has been read.
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    /// Where to anchor the placement, for `a=T`.
+    anchor: Point,
+    /// Whether the image is displayed as well as stored.
+    display: bool,
+}
+
 /// A decode handed off by the parser so that its cost is not paid while the
 /// terminal is locked.
 ///
-/// Decompression and pixel decoding dominate a transmission and are
-/// proportional to the image, so performing them under the lock stalls the
-/// display for as long as the image takes to decode.
+/// Reading a file, decompressing a payload and decoding pixels dominate a
+/// transmission and are proportional to the image, so performing them under
+/// the lock stalls the display for as long as the image takes to decode.
 #[derive(Debug)]
 pub struct DecodeJob {
     /// Image the pixels belong to, or `None` for a validation query.
     internal_id: Option<u32>,
     /// Command the payload belongs to, holding any compression still to undo.
     command: Command,
-    /// Payload as transmitted.
-    data: Vec<u8>,
-    /// Bound on the bytes `data` may expand to.
+    /// Where the payload comes from.
+    source: Source,
+    /// Bound on the bytes the payload may expand to.
     limit: usize,
     /// Maximum image dimension the terminal will allocate.
     max_dimension: u32,
+    /// Transmission to complete once the payload has been decoded.
+    pending: Option<Pending>,
 }
 
 impl DecodeJob {
@@ -1001,17 +1202,23 @@ impl DecodeJob {
     ///
     /// Touches no terminal state, so it is safe to run without the lock.
     pub fn decode(self) -> DecodeResult {
-        let result = decompress(&self.command, self.data, self.limit).and_then(|data| {
-            image::decode(
-                self.command.format,
-                &data,
-                self.command.source_width,
-                self.command.source_height,
-                self.max_dimension,
-            )
-        });
+        let max_to_read = max_read_size(&self.command);
 
-        DecodeResult { internal_id: self.internal_id, command: self.command, result }
+        let result = match self.source {
+            Source::Inline(data) => {
+                decode_payload(&self.command, data, self.limit, self.max_dimension)
+            },
+            Source::File(file) => file::read(&file, max_to_read).and_then(|data| {
+                decode_payload(&self.command, data, self.limit, self.max_dimension)
+            }),
+        };
+
+        DecodeResult {
+            internal_id: self.internal_id,
+            command: self.command,
+            result,
+            pending: self.pending,
+        }
     }
 }
 
@@ -1023,15 +1230,62 @@ pub struct DecodeResult {
     command: Command,
     /// Pixels, or the reason the payload was rejected.
     result: Result<Decoded, GraphicsError>,
+    /// Transmission that still has to store and anchor its image.
+    pending: Option<Pending>,
 }
 
-/// Reject transmission features this implementation does not support.
+/// Bound on the bytes a file medium may read.
 ///
-/// File, temporary file and shared memory mediums would let a client make the
-/// terminal read arbitrary paths, so only direct transmission is accepted.
-fn unsupported_transmission(command: &Command) -> Result<(), GraphicsError> {
-    if command.medium != Medium::Direct {
-        return Err(GraphicsError::Unsupported);
+/// A payload that still has to be decompressed or parsed as a PNG is not
+/// bounded by its declared pixels, so the protocol's data cap applies instead.
+/// A raw payload states exactly how many bytes it needs.
+fn max_read_size(command: &Command) -> usize {
+    if command.compression.is_some() || command.format == Format::Png {
+        return file::MAX_DATA_SIZE;
+    }
+
+    let bytes_per_pixel = command.format.bytes_per_pixel().unwrap_or(image::RGBA_CHANNELS);
+    (command.source_width as usize)
+        .saturating_mul(command.source_height as usize)
+        .saturating_mul(bytes_per_pixel)
+}
+
+/// Decompress a payload and decode it into pixels.
+fn decode_payload(
+    command: &Command,
+    data: Vec<u8>,
+    limit: usize,
+    max_dimension: u32,
+) -> Result<Decoded, GraphicsError> {
+    let data = decompress(command, data, limit)?;
+
+    // Compressed data must inflate to exactly the bytes the control data
+    // declares: a short result is its own error, not missing data, since the
+    // whole payload did arrive.
+    if command.compression.is_some() && command.format != Format::Png {
+        let expected = (command.source_width as usize)
+            .saturating_mul(command.source_height as usize)
+            .saturating_mul(command.format.bytes_per_pixel().unwrap_or(image::RGBA_CHANNELS));
+        if expected > 0 && data.len() < expected {
+            return Err(GraphicsError::InflationSize);
+        }
+    }
+
+    image::decode(command.format, &data, command.source_width, command.source_height, max_dimension)
+}
+
+/// Reject dimensions the protocol rules out before any payload is touched.
+///
+/// The reference makes both checks before it reads a file medium's file, so
+/// the checks belong here rather than after a decode.
+fn check_dimensions(command: &Command) -> Result<(), GraphicsError> {
+    if command.format != Format::Png && (command.source_width == 0 || command.source_height == 0) {
+        return Err(GraphicsError::ZeroDimensions);
+    }
+
+    const MAX_IMAGE_DIMENSION: u32 = 10000;
+    if command.source_width > MAX_IMAGE_DIMENSION || command.source_height > MAX_IMAGE_DIMENSION {
+        return Err(GraphicsError::ImageTooLarge);
     }
 
     Ok(())
@@ -1063,7 +1317,11 @@ fn decompression_limit(command: &Command, config: &GraphicsConfig) -> usize {
         .saturating_mul(command.source_height as usize)
         .saturating_mul(bytes_per_pixel);
 
-    if declared > 0 { declared } else { config.memory_limit }
+    if declared > 0 {
+        declared
+    } else {
+        config.memory_limit
+    }
 }
 
 #[cfg(test)]
@@ -1074,6 +1332,20 @@ mod tests {
     /// Encode bytes as base64 the way a client would.
     fn encode(data: &[u8]) -> String {
         BASE64.encode(data)
+    }
+
+    /// Path of a file under the temporary directory, unique per call.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("alacritty-graphics-{}-{unique}-{name}", std::process::id()))
+    }
+
+    /// The base64 payload that names a path for a file medium.
+    fn path_payload(path: &std::path::Path) -> String {
+        encode(path.as_os_str().as_encoded_bytes())
     }
 
     /// Feed one complete APC string to the store.
@@ -1290,12 +1562,114 @@ mod tests {
         let update = apc(&mut store, "Ga=p,i=99");
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=99;ENOENT:image not found\x1b\\"));
 
-        // Mediums that would read from the filesystem are refused.
-        let update = apc(&mut store, "Ga=t,f=32,t=f,s=1,v=1,i=4;/etc/passwd");
+        // Shared memory transmission is not implemented and stays refused, so
+        // that a client probing for it is told the terminal does not have it.
+        let update = apc(&mut store, "Ga=t,f=32,t=s,s=1,v=1,i=4;/dev/shm/foo");
         assert_eq!(
             update.response.as_deref(),
             Some("\x1b_Gi=4;EUNSUPPORTED:unsupported command\x1b\\")
         );
+
+        // A file that cannot be read reports one information-free error.
+        let missing = std::env::temp_dir().join("alacritty-graphics-missing-file");
+        let payload = path_payload(&missing);
+        let update = apc(&mut store, &format!("Ga=t,f=24,s=1,v=1,i=4,t=f;{payload}"));
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=4;EBADF:Failed to read image file\x1b\\")
+        );
+    }
+
+    #[test]
+    fn an_icat_file_probe_succeeds() {
+        // `kitten icat` probes for the file medium by validating a one pixel
+        // raw image held in a marked temporary file, and treats an `OK` reply
+        // as the terminal supporting it.
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let path = temp_path("tty-graphics-protocol-probe");
+        std::fs::write(&path, [1u8, 2, 3]).expect("failed to write the probe file");
+        let query = format!(
+            "Ga=q,f=24,t=t,s=1,v=1,S={},i=77;{}",
+            path.as_os_str().as_encoded_bytes().len(),
+            path_payload(&path),
+        );
+
+        let update = apc(&mut store, &query);
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=77;OK\x1b\\"));
+        assert_eq!(store.memory_used(), 0);
+        assert!(!path.exists(), "the probe's temporary file must be removed");
+    }
+
+    #[test]
+    fn reads_an_image_from_a_marked_temporary_file() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let path = temp_path("tty-graphics-protocol-read");
+        std::fs::write(&path, [10u8, 20, 30]).expect("failed to write the temporary file");
+        let payload = path_payload(&path);
+
+        let update = apc(&mut store, &format!("Ga=t,f=24,t=t,s=1,v=1,i=5;{payload}"));
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=5;OK\x1b\\"));
+        assert_eq!(store.memory_used(), 3);
+        assert!(!path.exists(), "a `t=t` file is removed once it has been read");
+    }
+
+    #[test]
+    fn keeps_a_file_that_was_not_sent_as_temporary() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let path = temp_path("tty-graphics-protocol-keep");
+        std::fs::write(&path, [10u8, 20, 30]).expect("failed to write the temporary file");
+        let payload = path_payload(&path);
+
+        let update = apc(&mut store, &format!("Ga=t,f=24,t=f,s=1,v=1,i=6;{payload}"));
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=6;OK\x1b\\"));
+        assert!(path.exists(), "a `t=f` file belongs to the client");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn removes_an_opened_temporary_file_even_when_reading_fails() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let path = temp_path("tty-graphics-protocol-short");
+        std::fs::write(&path, [1u8, 2, 3]).expect("failed to write the temporary file");
+        let payload = path_payload(&path);
+
+        // Two pixels need six bytes, but the file only holds three.
+        let update = apc(&mut store, &format!("Ga=t,f=24,t=t,s=1,v=2,i=7;{payload}"));
+
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=7;EBADF:Failed to read image file\x1b\\")
+        );
+        assert!(!path.exists(), "an opened `t=t` file is removed even on failure");
+    }
+
+    #[test]
+    fn refuses_a_filename_longer_than_the_protocol_allows() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload = encode("a".repeat(2049).as_bytes());
+
+        let update = apc(&mut store, &format!("Ga=t,f=24,s=1,v=1,i=8,t=f;{payload}"));
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=8;EINVAL:Filename too long\x1b\\"));
+    }
+
+    #[test]
+    fn an_embedded_nul_ends_the_path() {
+        // The payload is a C string, so anything after a NUL is ignored.
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let path = temp_path("tty-graphics-protocol-nul");
+        std::fs::write(&path, [10u8, 20, 30]).expect("failed to write the temporary file");
+        let mut bytes = path.as_os_str().as_encoded_bytes().to_vec();
+        bytes.extend_from_slice(b"\0/ignored");
+
+        let update = apc(&mut store, &format!("Ga=t,f=24,s=1,v=1,i=9,t=f;{}", encode(&bytes)));
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=9;OK\x1b\\"));
+        assert_eq!(store.memory_used(), 3);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1405,5 +1779,50 @@ mod tests {
         let payload = format!("Gf=32,s=8,v=1,a=T,i=1;{}", encode(&[0; 32]));
         let update = apc(&mut store, &payload);
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=1;EFBIG:image too large\x1b\\"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refuses_paths_outside_the_allowed_directories() {
+        // `/proc` and `/sys` expose process and kernel state and `/dev` holds
+        // device nodes and FIFOs, so none of them may be read; every refusal is
+        // reported as the one generic file error.
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+
+        for (image_id, path) in [
+            (20u32, std::path::Path::new("/proc/self/environ")),
+            (21, std::path::Path::new("/proc/version")),
+            (22, std::path::Path::new("/dev/null")),
+        ] {
+            let query = format!("Ga=t,f=24,s=1,v=1,i={image_id},t=f;{}", path_payload(path));
+            let update = apc(&mut store, &query);
+
+            assert_eq!(
+                update.response.as_deref(),
+                Some(format!("\x1b_Gi={image_id};EBADF:Failed to read image file\x1b\\").as_str()),
+                "unexpected reply for {path:?}",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reads_a_file_from_the_shared_memory_directory() {
+        // `/dev/shm` is the one exception to the `/dev` refusal, since that is
+        // where clients put shared memory objects.
+        let path = std::path::Path::new("/dev/shm")
+            .join(format!("alacritty-graphics-{}-probe", std::process::id()));
+        if std::fs::write(&path, [10u8, 20, 30]).is_err() {
+            return;
+        }
+
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let query = format!("Ga=t,f=24,s=1,v=1,i=23,t=f;{}", path_payload(&path));
+        let update = apc(&mut store, &query);
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=23;OK\x1b\\"));
+        assert_eq!(store.memory_used(), 3);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
