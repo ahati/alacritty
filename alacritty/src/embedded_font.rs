@@ -6,24 +6,26 @@
 //! the disk and without registering with the OS font stack. Glyphs missing
 //! from the embedded font fall back to system fonts.
 
-/// The platform's default `font.normal.family`.
-///
-/// On Linux this is the embedded font, when it was fetched at build time;
-/// macOS and Windows keep their stock defaults until their rasterizer backends
-/// gain in-memory support.
+/// The platform's default `font.normal.family`: the embedded font, when it was
+/// fetched at build time.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn default_family() -> String {
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        if cfg!(embed_fonts) {
-            String::from("JetBrainsMono Nerd Font Mono")
-        } else {
-            String::from("monospace")
-        }
+    if cfg!(embed_fonts) {
+        String::from("JetBrainsMono Nerd Font Mono")
+    } else {
+        String::from("monospace")
     }
+}
 
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        if cfg!(target_os = "macos") { String::from("Menlo") } else { String::from("Consolas") }
+/// The platform's default `font.normal.family` on macOS and Windows, which
+/// keep their stock defaults until their rasterizer backends gain in-memory
+/// support.
+#[cfg(any(target_os = "macos", windows))]
+pub fn default_family() -> String {
+    if cfg!(target_os = "macos") {
+        String::from("Menlo")
+    } else {
+        String::from("Consolas")
     }
 }
 
