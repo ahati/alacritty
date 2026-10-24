@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   transmitted in, so an uncompressed transmission needs no per-pixel conversion, and
   decoding runs away from the terminal lock via `Term::take_graphics_jobs` and
   `Term::install_graphics`
+- Kitty graphics file (`t=f`), temp file (`t=t`) and shared memory (`t=s`)
+  transmission, with the reference's path policy for files and unlink-after-read for
+  temporary files and shared memory objects
 
 ### Changed
 

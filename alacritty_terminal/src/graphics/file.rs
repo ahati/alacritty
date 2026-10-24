@@ -1,9 +1,14 @@
-//! Reading image data from the protocol's file mediums (`t=f` and `t=t`).
+//! Reading image data from the protocol's file and shared memory mediums
+//! (`t=f`, `t=t` and `t=s`).
 //!
 //! A file medium's payload is a path rather than image data, and the terminal
 //! reads a window of the file it names. The path is interpreted while the
 //! command is parsed, but the file itself is read by the decode that command
 //! queued, so that disk I/O never happens with the terminal locked.
+//!
+//! A shared memory medium's payload is likewise a name, of an object in the
+//! platform's shared memory namespace, and it is read by the decode the
+//! command queued in just the same way.
 //!
 //! Every way a read can fail is reported to the client as one identical,
 //! information-free error. Telling a client which of "does not exist", "is not
@@ -14,6 +19,11 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::unix::io::{FromRawFd, OwnedFd};
 
 use super::command::{Command, Medium};
 use super::GraphicsError;
@@ -98,6 +108,51 @@ impl FileSource {
     }
 }
 
+/// The window of a shared memory object a command names (`t=s`).
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct SharedMemorySource {
+    /// The object's name as transmitted, truncated at the first NUL.
+    name: Vec<u8>,
+    /// Bytes to read from the object (`S`), or zero for the rest of it.
+    size: u32,
+    /// Offset to start reading at (`O`).
+    offset: u32,
+}
+
+#[cfg(unix)]
+impl SharedMemorySource {
+    /// Interpret the payload of a shared memory medium as the name to read.
+    ///
+    /// The payload is used as raw bytes without any encoding check, as for a
+    /// path, truncated at the first NUL and capped at the same length. The
+    /// protocol requires the name to begin with a `/` and contain no other;
+    /// anything else is refused before the name is opened, and reported with
+    /// the same error a read failure gets, so that the client learns nothing
+    /// beyond that this name will not be read.
+    pub fn new(command: &Command, payload: &[u8]) -> Result<Self, GraphicsError> {
+        if payload.len() > MAX_FILENAME_LEN {
+            return Err(GraphicsError::FilenameTooLong);
+        }
+
+        let end = payload.iter().position(|byte| *byte == 0).unwrap_or(payload.len());
+        let name = &payload[..end];
+        if name.len() < 2 || name[0] != b'/' || name[1..].contains(&b'/') {
+            log::debug!(
+                "Refusing to read graphics image from shared memory name {}",
+                String::from_utf8_lossy(name)
+            );
+            return Err(GraphicsError::FileUnreadable);
+        }
+
+        Ok(Self {
+            name: name.to_vec(),
+            size: command.data_size,
+            offset: command.data_offset,
+        })
+    }
+}
+
 /// Read the window of the file the source names.
 ///
 /// `max_to_read` bounds the read, since a client must not be able to make the
@@ -138,19 +193,9 @@ pub fn read(
         GraphicsError::FileUnreadable
     })?;
 
-    let result = check_opened(&path, &file, allow_network_paths).and_then(|()| {
-        let data = read_window(&file, source, max_to_read)?;
-        // A raw window holding less than the pixels the control data declares
-        // is reported as unreadable rather than as missing data, so that a
-        // client cannot learn how short the file was. Windows that may still
-        // need processing (compressed data or PNG) are judged by that
-        // processing instead.
-        if max_to_read < MAX_DATA_SIZE && data.len() < max_to_read {
-            log::debug!("Graphics image file {} is shorter than its image", path.display());
-            return Err(GraphicsError::FileUnreadable);
-        }
-        Ok(data)
-    });
+    let result = check_opened(&path, &file, allow_network_paths)
+        .and_then(|()| read_window(&file, source.offset, source.size, max_to_read))
+        .and_then(|data| checked_window(data, max_to_read));
 
     // Nothing is reading the file any more, so it may be removed without
     // leaving the outcome to the platform's delete-sharing rules.
@@ -158,6 +203,69 @@ pub fn read(
 
     if source.temp {
         remove_temp(&source.path, &canonical);
+    }
+
+    result
+}
+
+/// Reject a window that is shorter than the pixels the control data declares.
+///
+/// Such a window is reported as unreadable rather than as missing data, so
+/// that a client cannot learn how short the file or object was. Windows that
+/// may still need processing (compressed data or PNG) are judged by that
+/// processing instead.
+fn checked_window(data: Vec<u8>, max_to_read: usize) -> Result<Vec<u8>, GraphicsError> {
+    if max_to_read < MAX_DATA_SIZE && data.len() < max_to_read {
+        log::debug!("Graphics image payload is shorter than its image");
+        return Err(GraphicsError::FileUnreadable);
+    }
+
+    Ok(data)
+}
+
+/// Read the window of the shared memory object the source names (`t=s`).
+///
+/// The object is opened by name in the platform's shared memory namespace: a
+/// flat namespace of objects a client has created with `shm_open`, with no
+/// paths, links or traversal in it, so none of the file policy applies and no
+/// canonical form is ever resolved. The client hands ownership over with the
+/// command, so whatever the read's outcome the object is unlinked afterwards,
+/// just as a temporary file is removed whatever the read's outcome.
+#[cfg(unix)]
+pub fn read_shm(
+    source: &SharedMemorySource,
+    max_to_read: usize,
+) -> Result<Vec<u8>, GraphicsError> {
+    // The name has no NUL left in it, so this cannot fail; the conversion is
+    // still checked rather than unwrapped.
+    let name =
+        CString::new(source.name.clone()).map_err(|_| GraphicsError::FileUnreadable)?;
+
+    // `O_NONBLOCK` has no meaning here, since opening the object cannot block;
+    // `O_CLOEXEC` so that the descriptor cannot leak into a child process.
+    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0) };
+    if fd < 0 {
+        log::debug!(
+            "Failed to open graphics image shared memory object {}: {}",
+            String::from_utf8_lossy(&source.name),
+            io::Error::last_os_error()
+        );
+        return Err(GraphicsError::FileUnreadable);
+    }
+
+    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let result = read_window(&file, source.offset, source.size, max_to_read)
+        .and_then(|data| checked_window(data, max_to_read));
+
+    // Nothing is reading the object any more, so it may be removed whatever
+    // the read's outcome: the client passed ownership with the command.
+    drop(file);
+    if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+        log::debug!(
+            "Failed to remove graphics image shared memory object {}: {}",
+            String::from_utf8_lossy(&source.name),
+            io::Error::last_os_error()
+        );
     }
 
     result
@@ -484,17 +592,18 @@ fn open(path: &Path) -> io::Result<File> {
 /// Read the window of an already opened file.
 fn read_window(
     file: &File,
-    source: &FileSource,
+    offset: u32,
+    size: u32,
     max_to_read: usize,
 ) -> Result<Vec<u8>, GraphicsError> {
     let length = file.metadata().map_err(|_| GraphicsError::FileUnreadable)?.len();
-    let offset = u64::from(source.offset);
+    let offset = u64::from(offset);
 
     // A client supplied size bounds the read; without one the read runs to the
-    // end of the file. Either way it is capped, since the file may be far
+    // end of the object. Either way it is capped, since the object may be far
     // larger than the image it holds.
     let available = length.saturating_sub(offset);
-    let wanted = if source.size == 0 { available } else { u64::from(source.size) };
+    let wanted = if size == 0 { available } else { u64::from(size) };
     let wanted = wanted.min(max_to_read as u64) as usize;
 
     let mut data = Vec::with_capacity(wanted.min(READ_CHUNK));

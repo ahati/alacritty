@@ -443,20 +443,23 @@ impl GraphicsStore {
         };
         self.control.clear();
 
-        // Shared memory objects are not implemented. A client that supports
-        // them tells the difference by the response, so this stays a refusal
-        // rather than letting the payload reach the decoder. Only the actions
-        // that load data ever consult the medium, so the others pass it by.
+        // Shared memory objects are only implemented where the platform has a
+        // POSIX shared memory namespace. A client that supports them tells the
+        // difference by the response, so this stays a refusal rather than
+        // letting the payload reach the decoder. Only the actions that load
+        // data ever consult the medium, so the others pass it by.
+        #[cfg(not(unix))]
         if command.medium == Medium::SharedMemory && command.action.is_deferred() {
             self.transfer = None;
             return self.failure(&command, GraphicsError::Unsupported);
         }
 
-        // A file medium's payload names a path rather than carrying image data,
-        // and the reference ignores `m` for it: such a command is a complete
-        // transfer of its own, never a chunk of one. Only the actions that
-        // load data interrupt a chunked transfer — a put or delete leaves the
-        // in-flight load alone, just as the reference does.
+        // A file or shared memory medium's payload names something to read
+        // rather than carrying image data, and the reference ignores `m` for
+        // it: such a command is a complete transfer of its own, never a chunk
+        // of one. Only the actions that load data interrupt a chunked transfer
+        // — a put or delete leaves the in-flight load alone, just as the
+        // reference does.
         if command.medium != Medium::Direct && command.action.is_deferred() {
             self.transfer = None;
             let mut transfer = Transfer::new(command);
@@ -620,17 +623,22 @@ impl GraphicsStore {
             return self.failure(command, GraphicsError::Invalid);
         }
 
-        // A file medium's payload is a path, and only the actions that load
-        // data consult it; the others ignore the medium entirely without so
-        // much as checking that the path is well formed, as the reference does.
+        // A file or shared memory medium's payload is the name of something to
+        // read, and only the actions that load data consult it; the others
+        // ignore the medium entirely without so much as checking that the name
+        // is well formed, as the reference does.
         let source = match command.medium {
             Medium::Direct => Source::Inline(data),
-            Medium::SharedMemory if command.action.is_deferred() => {
-                return self.failure(command, GraphicsError::Unsupported)
-            },
             Medium::File | Medium::TempFile if command.action.is_deferred() => {
                 match file::FileSource::new(command, &data) {
                     Ok(source) => Source::File(source),
+                    Err(error) => return self.failure(command, error),
+                }
+            },
+            #[cfg(unix)]
+            Medium::SharedMemory if command.action.is_deferred() => {
+                match file::SharedMemorySource::new(command, &data) {
+                    Ok(source) => Source::SharedMemory(source),
                     Err(error) => return self.failure(command, error),
                 }
             },
@@ -684,6 +692,33 @@ impl GraphicsStore {
         }
     }
 
+    /// Queue a payload that names something to read for off-thread decoding.
+    ///
+    /// Returns `None`, since the image cannot be reserved until its payload
+    /// has been read and its dimensions are known; `install` finishes the
+    /// transmission once the decode has landed.
+    fn queue_deferred_read(
+        &mut self,
+        command: &Command,
+        source: Source,
+        cursor: Point,
+    ) -> Result<Option<u32>, GraphicsError> {
+        self.jobs.push(DecodeJob {
+            internal_id: None,
+            command: command.clone(),
+            source,
+            limit: decompression_limit(command, &self.config),
+            max_dimension: self.config.max_image_dimension,
+            allow_network_paths: self.config.allow_network_paths,
+            pending: Some(Pending {
+                anchor: cursor,
+                display: command.action == Action::TransmitAndDisplay,
+            }),
+        });
+
+        Ok(None)
+    }
+
     /// Reserve space for a transmission and queue its payload for decoding.
     ///
     /// Returns the internal identifier of the reserved image, or `None` when
@@ -697,26 +732,18 @@ impl GraphicsStore {
     ) -> Result<Option<u32>, GraphicsError> {
         check_dimensions(command)?;
 
-        // A file medium is read away from the event thread, so neither the
-        // dimensions a PNG states in its own header nor the pixels themselves
-        // are available yet. The image and, for `a=T`, its placement are
-        // therefore established by `install` once the decode has landed.
+        // A file or shared memory medium is read away from the event thread,
+        // so neither the dimensions a PNG states in its own header nor the
+        // pixels themselves are available yet. The image and, for `a=T`, its
+        // placement are therefore established by `install` once the decode has
+        // landed.
         let data = match source {
             Source::File(file) => {
-                self.jobs.push(DecodeJob {
-                    internal_id: None,
-                    command: command.clone(),
-                    source: Source::File(file),
-                    limit: decompression_limit(command, &self.config),
-                    max_dimension: self.config.max_image_dimension,
-                    allow_network_paths: self.config.allow_network_paths,
-                    pending: Some(Pending {
-                        anchor: cursor,
-                        display: command.action == Action::TransmitAndDisplay,
-                    }),
-                });
-
-                return Ok(None);
+                return self.queue_deferred_read(command, Source::File(file), cursor);
+            },
+            #[cfg(unix)]
+            Source::SharedMemory(source) => {
+                return self.queue_deferred_read(command, Source::SharedMemory(source), cursor);
             },
             Source::Inline(data) => data,
         };
@@ -1180,6 +1207,9 @@ enum Source {
     Inline(Vec<u8>),
     /// A window of a file the command named, yet to be read.
     File(file::FileSource),
+    /// A window of a shared memory object the command named, yet to be read.
+    #[cfg(unix)]
+    SharedMemory(file::SharedMemorySource),
 }
 
 /// A transmission whose image is only established once its payload is known.
@@ -1229,6 +1259,12 @@ impl DecodeJob {
         let result = match self.source {
             Source::Inline(data) => {
                 decode_payload(&self.command, data, self.limit, self.max_dimension)
+            },
+            #[cfg(unix)]
+            Source::SharedMemory(source) => {
+                file::read_shm(&source, max_to_read).and_then(|data| {
+                    decode_payload(&self.command, data, self.limit, self.max_dimension)
+                })
             },
             Source::File(file) => file::read(&file, max_to_read, self.allow_network_paths)
                 .and_then(|data| {
@@ -1369,6 +1405,37 @@ mod tests {
     /// The base64 payload that names a path for a file medium.
     fn path_payload(path: &std::path::Path) -> String {
         encode(path.as_os_str().as_encoded_bytes())
+    }
+
+    /// Create a shared memory object holding `data`, replacing any old one.
+    #[cfg(unix)]
+    fn make_shm(name: &str, data: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+
+        let name = std::ffi::CString::new(name).unwrap();
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+        let fd = unsafe {
+            libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600)
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+
+        let mut object =
+            std::fs::File::from(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+        object.write_all(data).unwrap();
+    }
+
+    /// Whether a shared memory object still exists.
+    #[cfg(unix)]
+    fn shm_exists(name: &str) -> bool {
+        let name = std::ffi::CString::new(name).unwrap();
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            true
+        } else {
+            false
+        }
     }
 
     /// Feed one complete APC string to the store.
@@ -1585,12 +1652,13 @@ mod tests {
         let update = apc(&mut store, "Ga=p,i=99");
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=99;ENOENT:image not found\x1b\\"));
 
-        // Shared memory transmission is not implemented and stays refused, so
-        // that a client probing for it is told the terminal does not have it.
-        let update = apc(&mut store, "Ga=t,f=32,t=s,s=1,v=1,i=4;/dev/shm/foo");
+        // A shared memory object that cannot be opened reports the same
+        // information-free error a missing file does.
+        let payload = encode(b"/alacritty-graphics-missing");
+        let update = apc(&mut store, &format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{payload}"));
         assert_eq!(
             update.response.as_deref(),
-            Some("\x1b_Gi=4;EUNSUPPORTED:unsupported command\x1b\\")
+            Some("\x1b_Gi=4;EBADF:Failed to read image file\x1b\\")
         );
 
         // A file that cannot be read reports one information-free error.
@@ -1860,5 +1928,98 @@ mod tests {
         assert_eq!(store.memory_used(), 3);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_a_shared_memory_object() {
+        let name = format!("/alacritty-graphics-{}-shm", std::process::id());
+        make_shm(&name, &[255, 0, 0, 255]);
+
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload = format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{}", encode(name.as_bytes()));
+        let update = apc(&mut store, &payload);
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=4;OK\x1b\\"));
+        assert_eq!(store.memory_used(), 4);
+        // The client hands the object over with the command, so the terminal
+        // removes it after reading.
+        assert!(!shm_exists(&name));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_a_window_of_a_shared_memory_object() {
+        let name = format!("/alacritty-graphics-{}-window", std::process::id());
+        // Two pixels, of which only the second is asked for.
+        make_shm(&name, &[255, 0, 0, 255, 0, 255, 0, 255]);
+
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload =
+            format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s,S=4,O=4;{}", encode(name.as_bytes()));
+        let update = apc(&mut store, &payload);
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=4;OK\x1b\\"));
+        assert_eq!(store.memory_used(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_memory_object_is_removed_even_when_the_read_fails() {
+        let name = format!("/alacritty-graphics-{}-short", std::process::id());
+        // One pixel, while the control data declares two.
+        make_shm(&name, &[255, 0, 0, 255]);
+
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload = format!("Ga=t,f=32,s=2,v=1,a=t,i=4,t=s;{}", encode(name.as_bytes()));
+        let update = apc(&mut store, &payload);
+
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=4;EBADF:Failed to read image file\x1b\\")
+        );
+        assert!(!shm_exists(&name));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ill_formed_shared_memory_name_is_refused() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+
+        // A name has to begin with a `/` and contain no other.
+        for name in ["no-slash", "em/bedded", "/", ""] {
+            let payload =
+                format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{}", encode(name.as_bytes()));
+            let update = apc(&mut store, &payload);
+
+            assert_eq!(
+                update.response.as_deref(),
+                Some("\x1b_Gi=4;EBADF:Failed to read image file\x1b\\"),
+                "{name} must be refused"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_query_probes_the_shared_memory_medium() {
+        let name = format!("/alacritty-graphics-{}-query", std::process::id());
+        make_shm(&name, &[255, 0, 0, 255]);
+
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload = format!("Ga=q,f=32,s=1,v=1,i=9,t=s;{}", encode(name.as_bytes()));
+        let update = apc(&mut store, &payload);
+
+        // A query reads the object to validate the medium, but stores nothing.
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=9;OK\x1b\\"));
+        assert!(!update.changed);
+        assert_eq!(store.memory_used(), 0);
+
+        // Reading consumed the object, so a second query finds it gone.
+        let update = apc(&mut store, &payload);
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=9;EBADF:Failed to read image file\x1b\\")
+        );
     }
 }

@@ -13,8 +13,9 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 ### Added
 
 - Support for inline images through the Kitty graphics protocol (`f=24`, `f=32` and
-  `f=100`, zlib compression, direct transmission, placements, z-index, deletion and
-  chunked transfers), configurable through `terminal.graphics`
+  `f=100`, zlib compression, direct, file, temp-file and shared-memory transmission,
+  placements, z-index, deletion and chunked transfers), configurable through
+  `terminal.graphics`
 
 ### Changed
 

@@ -408,6 +408,8 @@ Plumb through `TermConfig` beside `kitty_keyboard` (`alacritty_terminal/src/term
 
 **Recommendation: MVP supports `t=d` only** and returns an error for other mediums. Add file/SHM later with the full checklist, ideally behind a config flag defaulting off.
 
+**Status: implemented beyond the MVP.** File (`t=f`) and temp file (`t=t`) transmission shipped with the mitigations above (uniform `EBADF` error, pre-resolution refusals, bounded window reads, marker- and temp-dir-gated unlink). Shared memory (`t=s`) is likewise implemented on unix: the name is validated (leading `/`, no other `/`), opened with `shm_open`, read through the same window logic, and unlinked after the read whether it succeeds or not, since the client hands ownership over with the command. No path policy applies to it, because the shared memory namespace is flat and has no paths, links or traversal in it. On Windows, where there is no POSIX shared memory namespace, `t=s` stays refused with `EUNSUPPORTED`.
+
 ---
 
 ## 5. Phased implementation plan
@@ -475,7 +477,7 @@ Test against real clients and fix what breaks: `kitten icat`, `timg`, `chafa --f
 | Decode stalls terminal output | Medium | Phase 5: decode off the parse path; v1 documented. |
 | Wayland under-damage leaves stale pixels | Medium | Full damage on every graphics mutation in v1. |
 | GLES2 path breakage (shaders, NPOT, `UNPACK_ROW_LENGTH`) | Medium | Both shader variants; one texture per image; validate on a GLES2/EGL device. |
-| File/SHM transmission is a security hole | **High** | Defer past MVP; then path pre-checks, `O_NONBLOCK`, regular-file check, identical error strings, config-gated. |
+| File/SHM transmission is a security hole | **High** | Defer past MVP; then path pre-checks, `O_NONBLOCK`, regular-file check, identical error strings, config-gated. *Implemented (see §4.8 status): files with the full path policy; `t=s` on unix with name validation and unlink-after-read.* |
 | Memory blowup from large/many images | Medium | Quota + eviction from phase 2; `MAX_IMAGE_DIMENSION` validation before allocation. |
 | Plain-negative-`z` renders under non-default cell backgrounds | Low | Known deviation (§4.4); requires splitting the text pass to fix. |
 | Perf regression when disabled | Medium | Flag checked before touching the parser; benchmark the no-APC read path. |
