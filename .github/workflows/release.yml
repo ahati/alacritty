@@ -84,6 +84,8 @@ jobs:
           scdoc < extra/man/alacritty.5.scd | gzip -c > "./alacritty.5.gz"
           scdoc < extra/man/alacritty-bindings.5.scd | gzip -c > "./alacritty-bindings.5.gz"
           scdoc < extra/man/alacritty-escapes.7.scd | gzip -c > "./alacritty-escapes.7.gz"
+      - name: Build
+        run: cargo build --release
       - name: Upload Assets
         run: |
           mv ./extra/logo/alacritty-term.svg ./Alacritty.svg
@@ -98,3 +100,54 @@ jobs:
           ./.github/workflows/upload_asset.sh ./extra/completions/_alacritty $GITHUB_TOKEN
           ./.github/workflows/upload_asset.sh ./extra/linux/Alacritty.desktop $GITHUB_TOKEN
           ./.github/workflows/upload_asset.sh ./extra/alacritty.info $GITHUB_TOKEN
+      - name: Upload binary archive
+        run: |
+          dir="alacritty-${GITHUB_REF##*/}"
+          mkdir "$dir"
+          cp ./target/release/alacritty "$dir"/
+          cp ./*.gz "$dir"/
+          cp ./extra/completions/alacritty.bash "$dir"/
+          cp ./extra/completions/alacritty.fish "$dir"/
+          cp ./extra/completions/_alacritty "$dir"/
+          cp ./extra/linux/Alacritty.desktop "$dir"/
+          cp ./extra/alacritty.info "$dir"/
+          cp ./Alacritty.svg "$dir"/
+          tar czf "Alacritty-${GITHUB_REF##*/}-x86_64.tar.gz" "$dir"
+          ./.github/workflows/upload_asset.sh "Alacritty-${GITHUB_REF##*/}-x86_64.tar.gz" $GITHUB_TOKEN
+
+  # A native arm64 runner builds the aarch64 binary directly, which spares the
+  # cross build's linker and sysroot setup: every dependency is built for the
+  # target by the same packages the x86_64 job installs.
+  linux-aarch64:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install cmake pkg-config libfreetype6-dev libfontconfig1-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev python3 scdoc
+      - name: Build
+        run: cargo build --release
+      - name: Generate manpages
+        run: |
+          scdoc < extra/man/alacritty.1.scd | gzip -c > "./alacritty.1.gz"
+          scdoc < extra/man/alacritty-msg.1.scd | gzip -c > "./alacritty-msg.1.gz"
+          scdoc < extra/man/alacritty.5.scd | gzip -c > "./alacritty.5.gz"
+          scdoc < extra/man/alacritty-bindings.5.scd | gzip -c > "./alacritty-bindings.5.gz"
+          scdoc < extra/man/alacritty-escapes.7.scd | gzip -c > "./alacritty-escapes.7.gz"
+      - name: Upload binary archive
+        run: |
+          dir="alacritty-${GITHUB_REF##*/}"
+          mkdir "$dir"
+          cp ./target/release/alacritty "$dir"/
+          cp ./*.gz "$dir"/
+          cp ./extra/completions/alacritty.bash "$dir"/
+          cp ./extra/completions/alacritty.fish "$dir"/
+          cp ./extra/completions/_alacritty "$dir"/
+          cp ./extra/linux/Alacritty.desktop "$dir"/
+          cp ./extra/alacritty.info "$dir"/
+          cp ./extra/logo/alacritty-term.svg "$dir"/Alacritty.svg
+          tar czf "Alacritty-${GITHUB_REF##*/}-aarch64.tar.gz" "$dir"
+          ./.github/workflows/upload_asset.sh "Alacritty-${GITHUB_REF##*/}-aarch64.tar.gz" $GITHUB_TOKEN
