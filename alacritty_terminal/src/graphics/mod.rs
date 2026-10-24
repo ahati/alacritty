@@ -1951,7 +1951,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reads_a_shared_memory_object() {
-        let name = format!("/alacritty-graphics-{}-shm", std::process::id());
+        let name = format!("/alac-gfx-{}-shm", std::process::id());
         make_shm(&name, &[255, 0, 0, 255]);
 
         let mut store = GraphicsStore::new(GraphicsConfig::default());
@@ -1968,7 +1968,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reads_a_window_of_a_shared_memory_object() {
-        let name = format!("/alacritty-graphics-{}-window", std::process::id());
+        let name = format!("/alac-gfx-{}-window", std::process::id());
         // Two pixels, of which only the second is asked for.
         make_shm(&name, &[255, 0, 0, 255, 0, 255, 0, 255]);
 
@@ -1984,7 +1984,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_shared_memory_object_is_removed_even_when_the_payload_is_rejected() {
-        let name = format!("/alacritty-graphics-{}-short", std::process::id());
+        let name = format!("/alac-gfx-{}-reject", std::process::id());
         // Bytes that decode as no image format at all.
         make_shm(&name, b"not a png");
 
@@ -2007,7 +2007,7 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_shared_memory_object_shorter_than_its_image_is_refused() {
-        let name = format!("/alacritty-graphics-{}-short", std::process::id());
+        let name = format!("/alac-gfx-{}-short", std::process::id());
         // One pixel, while the control data declares two.
         make_shm(&name, &[255, 0, 0, 255]);
 
@@ -2046,7 +2046,7 @@ mod tests {
     fn a_shared_memory_name_ends_at_its_first_nul() {
         // Whatever follows the name's NUL is not part of it, so a payload
         // cannot carry a second path component past the form check.
-        let name = format!("/alacritty-graphics-{}-nul", std::process::id());
+        let name = format!("/alac-gfx-{}-nul", std::process::id());
         make_shm(&name, &[255, 0, 0, 255]);
 
         let mut named = name.as_bytes().to_vec();
@@ -2078,7 +2078,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_query_probes_the_shared_memory_medium() {
-        let name = format!("/alacritty-graphics-{}-query", std::process::id());
+        let name = format!("/alac-gfx-{}-query", std::process::id());
         make_shm(&name, &[255, 0, 0, 255]);
 
         let mut store = GraphicsStore::new(GraphicsConfig::default());
