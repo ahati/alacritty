@@ -56,3 +56,26 @@ jobs:
         run: |
           rustup component add clippy
           cargo clippy --all-targets
+
+  # The Windows code paths are also exercised under Wine, which runs the
+  # gnu-target test binaries on a Linux runner. The tests are console ones
+  # and need no display; xvfb stands in for one anyway, so that nothing the
+  # loader probes can stall the run waiting for a screen.
+  windows-gnu-wine:
+    runs-on: ubuntu-latest
+
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER: xvfb-run -a wine64
+      WINEDEBUG: -all
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install --no-install-recommends wine64 gcc-mingw-w64-x86-64 xvfb
+      - name: Install target
+        run: rustup target add x86_64-pc-windows-gnu
+      - name: Test
+        run: cargo test -p alacritty_terminal --target x86_64-pc-windows-gnu
