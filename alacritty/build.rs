@@ -6,7 +6,10 @@ use std::process::Command;
 use gl_generator::{Api, Fallbacks, GlobalGenerator, Profile, Registry};
 
 fn main() {
-    let mut version = String::from(env!("CARGO_PKG_VERSION"));
+    // A tagged release names itself after the tag that triggered the release
+    // workflow; plain builds fall back to the package version.
+    let mut version =
+        env::var("RELEASE_TAG").unwrap_or_else(|_| String::from(env!("CARGO_PKG_VERSION")));
     if let Some(commit_hash) = commit_hash() {
         version = format!("{version} ({commit_hash})");
     }

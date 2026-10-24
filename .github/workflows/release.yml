@@ -13,6 +13,9 @@ permissions:
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   CARGO_TERM_COLOR: always
+  # The workflow only runs on tag pushes, so this is the release tag; the
+  # build stamps it into `alacritty --version` (see alacritty/build.rs).
+  RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:
   macos:
