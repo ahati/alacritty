@@ -283,6 +283,15 @@ macOS:     { family = _"Menlo"_,     style = _"Regular"_ }
 	the default being at the bottom. Increasing _x_ moves the glyph to the
 	right, increasing _y_ moves the glyph upward.
 
+*ligatures* = _true_ | _false_
+	When _true_, font ligatures are rendered. Text is shaped per run of
+	identically-styled cells, so ligatures like `->` or `fi` render as a single
+	glyph spanning multiple cells. Anything applying a different style to one of
+	its cells, like the cursor or a selection, breaks up both the run and the
+	ligature. Disabling this also skips text shaping entirely.
+
+	Default: _true_
+
 *builtin_box_drawing* = _true_ | _false_
 
 	When _true_, Alacritty will use a custom built-in font for box drawing

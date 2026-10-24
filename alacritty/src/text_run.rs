@@ -260,11 +260,111 @@ where
 
         // Emit any remaining buffered content; the iterator is exhausted
         // afterwards.
-        if !self.buffer.text.is_empty() {
-            let buffer = mem::take(&mut self.buffer);
-            Some(Self::build_text_run(&self.run_start, &self.latest_col, buffer))
-        } else {
-            None
+        if self.buffer.text.is_empty() {
+            return None;
         }
+
+        let buffer = mem::take(&mut self.buffer);
+        Some(Self::build_text_run(&self.run_start, &self.latest_col, buffer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::term::cell::Flags;
+
+    use crate::display::color::Rgb;
+    use crate::display::content::{RenderableCell, RenderableCellExtra};
+
+    use super::*;
+
+    fn cell(line: usize, column: usize, character: char, fg: Rgb) -> RenderableCell {
+        RenderableCell {
+            point: Point::new(line, Column(column)),
+            character,
+            extra: None,
+            flags: Flags::empty(),
+            bg_alpha: 1.,
+            fg,
+            bg: Rgb::default(),
+            underline: fg,
+        }
+    }
+
+    fn runs(cells: Vec<RenderableCell>) -> Vec<TextRun> {
+        TextRunIter::new(cells.into_iter()).collect()
+    }
+
+    #[test]
+    fn same_style_is_one_run() {
+        let fg = Rgb::default();
+        let runs = runs(vec![cell(0, 0, 'a', fg), cell(0, 1, 'b', fg), cell(0, 2, 'c', fg)]);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].span, (Column(0), Column(2)));
+        assert_eq!(runs[0].content.text, "abc");
+    }
+
+    #[test]
+    fn style_change_splits_run() {
+        let fg = Rgb::default();
+        let selected = Rgb::new(1, 2, 3);
+        let runs = runs(vec![cell(0, 0, 'a', fg), cell(0, 1, 'b', selected), cell(0, 2, 'c', fg)]);
+
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].content.text, "a");
+        assert_eq!(runs[1].content.text, "b");
+        assert_eq!(runs[2].content.text, "c");
+    }
+
+    #[test]
+    fn line_and_gap_splits_run() {
+        let fg = Rgb::default();
+        let runs = runs(vec![cell(0, 0, 'a', fg), cell(0, 2, 'b', fg), cell(1, 2, 'c', fg)]);
+
+        assert_eq!(runs.len(), 3);
+    }
+
+    #[test]
+    fn wide_chars_form_their_own_runs() {
+        let fg = Rgb::default();
+        let mut wide = cell(0, 0, '你', fg);
+        wide.flags.insert(Flags::WIDE_CHAR);
+
+        let runs = runs(vec![wide, cell(0, 2, 'x', fg)]);
+
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].flags.contains(Flags::WIDE_CHAR));
+        assert_eq!(runs[0].span, (Column(0), Column(1)));
+        assert_eq!(runs[0].cells().count(), 1);
+        assert_eq!(runs[1].content.text, "x");
+    }
+
+    #[test]
+    fn zero_width_chars_are_buffered() {
+        let fg = Rgb::default();
+        let mut combining = cell(0, 0, 'a', fg);
+        combining.extra = Some(Box::new(RenderableCellExtra {
+            zerowidth: Some(vec!['\u{0301}']),
+            hyperlink: None,
+        }));
+
+        let runs = runs(vec![combining, cell(0, 1, 'b', fg)]);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].content.zero_widths[0].as_deref(), Some(&['\u{0301}'][..]));
+        assert_eq!(runs[0].content.zero_widths[1], None);
+    }
+
+    #[test]
+    fn cursor_colors_split_runs() {
+        let fg = Rgb::default();
+        let mut cursor = cell(0, 1, 'b', fg);
+        cursor.bg = Rgb::new(4, 5, 6);
+
+        let runs = runs(vec![cell(0, 0, 'a', fg), cursor]);
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].bg, Rgb::new(4, 5, 6));
     }
 }

@@ -155,18 +155,12 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
     /// The run is shaped together, so glyphs like ligatures which span multiple
     /// cells can be rendered; everything that breaks up such a glyph (like a
     /// selection) also breaks up the text run.
-    fn draw_run(
-        &mut self,
-        run: TextRun,
-        glyph_cache: &mut GlyphCache,
-        size_info: &SizeInfo,
-    ) {
+    fn draw_run(&mut self, run: TextRun, glyph_cache: &mut GlyphCache, size_info: &SizeInfo) {
         let font_key = Self::determine_font_key(run.flags, glyph_cache);
 
         // Hidden cells draw their background only.
         if run.flags.contains(Flags::HIDDEN) {
-            let glyph_key =
-                GlyphKey { font_key, size: glyph_cache.font_size, character: ' ' };
+            let glyph_key = GlyphKey { font_key, size: glyph_cache.font_size, character: ' ' };
             let glyph = glyph_cache.get(glyph_key, self, true);
             for cell in run.cells() {
                 self.add_render_item(&cell, &glyph, size_info);

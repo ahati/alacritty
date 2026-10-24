@@ -21,9 +21,9 @@ use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
 use crate::gl;
 use crate::renderer::images::{ImageQuad, ImageRenderer};
-use crate::text_run::{TextRun, TextRunIter};
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
+use crate::text_run::{TextRun, TextRunIter};
 
 pub mod images;
 pub mod platform;

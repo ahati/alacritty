@@ -56,9 +56,9 @@ use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::images::{ImageKey, ImageQuad, ImageTextureCache};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
-use crate::text_run::TextRunIter;
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
+use crate::text_run::TextRunIter;
 
 pub mod color;
 pub mod content;

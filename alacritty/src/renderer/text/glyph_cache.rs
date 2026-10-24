@@ -390,9 +390,7 @@ impl GlyphCache {
             .into_iter()
             .map(|(spec, cluster)| {
                 let glyph = match spec {
-                    ShapedGlyphSpec::GlyphIndex(index) => {
-                        self.get_shaped(index, font_key, loader)
-                    },
+                    ShapedGlyphSpec::GlyphIndex(index) => self.get_shaped(index, font_key, loader),
                     ShapedGlyphSpec::Char(c) => {
                         let glyph_key = GlyphKey { font_key, size: self.font_size, character: c };
                         self.get(glyph_key, loader, true)
