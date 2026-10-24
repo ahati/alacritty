@@ -64,6 +64,7 @@ fn embed_fonts() {
 
     const FONT_ZIP_URL: &str =
         "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip";
+    const RELEASES_API: &str = "https://api.github.com/repos/ryanoasis/nerd-fonts/releases/latest";
     const FONT_TAG: &str = "JetBrainsMonoNerdFontMono";
     const STYLES: [(&str, &str); 4] = [
         ("REGULAR", "Regular"),
@@ -94,24 +95,13 @@ fn embed_fonts() {
 
     // Fetch the latest release asset; GitHub resolves the `latest` URL to it.
     println!("cargo:warning=Fetching embedded font from {FONT_ZIP_URL}");
-    let response = match ureq::get(FONT_ZIP_URL).call() {
-        Ok(response) => response,
-        Err(err) => {
-            println!(
-                "cargo:warning=Embedded font download failed; building without embedded font: {err}"
-            );
-            return;
-        },
-    };
-    let release = latest_release_tag().unwrap_or_else(|| String::from("unknown"));
-
-    let mut zip_bytes = Vec::new();
-    if let Err(err) = response.into_reader().take(512 * 1024 * 1024).read_to_end(&mut zip_bytes) {
-        println!(
-            "cargo:warning=Embedded font download failed; building without embedded font: {err}"
-        );
+    let Some(zip_bytes) = fetch_url(FONT_ZIP_URL, None) else {
+        println!("cargo:warning=Embedded font download failed; building without embedded font");
         return;
-    }
+    };
+    let release = fetch_url(RELEASES_API, Some("application/vnd.github+json"))
+        .and_then(|body| latest_release_tag(&body))
+        .unwrap_or_else(|| String::from("unknown"));
 
     let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes)) {
         Ok(archive) => archive,
@@ -172,16 +162,9 @@ fn font_cache_dir() -> Option<PathBuf> {
 }
 
 /// Resolve the tag of the latest Nerd Fonts release.
-fn latest_release_tag() -> Option<String> {
-    const RELEASES_API: &str = "https://api.github.com/repos/ryanoasis/nerd-fonts/releases/latest";
-
-    let response = ureq::get(RELEASES_API)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "alacritty-build")
-        .call()
-        .ok()?;
-    let mut body = String::new();
-    response.into_reader().take(1024 * 1024).read_to_string(&mut body).ok()?;
+/// Resolve the tag of the latest Nerd Fonts release from its JSON body.
+fn latest_release_tag(body: &[u8]) -> Option<String> {
+    let body = std::str::from_utf8(body).ok()?;
 
     // Sniff the tag name without pulling a JSON parser into the build deps.
     let index = body.find("\"tag_name\":")?;
@@ -190,4 +173,34 @@ fn latest_release_tag() -> Option<String> {
     let value_rest = &rest[value_start + 1..];
     let value_end = value_rest.find('"')?;
     Some(value_rest[..value_end].to_owned())
+}
+
+/// Fetch a URL's body, preferring `curl` and falling back to `wget`.
+///
+/// System downloaders keep the build free of an HTTP dependency stack; both
+/// are available on every platform the project builds on.
+fn fetch_url(url: &str, accept: Option<&str>) -> Option<Vec<u8>> {
+    let mut headers = vec![String::from("User-Agent: alacritty-build")];
+    if let Some(accept) = accept {
+        headers.push(format!("Accept: {accept}"));
+    }
+
+    let mut curl = Command::new("curl");
+    curl.args(["--location", "--silent", "--show-error", "--fail", url]);
+    let mut wget = Command::new("wget");
+    wget.args(["-qO-", url]);
+    for header in &headers {
+        curl.args(["--header", header]);
+        wget.arg(format!("--header={header}"));
+    }
+
+    for mut downloader in [curl, wget] {
+        if let Ok(output) = downloader.output() {
+            if output.status.success() && !output.stdout.is_empty() {
+                return Some(output.stdout);
+            }
+        }
+    }
+
+    None
 }
