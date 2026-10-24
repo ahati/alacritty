@@ -9,6 +9,30 @@
        src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/promo/alacritty-readme.png">
 </p>
 
+## What this fork adds
+
+This fork extends upstream Alacritty with the following features:
+
+- **Kitty graphics protocol** — display images inline in the terminal.
+  Images arrive as direct payloads, temporary files, regular files or
+  shared memory, so clients like `kitten icat` work. Configured through
+  the [`[terminal.graphics]`](extra/man/alacritty.5.scd) table (`enabled`,
+  `max_image_dimension`, `memory_limit`, `allow_network_paths`).
+- **Font ligatures** — runs of identically-styled text are shaped with
+  harfrust (a pure-Rust HarfBuzz port), so ligatures like `->`, `=>` or
+  `fi` render as a single glyph spanning multiple cells, without
+  disturbing cursor, selection or damage tracking. Toggle with
+  [`font.ligatures`](extra/man/alacritty.5.scd) (on by default).
+- **Embedded default font** — JetBrains Mono Nerd Font Mono is compiled
+  into the binary, so terminals render well out of the box even on
+  systems with no usable fonts installed.
+- **Fork release tooling** — a release workflow that publishes stripped
+  Linux, macOS and Windows binaries to GitHub releases, along with winget
+  manifests for Windows installs.
+
+Everything else — configuration, keybindings and behavior — follows
+upstream Alacritty.
+
 ## About
 
 Alacritty is a modern terminal emulator that comes with sensible defaults, but
