@@ -12,6 +12,9 @@ defaults:
 jobs:
   build:
     strategy:
+      # Every platform reports on its own, so one leg's failure does not
+      # cancel the others and hide what they would have said.
+      fail-fast: false
       matrix:
         include:
           # Linux, both architectures the release ships.
