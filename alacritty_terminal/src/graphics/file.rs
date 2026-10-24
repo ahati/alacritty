@@ -20,7 +20,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::ffi::CString;
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::io::{FromRawFd, OwnedFd};
@@ -109,7 +109,6 @@ impl FileSource {
 }
 
 /// The window of a shared memory object a command names (`t=s`).
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct SharedMemorySource {
     /// The object's name as transmitted, truncated at the first NUL.
@@ -120,7 +119,7 @@ pub struct SharedMemorySource {
     offset: u32,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl SharedMemorySource {
     /// Interpret the payload of a shared memory medium as the name to read.
     ///
@@ -312,7 +311,11 @@ fn read_shm_mapping(
 
     // The same window the file mediums read: a client supplied size bounds
     // the read, without one it runs to the end of the object, and either way
-    // it is capped, since the object may be far larger than its image.
+    // it is capped, since the object may be far larger than its image. On
+    // Darwin the object's size is its allocation, rounded to whole pages, so
+    // a read without a declared size picks up zero padding past the client's
+    // bytes; the decode bounds what it consumes by the declared dimensions,
+    // so the padding is never shown.
     let available = length.saturating_sub(offset);
     let wanted = if source.size == 0 { available } else { u64::from(source.size) };
     let wanted = (wanted.min(max_to_read as u64) as usize).min(available as usize);
@@ -346,6 +349,93 @@ fn read_shm_mapping(
     unsafe { libc::munmap(map, map_length) };
 
     checked_window(data, max_to_read)
+}
+
+/// Read the window of the shared memory object the source names (`t=s`).
+///
+/// Windows has no POSIX shared memory namespace; its own is a set of named
+/// file mappings, which the client creates and names and the terminal opens
+/// for reading. There is nothing to unlink afterwards: the object lives as
+/// long as any handle to it is open, so the terminal only closes its own.
+#[cfg(windows)]
+pub fn read_shm(
+    source: &SharedMemorySource,
+    max_to_read: usize,
+) -> Result<Vec<u8>, GraphicsError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{
+        MapViewOfFile, OpenFileMappingA, UnmapViewOfFile, VirtualQuery, FILE_MAP_READ,
+        MEMORY_BASIC_INFORMATION,
+    };
+
+    let name = CString::new(source.name.clone()).map_err(|_| GraphicsError::FileUnreadable)?;
+
+    let handle = unsafe { OpenFileMappingA(FILE_MAP_READ, 0, name.as_ptr().cast()) };
+    if handle.is_null() {
+        log::debug!(
+            "Failed to open graphics image shared memory object {}: {}",
+            String::from_utf8_lossy(&source.name),
+            io::Error::last_os_error()
+        );
+        return Err(GraphicsError::FileUnreadable);
+    }
+
+    // Mapping nothing maps the whole object, whose size is only known once it
+    // is asked of the mapping. As on Darwin, the reported size is the mapped
+    // region's, rounded to whole pages, so a read without a declared size can
+    // carry zero padding past the client's bytes; the decode bounds what it
+    // consumes by the declared dimensions, so the padding is never shown.
+    let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
+    if view.Value.is_null() {
+        unsafe { CloseHandle(handle) };
+        log::debug!(
+            "Failed to map graphics image shared memory object {}: {}",
+            String::from_utf8_lossy(&source.name),
+            io::Error::last_os_error()
+        );
+        return Err(GraphicsError::FileUnreadable);
+    }
+
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let measured = unsafe {
+        VirtualQuery(view.Value, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>())
+    };
+    let result = if measured == 0 {
+        log::debug!(
+            "Failed to measure graphics image shared memory object {}: {}",
+            String::from_utf8_lossy(&source.name),
+            io::Error::last_os_error()
+        );
+        Err(GraphicsError::FileUnreadable)
+    } else {
+        let length = info.RegionSize as u64;
+        let offset = u64::from(source.offset);
+
+        // The same window the file mediums read: a client supplied size
+        // bounds the read, without one it runs to the end of the object, and
+        // either way it is capped, since the object may be far larger than
+        // the image it holds.
+        let available = length.saturating_sub(offset);
+        let wanted = if source.size == 0 { available } else { u64::from(source.size) };
+        let wanted = (wanted.min(max_to_read as u64) as usize).min(available as usize);
+
+        if wanted == 0 {
+            Ok(Vec::new())
+        } else {
+            let data = unsafe {
+                std::slice::from_raw_parts(view.Value.cast::<u8>().add(offset as usize), wanted)
+            }
+            .to_vec();
+            checked_window(data, max_to_read)
+        }
+    };
+
+    // The object is the client's to keep alive; the terminal only lets its
+    // own view of it and handle to it go.
+    unsafe { UnmapViewOfFile(view) };
+    unsafe { CloseHandle(handle) };
+
+    result
 }
 
 /// Check a freshly opened file again, now that its descriptor is held.

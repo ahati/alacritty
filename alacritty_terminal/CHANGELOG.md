@@ -17,8 +17,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   decoding runs away from the terminal lock via `Term::take_graphics_jobs` and
   `Term::install_graphics`
 - Kitty graphics file (`t=f`), temp file (`t=t`) and shared memory (`t=s`)
-  transmission, with the reference's path policy for files and unlink-after-read for
-  temporary files and shared memory objects
+  transmission on every platform, with the reference's path policy for files and
+  unlink-after-read for temporary files and POSIX shared memory objects (on Windows
+  the object is a named file mapping that lives with the client's handle, so the
+  terminal only closes its own)
 
 ### Changed
 

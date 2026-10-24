@@ -443,17 +443,6 @@ impl GraphicsStore {
         };
         self.control.clear();
 
-        // Shared memory objects are only implemented where the platform has a
-        // POSIX shared memory namespace. A client that supports them tells the
-        // difference by the response, so this stays a refusal rather than
-        // letting the payload reach the decoder. Only the actions that load
-        // data ever consult the medium, so the others pass it by.
-        #[cfg(not(unix))]
-        if command.medium == Medium::SharedMemory && command.action.is_deferred() {
-            self.transfer = None;
-            return self.failure(&command, GraphicsError::Unsupported);
-        }
-
         // A file or shared memory medium's payload names something to read
         // rather than carrying image data, and the reference ignores `m` for
         // it: such a command is a complete transfer of its own, never a chunk
@@ -635,7 +624,6 @@ impl GraphicsStore {
                     Err(error) => return self.failure(command, error),
                 }
             },
-            #[cfg(unix)]
             Medium::SharedMemory if command.action.is_deferred() => {
                 match file::SharedMemorySource::new(command, &data) {
                     Ok(source) => Source::SharedMemory(source),
@@ -741,7 +729,6 @@ impl GraphicsStore {
             Source::File(file) => {
                 return self.queue_deferred_read(command, Source::File(file), cursor);
             },
-            #[cfg(unix)]
             Source::SharedMemory(source) => {
                 return self.queue_deferred_read(command, Source::SharedMemory(source), cursor);
             },
@@ -1208,7 +1195,6 @@ enum Source {
     /// A window of a file the command named, yet to be read.
     File(file::FileSource),
     /// A window of a shared memory object the command named, yet to be read.
-    #[cfg(unix)]
     SharedMemory(file::SharedMemorySource),
 }
 
@@ -1260,7 +1246,6 @@ impl DecodeJob {
             Source::Inline(data) => {
                 decode_payload(&self.command, data, self.limit, self.max_dimension)
             },
-            #[cfg(unix)]
             Source::SharedMemory(source) => {
                 file::read_shm(&source, max_to_read).and_then(|data| {
                     decode_payload(&self.command, data, self.limit, self.max_dimension)
@@ -1447,6 +1432,57 @@ mod tests {
             true
         } else {
             false
+        }
+    }
+
+    /// Create a shared memory file mapping holding `data`, replacing any old
+    /// one.
+    ///
+    /// The handle is deliberately left open for the rest of the process, as
+    /// the client's is while the terminal reads: on Windows the object lives
+    /// exactly as long as some handle to it does.
+    #[cfg(windows)]
+    fn make_shm(name: &str, data: &[u8]) {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingA, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE, PAGE_READWRITE,
+        };
+
+        let cname = std::ffi::CString::new(name).unwrap();
+        // An object left over from an earlier run is not a problem: opening
+        // it by this name again is what the client would do, and the bytes
+        // are written over whatever the old ones were.
+        let handle = unsafe {
+            CreateFileMappingA(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null_mut(),
+                PAGE_READWRITE,
+                0,
+                data.len() as u32,
+                cname.as_ptr().cast(),
+            )
+        };
+        assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, 0) };
+        assert!(!view.Value.is_null(), "{}", std::io::Error::last_os_error());
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), view.Value.cast(), data.len()) };
+        unsafe { UnmapViewOfFile(view) };
+    }
+
+    /// Whether a shared memory object still exists.
+    #[cfg(windows)]
+    fn shm_exists(name: &str) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{OpenFileMappingA, FILE_MAP_READ};
+
+        let cname = std::ffi::CString::new(name).unwrap();
+        let handle = unsafe { OpenFileMappingA(FILE_MAP_READ, 0, cname.as_ptr().cast()) };
+        if handle.is_null() {
+            false
+        } else {
+            unsafe { CloseHandle(handle) };
+            true
         }
     }
 
@@ -1664,19 +1700,17 @@ mod tests {
         let update = apc(&mut store, "Ga=p,i=99");
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=99;ENOENT:image not found\x1b\\"));
 
-        // A shared memory object is read where the platform has a shared
-        // memory namespace, and refused outright where it does not; either
-        // way the reply tells the client which of the two this terminal is.
+        // A shared memory object that is not there reports one
+        // information-free error on every platform, so that a client cannot
+        // learn anything but that this name will not be read.
         {
             let payload = encode(b"/alacritty-graphics-missing");
             let update = apc(&mut store, &format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{payload}"));
 
-            #[cfg(unix)]
-            let expected = "\x1b_Gi=4;EBADF:Failed to read image file\x1b\\";
-            #[cfg(windows)]
-            let expected = "\x1b_Gi=4;EUNSUPPORTED:unsupported command\x1b\\";
-
-            assert_eq!(update.response.as_deref(), Some(expected));
+            assert_eq!(
+                update.response.as_deref(),
+                Some("\x1b_Gi=4;EBADF:Failed to read image file\x1b\\")
+            );
         }
 
         // A file that cannot be read reports one information-free error.
@@ -1948,7 +1982,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn reads_a_shared_memory_object() {
         let name = format!("/alac-gfx-{}-shm", std::process::id());
@@ -1960,12 +1994,14 @@ mod tests {
 
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=4;OK\x1b\\"));
         assert_eq!(store.memory_used(), 4);
-        // The client hands the object over with the command, so the terminal
-        // removes it after reading.
+        // The client hands the object over with the command, so a POSIX
+        // terminal removes it after reading; on Windows the object lives as
+        // long as the client's handle does and nothing is removed.
+        #[cfg(unix)]
         assert!(!shm_exists(&name));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn reads_a_window_of_a_shared_memory_object() {
         let name = format!("/alac-gfx-{}-window", std::process::id());
@@ -1999,6 +2035,27 @@ mod tests {
         assert!(!shm_exists(&name));
     }
 
+    // Windows has nothing to remove: the object lives exactly as long as the
+    // client's handle to it does, whatever happens to the payload, so a
+    // rejected transfer leaves it readable just as an unhappened one would.
+    #[cfg(windows)]
+    #[test]
+    fn a_shared_memory_object_outlives_a_rejected_payload() {
+        let name = format!("/alac-gfx-{}-reject", std::process::id());
+        // Bytes that decode as no image format at all.
+        make_shm(&name, b"not a png");
+
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload = format!("Ga=t,f=100,a=t,i=4,t=s;{}", encode(name.as_bytes()));
+        let update = apc(&mut store, &payload);
+
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=4;EBADPNG:could not decode image data\x1b\\")
+        );
+        assert!(shm_exists(&name));
+    }
+
     // macOS reports a shared memory object's allocated size, which is rounded
     // to whole pages, so a read without a declared size cannot see where the
     // client's bytes end and the zero padding begins, and the window is never
@@ -2022,7 +2079,7 @@ mod tests {
         assert!(!shm_exists(&name));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn an_ill_formed_shared_memory_name_is_refused() {
         let mut store = GraphicsStore::new(GraphicsConfig::default());
@@ -2041,7 +2098,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn a_shared_memory_name_ends_at_its_first_nul() {
         // Whatever follows the name's NUL is not part of it, so a payload
@@ -2061,7 +2118,7 @@ mod tests {
         assert_eq!(store.memory_used(), 4);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn an_overlong_shared_memory_name_is_refused() {
         let mut store = GraphicsStore::new(GraphicsConfig::default());
