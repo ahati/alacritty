@@ -250,6 +250,9 @@ pub fn read_shm(
             String::from_utf8_lossy(&source.name),
             io::Error::last_os_error()
         );
+        // TODO(diagnostic): temporary, remove once macOS is diagnosed.
+        #[cfg(target_os = "macos")]
+        eprintln!("DIAG shm: open failed: {:?}", std::io::Error::last_os_error());
         return Err(GraphicsError::FileUnreadable);
     }
 
@@ -263,6 +266,20 @@ pub fn read_shm(
         .and_then(|data| checked_window(data, max_to_read));
     #[cfg(target_os = "macos")]
     let result = read_shm_mapping(fd, source, max_to_read);
+    #[cfg(target_os = "macos")]
+    if result.is_err() {
+        // TODO(diagnostic): temporary, remove once macOS is diagnosed.
+        let mut probe: libc::stat = unsafe { std::mem::zeroed() };
+        eprintln!(
+            "DIAG shm: reopen fd={} errno={:?}",
+            unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) },
+            std::io::Error::last_os_error()
+        );
+        unsafe { libc::fstat(fd, &mut probe) };
+        eprintln!("DIAG shm: fstat size={} err={:?}", probe.st_size, std::io::Error::last_os_error());
+        let m = unsafe { libc::mmap(std::ptr::null_mut(), 16, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+        eprintln!("DIAG shm: mmap={:?} err={:?}", m, std::io::Error::last_os_error());
+    }
 
     // Nothing is reading the object any more, so it may be removed whatever
     // the read's outcome: the client passed ownership with the command.
@@ -298,8 +315,15 @@ fn read_shm_mapping(
             "Failed to measure graphics image shared memory object: {}",
             io::Error::last_os_error()
         );
+        // TODO(diagnostic): temporary, remove once macOS is diagnosed.
+        eprintln!("DIAG mapping: fstat failed: {:?}", std::io::Error::last_os_error());
         return Err(GraphicsError::FileUnreadable);
     }
+    // TODO(diagnostic): temporary, remove once macOS is diagnosed.
+    eprintln!(
+        "DIAG mapping: fd={fd} size={} offset={} want={} max={}",
+        stat.st_size, source.offset, source.size, max_to_read
+    );
 
     let length = u64::try_from(stat.st_size).unwrap_or(0);
     let offset = u64::from(source.offset);
@@ -331,6 +355,8 @@ fn read_shm_mapping(
             "Failed to map graphics image shared memory object: {}",
             io::Error::last_os_error()
         );
+        // TODO(diagnostic): temporary, remove once macOS is diagnosed.
+        eprintln!("DIAG mapping: mmap failed: {:?}", std::io::Error::last_os_error());
         return Err(GraphicsError::FileUnreadable);
     }
 
