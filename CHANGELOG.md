@@ -29,6 +29,8 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 ### Changed
 
+- Release binaries are fully stripped (`strip = "symbols"`), shrinking them from
+  77 MiB to 19.5 MiB
 - Image pixels are stored in the layout they were transmitted in instead of being
   expanded to RGBA, which takes a 1200x900 `f=24` image from 4.1 MiB to 3.1 MiB and
   halves the time spent storing it

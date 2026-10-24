@@ -12,6 +12,7 @@ edition = "2024"
 rust-version = "1.85.0"
 
 [profile.release]
+strip = "symbols"
 lto = "thin"
 debug = 1
 incremental = false
