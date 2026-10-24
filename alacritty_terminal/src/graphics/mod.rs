@@ -1410,9 +1410,6 @@ mod tests {
     /// Create a shared memory object holding `data`, replacing any old one.
     #[cfg(unix)]
     fn make_shm(name: &str, data: &[u8]) {
-        use std::io::Write;
-        use std::os::unix::io::FromRawFd;
-
         let name = std::ffi::CString::new(name).unwrap();
         unsafe { libc::shm_unlink(name.as_ptr()) };
         let fd = unsafe {
@@ -1420,13 +1417,24 @@ mod tests {
         };
         assert!(fd >= 0, "{}", std::io::Error::last_os_error());
 
-        // macOS does not grow a shared memory object on write, so its size has
-        // to be set before any bytes go into it.
+        // macOS neither grows a shared memory object on write nor takes a
+        // write at all, so its size is set with ftruncate and the bytes go in
+        // through a mapping, which is what a client on Darwin does too.
         assert_eq!(unsafe { libc::ftruncate(fd, data.len() as libc::off_t) }, 0);
-
-        let mut object =
-            std::fs::File::from(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
-        object.write_all(data).unwrap();
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                data.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "{}", std::io::Error::last_os_error());
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), map.cast(), data.len()) };
+        assert_eq!(unsafe { libc::munmap(map, data.len()) }, 0);
+        assert_eq!(unsafe { libc::close(fd) }, 0);
     }
 
     /// Whether a shared memory object still exists.

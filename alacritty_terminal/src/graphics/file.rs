@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::ffi::CString;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::io::{FromRawFd, OwnedFd};
 
 use super::command::{Command, Medium};
@@ -253,13 +253,23 @@ pub fn read_shm(
         return Err(GraphicsError::FileUnreadable);
     }
 
+    // Darwin's shared memory descriptors do not take read(2) or write(2) at
+    // all, so there the bytes are reachable only through a mapping; elsewhere
+    // the descriptor reads like a file.
+    #[cfg(not(target_os = "macos"))]
     let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    #[cfg(not(target_os = "macos"))]
     let result = read_window(&file, source.offset, source.size, max_to_read)
         .and_then(|data| checked_window(data, max_to_read));
+    #[cfg(target_os = "macos")]
+    let result = read_shm_mapping(fd, source, max_to_read);
 
     // Nothing is reading the object any more, so it may be removed whatever
     // the read's outcome: the client passed ownership with the command.
+    #[cfg(not(target_os = "macos"))]
     drop(file);
+    #[cfg(target_os = "macos")]
+    unsafe { libc::close(fd) };
     if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
         log::debug!(
             "Failed to remove graphics image shared memory object {}: {}",
@@ -269,6 +279,67 @@ pub fn read_shm(
     }
 
     result
+}
+
+/// Read the window through a mapping, as Darwin requires.
+///
+/// A mapping's offset has to lie on a page boundary, which a client's window
+/// need not, so the object is mapped from its start and the window is taken
+/// from inside the mapping.
+#[cfg(target_os = "macos")]
+fn read_shm_mapping(
+    fd: i32,
+    source: &SharedMemorySource,
+    max_to_read: usize,
+) -> Result<Vec<u8>, GraphicsError> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        log::debug!(
+            "Failed to measure graphics image shared memory object: {}",
+            io::Error::last_os_error()
+        );
+        return Err(GraphicsError::FileUnreadable);
+    }
+
+    let length = u64::try_from(stat.st_size).unwrap_or(0);
+    let offset = u64::from(source.offset);
+
+    // The same window the file mediums read: a client supplied size bounds
+    // the read, without one it runs to the end of the object, and either way
+    // it is capped, since the object may be far larger than its image.
+    let available = length.saturating_sub(offset);
+    let wanted = if source.size == 0 { available } else { u64::from(source.size) };
+    let wanted = (wanted.min(max_to_read as u64) as usize).min(available as usize);
+
+    if wanted == 0 {
+        return Ok(Vec::new());
+    }
+
+    let map_length = offset as usize + wanted;
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_length,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        log::debug!(
+            "Failed to map graphics image shared memory object: {}",
+            io::Error::last_os_error()
+        );
+        return Err(GraphicsError::FileUnreadable);
+    }
+
+    let data =
+        unsafe { std::slice::from_raw_parts(map.cast::<u8>().add(offset as usize), wanted) }
+            .to_vec();
+    unsafe { libc::munmap(map, map_length) };
+
+    checked_window(data, max_to_read)
 }
 
 /// Check a freshly opened file again, now that its descriptor is held.
