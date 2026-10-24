@@ -16,6 +16,8 @@ Notable changes to the `alacritty_terminal` crate are documented in its
   `f=100`, zlib compression, direct, file, temp-file and shared-memory transmission,
   placements, z-index, deletion and chunked transfers), configurable through
   `terminal.graphics`
+- Font ligature support, shaping style-homogeneous runs of cells with harfrust and
+  rendering the resulting glyphs across multiple cells, configurable through `font.ligatures`
 
 ### Changed
 

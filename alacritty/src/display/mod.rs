@@ -56,6 +56,7 @@ use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::images::{ImageKey, ImageQuad, ImageTextureCache};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
+use crate::text_run::TextRunIter;
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 
@@ -930,7 +931,11 @@ impl Display {
 
                 cell
             });
-            self.renderer.draw_cells(&size_info, glyph_cache, cells);
+
+            // Group the cells into style-homogeneous text runs, which are
+            // shaped together to render ligatures.
+            let runs = TextRunIter::new(cells).collect::<Vec<_>>();
+            self.renderer.draw_runs(&size_info, glyph_cache, runs.into_iter());
         }
 
         // Images with a non-negative z-index are drawn over the text, but
