@@ -17,18 +17,6 @@ pub fn default_family() -> String {
     }
 }
 
-/// The platform's default `font.normal.family` on macOS and Windows, which
-/// keep their stock defaults until their rasterizer backends gain in-memory
-/// support.
-#[cfg(any(target_os = "macos", windows))]
-pub fn default_family() -> String {
-    if cfg!(target_os = "macos") {
-        String::from("Menlo")
-    } else {
-        String::from("Consolas")
-    }
-}
-
 /// Register the embedded font styles with the rasterizer.
 ///
 /// This is a no-op unless the font was fetched at build time; on macOS and
