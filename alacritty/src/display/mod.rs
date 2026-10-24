@@ -51,6 +51,7 @@ use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::window::Window;
+use crate::embedded_font;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::images::{ImageKey, ImageQuad, ImageTextureCache};
@@ -414,7 +415,11 @@ impl Display {
         let raw_window_handle = window.raw_window_handle();
 
         let scale_factor = window.scale_factor as f32;
-        let rasterizer = Rasterizer::new()?;
+        let mut rasterizer = Rasterizer::new()?;
+
+        // Register the default font embedded into the binary; a no-op unless
+        // the font was fetched at build time.
+        embedded_font::register(&mut rasterizer);
 
         let font_size = config.font.size().scale(scale_factor);
         debug!("Loading \"{}\" font", config.font.normal().family);

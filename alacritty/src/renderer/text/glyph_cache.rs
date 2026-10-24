@@ -513,6 +513,11 @@ impl GlyphCache {
 
     /// Load the font file of `font_key` for shaping.
     fn load_shaped_font(&mut self, font_key: FontKey) -> Option<harfrust::Font> {
+        // Memory-registered fonts are shaped straight from their bytes.
+        if let Some(data) = self.rasterizer.memory_font_data(font_key) {
+            return harfrust::Font::new((*data).clone(), 0);
+        }
+
         let (path, face_index) = self.rasterizer.font_path(font_key).ok()?;
         let data = std::fs::read(path).ok()?;
 
@@ -573,6 +578,31 @@ mod tests {
         let shaped = glyph_cache.shape_run("ab", font_key, &mut loader);
 
         // Without ligatures in the font, every character maps to its own glyph.
+        assert_eq!(shaped.len(), 2);
+        assert_eq!(shaped[0].cluster, 0);
+        assert_eq!(shaped[1].cluster, 1);
+    }
+
+    /// The default font resolves to the embedded font, which is shaped from
+    /// its registered bytes.
+    #[test]
+    fn embedded_font_shapes() {
+        // Only meaningful when the font was fetched at build time on a
+        // platform with in-memory registration.
+        if !cfg!(embed_fonts) || cfg!(any(target_os = "macos", target_os = "windows")) {
+            return;
+        }
+
+        assert_eq!(Font::default().normal().family, "JetBrainsMono Nerd Font Mono");
+
+        let font = Font::default();
+        let rasterizer = Rasterizer::new().unwrap();
+        let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
+        let font_key = glyph_cache.font_key;
+
+        let mut loader = TestLoader;
+        let shaped = glyph_cache.shape_run("ab", font_key, &mut loader);
+
         assert_eq!(shaped.len(), 2);
         assert_eq!(shaped[0].cluster, 0);
         assert_eq!(shaped[1].cluster, 1);

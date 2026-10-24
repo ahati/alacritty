@@ -32,6 +32,7 @@ mod clipboard;
 mod config;
 mod daemon;
 mod display;
+mod embedded_font;
 mod event;
 mod input;
 mod logging;
