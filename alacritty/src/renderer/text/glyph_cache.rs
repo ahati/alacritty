@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use ahash::RandomState;
@@ -460,12 +461,12 @@ impl GlyphCache {
         font_key: FontKey,
     ) -> Vec<(ShapedGlyphSpec, usize)> {
         // Load the font for shaping, if possible.
-        if !self.shaped_fonts.contains_key(&font_key) {
-            let font = self.load_shaped_font(font_key);
+        if let Entry::Vacant(entry) = self.shaped_fonts.entry(font_key) {
+            let font = Self::load_shaped_font(&mut self.rasterizer, font_key);
             if font.is_none() {
                 trace!("Unable to load font {:?} for shaping", font_key);
             }
-            self.shaped_fonts.insert(font_key, font);
+            entry.insert(font);
         }
 
         // Clone the font to avoid borrowing the cache while shaping.
@@ -512,13 +513,13 @@ impl GlyphCache {
     }
 
     /// Load the font file of `font_key` for shaping.
-    fn load_shaped_font(&mut self, font_key: FontKey) -> Option<harfrust::Font> {
+    fn load_shaped_font(rasterizer: &mut Rasterizer, font_key: FontKey) -> Option<harfrust::Font> {
         // Memory-registered fonts are shaped straight from their bytes.
-        if let Some(data) = self.rasterizer.memory_font_data(font_key) {
+        if let Some(data) = rasterizer.memory_font_data(font_key) {
             return harfrust::Font::new((*data).clone(), 0);
         }
 
-        let (path, face_index) = self.rasterizer.font_path(font_key).ok()?;
+        let (path, face_index) = rasterizer.font_path(font_key).ok()?;
         let data = std::fs::read(path).ok()?;
 
         harfrust::Font::new(data, face_index)
