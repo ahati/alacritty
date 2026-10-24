@@ -1420,6 +1420,10 @@ mod tests {
         };
         assert!(fd >= 0, "{}", std::io::Error::last_os_error());
 
+        // macOS does not grow a shared memory object on write, so its size has
+        // to be set before any bytes go into it.
+        assert_eq!(unsafe { libc::ftruncate(fd, data.len() as libc::off_t) }, 0);
+
         let mut object =
             std::fs::File::from(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
         object.write_all(data).unwrap();
