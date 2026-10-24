@@ -1983,7 +1983,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_shared_memory_object_is_removed_even_when_the_read_fails() {
+    fn a_shared_memory_object_is_removed_even_when_the_payload_is_rejected() {
+        let name = format!("/alacritty-graphics-{}-short", std::process::id());
+        // Bytes that decode as no image format at all.
+        make_shm(&name, b"not a png");
+
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload = format!("Ga=t,f=100,a=t,i=4,t=s;{}", encode(name.as_bytes()));
+        let update = apc(&mut store, &payload);
+
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=4;EBADPNG:could not decode image data\x1b\\")
+        );
+        assert!(!shm_exists(&name));
+    }
+
+    // macOS reports a shared memory object's allocated size, which is rounded
+    // to whole pages, so a read without a declared size cannot see where the
+    // client's bytes end and the zero padding begins, and the window is never
+    // shorter than the image claims. Where the object's size is honest, the
+    // short read is still refused.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_shared_memory_object_shorter_than_its_image_is_refused() {
         let name = format!("/alacritty-graphics-{}-short", std::process::id());
         // One pixel, while the control data declares two.
         make_shm(&name, &[255, 0, 0, 255]);
