@@ -5,7 +5,8 @@ use crossfont::{
     Error as RasterizerError, FontDesc, FontKey, GlyphKey, Metrics, Rasterize, RasterizedGlyph,
     Rasterizer, Size, Slant, Style, Weight,
 };
-use log::{error, info};
+use harfrust::{Feature, Tag};
+use log::{error, info, trace, warn};
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::font::{Font, FontDescription};
@@ -39,10 +40,33 @@ pub struct Glyph {
     pub uv_height: f32,
 }
 
+/// A glyph as produced by shaping a text run.
+#[derive(Copy, Clone, Debug)]
+pub enum ShapedGlyphSpec {
+    /// A raw glyph index within the shaped font.
+    GlyphIndex(u32),
+
+    /// A character, used when the shaped glyph is unavailable (like the
+    /// `.notdef` glyph) so that fallbacks apply as usual.
+    Char(char),
+}
+
+/// A shaped glyph and its cluster within the shaped text.
+#[derive(Copy, Clone, Debug)]
+pub struct ShapedGlyph {
+    pub glyph: Glyph,
+
+    /// UTF-8 byte offset of the cluster this glyph belongs to.
+    pub cluster: usize,
+}
+
+/// The maximum number of shaped runs kept around.
+const SHAPED_RUNS_CAP: usize = 10_000;
+
 /// Naïve glyph cache.
 ///
-/// Currently only keyed by `char`, and thus not possible to hold different
-/// representations of the same code point.
+/// The cache is keyed by [`GlyphKey`], which uniquely identifies a glyph
+/// within a font at a specific size.
 pub struct GlyphCache {
     /// Cache of buffered glyphs.
     cache: HashMap<GlyphKey, Glyph, RandomState>,
@@ -76,6 +100,28 @@ pub struct GlyphCache {
 
     /// Whether to use the built-in font for box drawing characters.
     builtin_box_drawing: bool,
+
+    /// Whether font ligatures should be shaped.
+    ligatures: bool,
+
+    /// OpenType features used during shaping.
+    shape_features: Vec<Feature>,
+
+    /// Fonts loaded for shaping, keyed by [`FontKey`].
+    ///
+    /// Loading can fail, for instance when the font file is inaccessible, in
+    /// which case runs are shaped char-by-char instead.
+    shaped_fonts: HashMap<FontKey, Option<harfrust::Font>>,
+
+    /// Cache of shaped runs, keyed by font and text.
+    shaped_runs: HashMap<(FontKey, String), Vec<(ShapedGlyphSpec, usize)>>,
+
+    /// Cache of glyphs rasterized by their index, keyed by font, size and
+    /// glyph index.
+    shaped_cache: HashMap<(FontKey, crossfont::Size, u32), Glyph>,
+
+    /// Reusable buffer for shaping.
+    shape_buffer: harfrust::Buffer,
 }
 
 impl GlyphCache {
@@ -95,6 +141,12 @@ impl GlyphCache {
             glyph_offset: font.glyph_offset,
             metrics,
             builtin_box_drawing: font.builtin_box_drawing,
+            ligatures: font.ligatures,
+            shape_features: Self::shape_features(font.ligatures),
+            shaped_fonts: Default::default(),
+            shaped_runs: Default::default(),
+            shaped_cache: Default::default(),
+            shape_buffer: Default::default(),
         })
     }
 
@@ -272,6 +324,7 @@ impl GlyphCache {
     pub fn reset_glyph_cache<L: LoadGlyph>(&mut self, loader: &mut L) {
         loader.clear();
         self.cache = Default::default();
+        self.shaped_cache = Default::default();
 
         self.load_common_glyphs(loader);
     }
@@ -300,6 +353,12 @@ impl GlyphCache {
         self.bold_italic_key = bold_italic;
         self.metrics = metrics;
         self.builtin_box_drawing = font.builtin_box_drawing;
+        self.ligatures = font.ligatures;
+        self.shape_features = Self::shape_features(font.ligatures);
+
+        // Shaped runs are only valid for a single font size.
+        self.shaped_runs.clear();
+        self.shaped_cache.clear();
 
         Ok(())
     }
@@ -314,5 +373,238 @@ impl GlyphCache {
         self.load_glyphs_for_font(self.bold_key, loader);
         self.load_glyphs_for_font(self.italic_key, loader);
         self.load_glyphs_for_font(self.bold_italic_key, loader);
+    }
+
+    /// Shape `text` in `font_key` and load all of its glyphs.
+    ///
+    /// The returned glyphs are ordered like the characters of the shaped text,
+    /// with their cluster identifying the position of the character they were
+    /// derived from.
+    pub fn shape_run<L: LoadGlyph + ?Sized>(
+        &mut self,
+        text: &str,
+        font_key: FontKey,
+        loader: &mut L,
+    ) -> Vec<ShapedGlyph> {
+        self.shape_text(text, font_key)
+            .into_iter()
+            .map(|(spec, cluster)| {
+                let glyph = match spec {
+                    ShapedGlyphSpec::GlyphIndex(index) => self.get_shaped(index, font_key, loader),
+                    ShapedGlyphSpec::Char(c) => {
+                        let glyph_key = GlyphKey { font_key, size: self.font_size, character: c };
+                        self.get(glyph_key, loader, true)
+                    },
+                };
+
+                ShapedGlyph { cluster, glyph }
+            })
+            .collect()
+    }
+
+    /// Get a glyph rasterized by its index within `font_key`.
+    ///
+    /// Shaped glyphs (like ligatures) are identified by their index in the
+    /// font instead of a character, so they are cached separately.
+    fn get_shaped<L: LoadGlyph + ?Sized>(
+        &mut self,
+        glyph_index: u32,
+        font_key: FontKey,
+        loader: &mut L,
+    ) -> Glyph {
+        let cache_key = (font_key, self.font_size, glyph_index);
+
+        // Try to load glyph from cache.
+        if let Some(glyph) = self.shaped_cache.get(&cache_key) {
+            return *glyph;
+        }
+
+        let glyph = match self.rasterizer.get_glyph_by_index(font_key, self.font_size, glyph_index)
+        {
+            Ok(rasterized) => self.load_glyph(loader, rasterized),
+            // Load the default glyph on error.
+            Err(_) => self.load_glyph(loader, Default::default()),
+        };
+
+        *self.shaped_cache.entry(cache_key).or_insert(glyph)
+    }
+
+    /// Shape `text`, using a cache for runs shaped before.
+    fn shape_text(&mut self, text: &str, font_key: FontKey) -> Vec<(ShapedGlyphSpec, usize)> {
+        // Without ligatures there is no need for shaping at all.
+        if !self.ligatures {
+            return Self::shape_char_by_char(text);
+        }
+
+        // Since shaping is per-frame while a line is visible, reuse previous
+        // results for identical runs.
+        let key = (font_key, text.to_owned());
+        if let Some(shaped) = self.shaped_runs.get(&key) {
+            return shaped.clone();
+        }
+
+        if self.shaped_runs.len() >= SHAPED_RUNS_CAP {
+            self.shaped_runs.clear();
+        }
+
+        let shaped = self.shape_with_harfrust(text, font_key);
+        self.shaped_runs.insert(key, shaped.clone());
+
+        shaped
+    }
+
+    /// Shape `text` with harfrust.
+    fn shape_with_harfrust(
+        &mut self,
+        text: &str,
+        font_key: FontKey,
+    ) -> Vec<(ShapedGlyphSpec, usize)> {
+        // Load the font for shaping, if possible.
+        if !self.shaped_fonts.contains_key(&font_key) {
+            let font = self.load_shaped_font(font_key);
+            if font.is_none() {
+                trace!("Unable to load font {:?} for shaping", font_key);
+            }
+            self.shaped_fonts.insert(font_key, font);
+        }
+
+        // Clone the font to avoid borrowing the cache while shaping.
+        let Some(font) = self.shaped_fonts.get(&font_key).and_then(Option::as_ref).cloned() else {
+            return Self::shape_char_by_char(text);
+        };
+
+        let shaper = harfrust::ShaperFont::new(&font);
+
+        let buffer = &mut self.shape_buffer;
+        buffer.reset();
+        buffer.push_str(text);
+
+        // Infer the script of the text, but always shape in logical order to
+        // match the terminal's grid.
+        buffer.guess_segment_properties();
+        buffer.set_direction(harfrust::Direction::LeftToRight);
+
+        let features = self.shape_features.clone();
+        let options = harfrust::ShapeOptions::new().features(&features);
+        if let Err(err) = harfrust::shape(&shaper, buffer, options) {
+            warn!("Shaping failed: {err}");
+            return Self::shape_char_by_char(text);
+        }
+
+        buffer
+            .glyph_infos()
+            .iter()
+            .map(|info| {
+                let cluster = info.cluster as usize;
+
+                // Glyph `0` is the `.notdef` glyph; rasterize the cluster's
+                // character instead so that the usual fallbacks apply.
+                let spec = if info.glyph_id == 0 {
+                    let c = text[cluster..].chars().next().unwrap_or(' ');
+                    ShapedGlyphSpec::Char(c)
+                } else {
+                    ShapedGlyphSpec::GlyphIndex(info.glyph_id)
+                };
+
+                (spec, cluster)
+            })
+            .collect()
+    }
+
+    /// Load the font file of `font_key` for shaping.
+    fn load_shaped_font(&mut self, font_key: FontKey) -> Option<harfrust::Font> {
+        // Memory-registered fonts are shaped straight from their bytes.
+        if let Some(data) = self.rasterizer.memory_font_data(font_key) {
+            return harfrust::Font::new((*data).clone(), 0);
+        }
+
+        let (path, face_index) = self.rasterizer.font_path(font_key).ok()?;
+        let data = std::fs::read(path).ok()?;
+
+        harfrust::Font::new(data, face_index)
+    }
+
+    /// "Shape" `text` by mapping every character to its own glyph.
+    fn shape_char_by_char(text: &str) -> Vec<(ShapedGlyphSpec, usize)> {
+        text.char_indices().map(|(offset, c)| (ShapedGlyphSpec::Char(c), offset)).collect()
+    }
+
+    /// The OpenType features used during shaping.
+    fn shape_features(ligatures: bool) -> Vec<Feature> {
+        if ligatures {
+            vec![Feature::new(Tag::new(b"liga"), 1, ..), Feature::new(Tag::new(b"calt"), 1, ..)]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossfont::{Rasterize, Rasterizer};
+
+    use super::{Glyph, GlyphCache, LoadGlyph, RasterizedGlyph};
+    use crate::config::font::Font;
+
+    struct TestLoader;
+
+    impl LoadGlyph for TestLoader {
+        fn load_glyph(&mut self, _: &RasterizedGlyph) -> Glyph {
+            Glyph {
+                tex_id: 0,
+                multicolor: false,
+                top: 0,
+                left: 0,
+                width: 0,
+                height: 0,
+                uv_bot: 0.,
+                uv_left: 0.,
+                uv_width: 0.,
+                uv_height: 0.,
+            }
+        }
+
+        fn clear(&mut self) {}
+    }
+
+    #[test]
+    fn shape_run_maps_clusters() {
+        let font = Font::default();
+        let rasterizer = Rasterizer::new().unwrap();
+        let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
+        let font_key = glyph_cache.font_key;
+
+        let mut loader = TestLoader;
+        let shaped = glyph_cache.shape_run("ab", font_key, &mut loader);
+
+        // Without ligatures in the font, every character maps to its own glyph.
+        assert_eq!(shaped.len(), 2);
+        assert_eq!(shaped[0].cluster, 0);
+        assert_eq!(shaped[1].cluster, 1);
+    }
+
+    /// The default font resolves to the embedded font, which is shaped from
+    /// its registered bytes.
+    #[test]
+    fn embedded_font_shapes() {
+        // Only meaningful when the font was fetched at build time on a
+        // platform with in-memory registration.
+        if !cfg!(embed_fonts) || cfg!(any(target_os = "macos", target_os = "windows")) {
+            return;
+        }
+
+        assert_eq!(Font::default().normal().family, "JetBrainsMono Nerd Font Mono");
+
+        let font = Font::default();
+        let rasterizer = Rasterizer::new().unwrap();
+        let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
+        let font_key = glyph_cache.font_key;
+
+        let mut loader = TestLoader;
+        let shaped = glyph_cache.shape_run("ab", font_key, &mut loader);
+
+        assert_eq!(shaped.len(), 2);
+        assert_eq!(shaped[0].cluster, 0);
+        assert_eq!(shaped[1].cluster, 1);
     }
 }

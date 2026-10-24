@@ -32,6 +32,7 @@ mod clipboard;
 mod config;
 mod daemon;
 mod display;
+mod embedded_font;
 mod event;
 mod input;
 mod logging;
@@ -46,6 +47,7 @@ mod polling;
 mod renderer;
 mod scheduler;
 mod string;
+mod text_run;
 mod window_context;
 
 mod gl {

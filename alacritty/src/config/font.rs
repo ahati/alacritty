@@ -25,6 +25,9 @@ pub struct Font {
     #[config(removed = "set the AppleFontSmoothing user default instead")]
     pub use_thin_strokes: bool,
 
+    /// Render font ligatures.
+    pub ligatures: bool,
+
     /// Normal font face.
     normal: FontDescription,
 
@@ -82,6 +85,7 @@ impl Default for Font {
             builtin_box_drawing: true,
             glyph_offset: Default::default(),
             use_thin_strokes: Default::default(),
+            ligatures: true,
             bold_italic: Default::default(),
             italic: Default::default(),
             offset: Default::default(),
@@ -102,8 +106,10 @@ pub struct FontDescription {
 impl Default for FontDescription {
     fn default() -> FontDescription {
         FontDescription {
+            // Linux uses the font embedded into the binary, when it was
+            // fetched at build time.
             #[cfg(not(any(target_os = "macos", windows)))]
-            family: "monospace".into(),
+            family: crate::embedded_font::default_family(),
             #[cfg(target_os = "macos")]
             family: "Menlo".into(),
             #[cfg(windows)]

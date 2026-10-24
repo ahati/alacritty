@@ -23,6 +23,7 @@ use crate::gl;
 use crate::renderer::images::{ImageQuad, ImageRenderer};
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
+use crate::text_run::{TextRun, TextRunIter};
 
 pub mod images;
 pub mod platform;
@@ -180,18 +181,18 @@ impl Renderer {
         Ok(Self { text_renderer, rect_renderer, image_renderer, robustness })
     }
 
-    pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
+    pub fn draw_runs<I: Iterator<Item = TextRun>>(
         &mut self,
         size_info: &SizeInfo,
         glyph_cache: &mut GlyphCache,
-        cells: I,
+        runs: I,
     ) {
         match &mut self.text_renderer {
             TextRendererProvider::Gles2(renderer) => {
-                renderer.draw_cells(size_info, glyph_cache, cells)
+                renderer.draw_runs(size_info, glyph_cache, runs)
             },
             TextRendererProvider::Glsl3(renderer) => {
-                renderer.draw_cells(size_info, glyph_cache, cells)
+                renderer.draw_runs(size_info, glyph_cache, runs)
             },
         }
     }
@@ -232,7 +233,8 @@ impl Renderer {
             })
         });
 
-        self.draw_cells(size_info, glyph_cache, cells);
+        let runs = TextRunIter::new(cells).collect::<Vec<_>>();
+        self.draw_runs(size_info, glyph_cache, runs.into_iter());
     }
 
     pub fn with_loader<F, T>(&mut self, func: F) -> T

@@ -1,12 +1,14 @@
 use bitflags::bitflags;
-use crossfont::{GlyphKey, RasterizedGlyph};
+use crossfont::{FontKey, GlyphKey, RasterizedGlyph};
 
+use alacritty_terminal::index::Column;
 use alacritty_terminal::term::cell::Flags;
 
 use crate::display::SizeInfo;
 use crate::display::content::RenderableCell;
 use crate::gl;
 use crate::gl::types::*;
+use crate::text_run::TextRun;
 
 mod atlas;
 mod builtin_font;
@@ -54,16 +56,16 @@ pub trait TextRenderer<'a> {
     /// Get loader API for the renderer.
     fn loader_api(&mut self) -> LoaderApi<'_>;
 
-    /// Draw cells.
-    fn draw_cells<'b: 'a, I: Iterator<Item = RenderableCell>>(
+    /// Draw text runs.
+    fn draw_runs<'b: 'a, I: Iterator<Item = TextRun>>(
         &'b mut self,
         size_info: &'b SizeInfo,
         glyph_cache: &'a mut GlyphCache,
-        cells: I,
+        runs: I,
     ) {
         self.with_api(size_info, |mut api| {
-            for cell in cells {
-                api.draw_cell(cell, glyph_cache, size_info);
+            for run in runs {
+                api.draw_run(run, glyph_cache, size_info);
             }
         })
     }
@@ -119,7 +121,6 @@ pub trait TextRenderBatch {
 pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
     /// Get `Batch` the api is using.
     fn batch(&mut self) -> &mut T;
-
     /// Render the underlying data.
     fn render_batch(&mut self);
 
@@ -139,40 +140,97 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
         }
     }
 
-    /// Draw cell.
-    fn draw_cell(
-        &mut self,
-        mut cell: RenderableCell,
-        glyph_cache: &mut GlyphCache,
-        size_info: &SizeInfo,
-    ) {
-        // Get font key for cell.
-        let font_key = match cell.flags & Flags::BOLD_ITALIC {
+    /// Get the [`FontKey`] for drawing cells with `flags`.
+    fn determine_font_key(flags: Flags, glyph_cache: &GlyphCache) -> FontKey {
+        match flags & Flags::BOLD_ITALIC {
             Flags::BOLD_ITALIC => glyph_cache.bold_italic_key,
             Flags::ITALIC => glyph_cache.italic_key,
             Flags::BOLD => glyph_cache.bold_key,
             _ => glyph_cache.font_key,
-        };
+        }
+    }
 
-        // Ignore hidden cells and render tabs as spaces to prevent font issues.
-        let hidden = cell.flags.contains(Flags::HIDDEN);
-        if cell.character == '\t' || hidden {
-            cell.character = ' ';
+    /// Draw a text run.
+    ///
+    /// The run is shaped together, so glyphs like ligatures which span multiple
+    /// cells can be rendered; everything that breaks up such a glyph (like a
+    /// selection) also breaks up the text run.
+    fn draw_run(&mut self, run: TextRun, glyph_cache: &mut GlyphCache, size_info: &SizeInfo) {
+        let font_key = Self::determine_font_key(run.flags, glyph_cache);
+
+        // Hidden cells draw their background only.
+        if run.flags.contains(Flags::HIDDEN) {
+            let glyph_key = GlyphKey { font_key, size: glyph_cache.font_size, character: ' ' };
+            let glyph = glyph_cache.get(glyph_key, self, true);
+            for cell in run.cells() {
+                self.add_render_item(&cell, &glyph, size_info);
+            }
+            return;
         }
 
-        let mut glyph_key =
-            GlyphKey { font_key, size: glyph_cache.font_size, character: cell.character };
+        // Shape the entire run, so ligatures spanning multiple cells are
+        // rendered as a single glyph.
+        let text = run.text();
+        let shaped = glyph_cache.shape_run(&text, font_key, self);
 
-        // Add cell to batch.
-        let glyph = glyph_cache.get(glyph_key, self, true);
-        self.add_render_item(&cell, &glyph, size_info);
+        // Map every shaped glyph to the column of its cluster. Ligatures cover
+        // the columns of all their characters, while the additional glyphs of
+        // expanded clusters render inside the cluster's first cell.
+        let start_column = run.span.0.0;
+        let mut columns: Vec<Vec<Glyph>> = vec![Vec::new(); run.num_columns()];
 
-        // Render visible zero-width characters.
-        if let Some(zerowidth) =
-            cell.extra.as_mut().and_then(|extra| extra.zerowidth.take().filter(|_| !hidden))
-        {
+        let mut char_index = 0usize;
+        let mut chars = text.char_indices().peekable();
+        for glyph in shaped {
+            while let Some((offset, _)) = chars.peek() {
+                if *offset < glyph.cluster {
+                    chars.next();
+                    char_index += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let column = run.column_of_char(char_index);
+            if column.0 < start_column || column.0 > run.span.1.0 {
+                continue;
+            }
+            columns[column.0 - start_column].push(glyph.glyph);
+        }
+
+        // Spaces cover the cells consumed by ligatures, so that their
+        // backgrounds are drawn without drawing a glyph.
+        let space = GlyphKey { font_key, size: glyph_cache.font_size, character: ' ' };
+        let space = glyph_cache.get(space, self, true);
+
+        let wide = run.flags.contains(Flags::WIDE_CHAR);
+        for (index, glyphs) in columns.into_iter().enumerate() {
+            // The spacer of wide characters is drawn as part of the wide
+            // character's item, which the shader expands over both cells.
+            if wide && index % 2 == 1 {
+                continue;
+            }
+
+            let cell = run.dummy_cell_at(Column(start_column + index));
+            let mut glyphs = glyphs.into_iter();
+            let glyph = glyphs.next().unwrap_or(space);
+            self.add_render_item(&cell, &glyph, size_info);
+
+            // Additional glyphs of expanded clusters render in the same cell.
+            for glyph in glyphs {
+                self.add_render_item(&cell, &glyph, size_info);
+            }
+        }
+
+        // Render visible zero-width characters inside their character's cell.
+        for (index, zerowidth) in run.content.zero_widths.iter().enumerate() {
+            let Some(zerowidth) = zerowidth else { continue };
+
+            let column = run.column_of_char(index);
+            let cell = run.dummy_cell_at(column);
             for character in zerowidth {
-                glyph_key.character = character;
+                let glyph_key =
+                    GlyphKey { font_key, size: glyph_cache.font_size, character: *character };
                 let glyph = glyph_cache.get(glyph_key, self, false);
                 self.add_render_item(&cell, &glyph, size_info);
             }

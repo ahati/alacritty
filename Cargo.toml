@@ -27,3 +27,7 @@ x11-clipboard = { git = "https://github.com/quininer/x11-clipboard.git", rev = "
 # Streaming APC (`ESC _`) callbacks, required by the Kitty graphics protocol.
 # Upstream vte 0.15.0 drops APC payloads before they reach the terminal.
 vte = { git = "https://github.com/ahati/vte.git", branch = "kitty-graphics" }
+
+# GlyphId rasterization and `font_path` lookup, required for text shaping.
+# Based on alacritty/crossfont#35 by fee1-dead.
+crossfont = { git = "https://github.com/ahati/crossfont", branch = "ligatures" }

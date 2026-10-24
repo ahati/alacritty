@@ -12,10 +12,20 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 ### Added
 
+- Embedded default font: JetBrains Mono Nerd Font Mono is downloaded at build
+  time from the latest Nerd Fonts release and compiled into the binary, then
+  registered with the rasterizer entirely in-memory, so it renders without
+  being installed on the system or touching the disk. System fonts remain
+  available for glyph fallback, and `font.normal.family` overrides it as
+  usual. Set `ALACRITTY_EMBED_FONTS=0` to build without it and
+  `ALACRITTY_FONT_CACHE` to relocate the build-time font cache. Currently
+  Linux only; macOS and Windows keep their stock defaults
 - Support for inline images through the Kitty graphics protocol (`f=24`, `f=32` and
   `f=100`, zlib compression, direct, file, temp-file and shared-memory transmission,
   placements, z-index, deletion and chunked transfers), configurable through
   `terminal.graphics`
+- Font ligature support, shaping style-homogeneous runs of cells with harfrust and
+  rendering the resulting glyphs across multiple cells, configurable through `font.ligatures`
 
 ### Changed
 
