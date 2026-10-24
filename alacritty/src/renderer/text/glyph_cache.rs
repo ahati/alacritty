@@ -492,16 +492,32 @@ impl GlyphCache {
             return Self::shape_char_by_char(text);
         }
 
-        buffer
-            .glyph_infos()
+        // The infos are collected so the closure below can use `self` while
+        // iterating over the shaped buffer.
+        let infos = buffer.glyph_infos().to_vec();
+        infos
             .iter()
-            .map(|info| {
+            .enumerate()
+            .map(|(index, info)| {
                 let cluster = info.cluster as usize;
+
+                // A cluster extends up to the next glyph's cluster; the last
+                // glyph's cluster extends to the end of the text.
+                let cluster_end = infos
+                    .get(index + 1)
+                    .map_or(text.len(), |next| (next.cluster as usize).max(cluster));
 
                 // Glyph `0` is the `.notdef` glyph; rasterize the cluster's
                 // character instead so that the usual fallbacks apply.
                 let spec = if info.glyph_id == 0 {
                     let c = text[cluster..].chars().next().unwrap_or(' ');
+                    ShapedGlyphSpec::Char(c)
+                } else if let Some(c) = self.builtin_cluster_char(text, cluster, cluster_end) {
+                    // Clusters of a single character that the built-in font
+                    // draws (like box drawing) keep using it: its glyphs tile
+                    // the cell exactly, while the font's own glyphs show
+                    // seams at the cell boundaries. Ligatures span several
+                    // characters and keep their font glyph.
                     ShapedGlyphSpec::Char(c)
                 } else {
                     ShapedGlyphSpec::GlyphIndex(info.glyph_id)
@@ -510,6 +526,20 @@ impl GlyphCache {
                 (spec, cluster)
             })
             .collect()
+    }
+
+    /// The cluster's character, if the built-in font draws it.
+    ///
+    /// Clusters spanning several characters are ligatures, which keep their
+    /// font glyph.
+    fn builtin_cluster_char(&self, text: &str, cluster: usize, cluster_end: usize) -> Option<char> {
+        if !self.builtin_box_drawing {
+            return None;
+        }
+
+        let mut chars = text.get(cluster..cluster_end)?.chars();
+        let c = chars.next()?;
+        (chars.next().is_none() && builtin_font::is_builtin(c)).then_some(c)
     }
 
     /// Load the font file of `font_key` for shaping.
@@ -544,7 +574,7 @@ impl GlyphCache {
 mod tests {
     use crossfont::{Rasterize, Rasterizer};
 
-    use super::{Glyph, GlyphCache, LoadGlyph, RasterizedGlyph};
+    use super::{Glyph, GlyphCache, LoadGlyph, RasterizedGlyph, ShapedGlyphSpec};
     use crate::config::font::Font;
 
     struct TestLoader;
@@ -597,7 +627,8 @@ mod tests {
         assert_eq!(Font::default().normal().family, "JetBrainsMono Nerd Font Mono");
 
         let font = Font::default();
-        let rasterizer = Rasterizer::new().unwrap();
+        let mut rasterizer = Rasterizer::new().unwrap();
+        crate::embedded_font::register(&mut rasterizer);
         let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
         let font_key = glyph_cache.font_key;
 
@@ -607,5 +638,98 @@ mod tests {
         assert_eq!(shaped.len(), 2);
         assert_eq!(shaped[0].cluster, 0);
         assert_eq!(shaped[1].cluster, 1);
+    }
+
+    // Regression test: shaping a run must not take box drawing characters away
+    // from the built-in font. Its glyphs tile the cell exactly, while the
+    // glyphs of fonts like the embedded JetBrains Mono Nerd Font Mono carry
+    // anti-aliased edges that show up as seams at every cell boundary.
+    #[test]
+    fn shaped_box_drawing_uses_builtin_font() {
+        let font = Font::default();
+        let mut rasterizer = Rasterizer::new().unwrap();
+
+        // Shape the embedded font like the real terminal does, rather than
+        // whatever fontconfig resolves for the default family in tests.
+        crate::embedded_font::register(&mut rasterizer);
+
+        let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
+        let font_key = glyph_cache.font_key;
+
+        let shaped = glyph_cache.shape_text("\u{2500}\u{2502}\u{2571}", font_key);
+
+        // Every box drawing glyph is routed through the built-in font, whether
+        // the run was shaped (glyph indices) or mapped char-by-char.
+        assert_eq!(shaped.len(), 3);
+        assert!(shaped.iter().all(|(spec, _)| matches!(
+            spec,
+            ShapedGlyphSpec::Char('\u{2500}' | '\u{2502}' | '\u{2571}')
+        )));
+
+        // Where the embedded font is available for shaping, prove the run
+        // actually went through the shaper: mixed into a shaped run, the
+        // regular character keeps its font glyph while the box drawing
+        // character resolves through the built-in font.
+        if cfg!(embed_fonts) && !cfg!(any(target_os = "macos", target_os = "windows")) {
+            let shaped = glyph_cache.shape_text("\u{2502}x", font_key);
+            assert!(matches!(shaped[0], (ShapedGlyphSpec::Char('\u{2502}'), _)));
+            assert!(matches!(shaped[1], (ShapedGlyphSpec::GlyphIndex(_), _)));
+        }
+    }
+
+    /// Characters without built-in rendering keep their font glyphs, so
+    /// ligatures (a single glyph spanning several characters) survive.
+    #[test]
+    fn ligatures_keep_font_glyphs() {
+        let font = Font::default();
+        let mut rasterizer = Rasterizer::new().unwrap();
+
+        // Shape the embedded font like the real terminal does, rather than
+        // whatever fontconfig resolves for the default family in tests.
+        crate::embedded_font::register(&mut rasterizer);
+
+        let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
+        let font_key = glyph_cache.font_key;
+
+        // Programming arrows like these are ligatures in many fonts; none of
+        // their characters is built-in rendered, so every glyph of these runs
+        // must stay a font glyph, ligature or not.
+        for text in ["->", "->>", "=>", "fi"] {
+            let shaped = glyph_cache.shape_text(text, font_key);
+            assert!(
+                shaped.iter().all(|(spec, _)| matches!(spec, ShapedGlyphSpec::GlyphIndex(_))),
+                "{text:?} took a non-font rendering path: {shaped:?}"
+            );
+
+            // If the font ligated the run into a single glyph, the ligature
+            // keeps its font glyph and its cluster still covers the sequence.
+            if shaped.len() == 1 {
+                assert_eq!(shaped[0].1, 0, "{text:?} ligated with a shifted cluster");
+            }
+        }
+    }
+
+    /// The cluster classification: single built-in characters resolve to the
+    /// built-in font, ligature clusters and other characters do not.
+    #[test]
+    fn builtin_cluster_char_rules() {
+        let font = Font::default();
+        let rasterizer = Rasterizer::new().unwrap();
+        let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
+
+        // A single box drawing character resolves to the built-in font. Note
+        // that `\u{2502}` encodes to three bytes.
+        assert_eq!(glyph_cache.builtin_cluster_char("\u{2502}", 0, 3), Some('\u{2502}'));
+
+        // A cluster covering several characters is a ligature: it keeps its
+        // font glyph, even when it contains box drawing characters.
+        assert_eq!(glyph_cache.builtin_cluster_char("\u{2500}\u{2500}", 0, 6), None);
+
+        // Regular characters are not affected.
+        assert_eq!(glyph_cache.builtin_cluster_char("a", 0, 1), None);
+
+        // With the built-in font disabled, everything uses the font glyphs.
+        glyph_cache.builtin_box_drawing = false;
+        assert_eq!(glyph_cache.builtin_cluster_char("\u{2502}", 0, 3), None);
     }
 }

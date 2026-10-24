@@ -37,6 +37,11 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 ### Fixed
 
+- Box drawing characters rendering with seams at the cell boundaries while
+  `font.ligatures` is enabled. Shaped runs now keep drawing characters that the
+  built-in font covers (box drawing, block elements, powerline) through that
+  built-in renderer, so window borders and pane dividers are seamless again;
+  ligatures still use the font's own glyphs
 - Primary device attributes reply (`CSI ? 6 c`) not being recognised by `kitten icat`,
   which requires a reply longer than three bytes and otherwise times out
 - Images not moving the cursor past the placement, which left the shell prompt and

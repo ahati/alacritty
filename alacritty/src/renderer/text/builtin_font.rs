@@ -19,6 +19,20 @@ const POWERLINE_ARROW_LTR: char = '\u{e0b1}';
 const POWERLINE_TRIANGLE_RTL: char = '\u{e0b2}';
 const POWERLINE_ARROW_RTL: char = '\u{e0b3}';
 
+/// Whether `character` is drawn by the built-in font (when enabled).
+///
+/// This mirrors the characters [`builtin_glyph`] accepts without requiring the
+/// font metrics, so callers can decide up front how a character is rendered.
+pub fn is_builtin(character: char) -> bool {
+    matches!(
+        character,
+        '\u{2500}'..='\u{259f}'
+            | '\u{1fb00}'..='\u{1fb3b}'
+            | '\u{1fb82}'..='\u{1fb8b}'
+            | POWERLINE_TRIANGLE_LTR..=POWERLINE_ARROW_RTL
+    )
+}
+
 /// Returns the rasterized glyph if the character is part of the built-in font.
 pub fn builtin_glyph(
     character: char,
