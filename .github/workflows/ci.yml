@@ -1,20 +1,46 @@
 name: CI
 
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 
 env:
   CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          # Linux, both architectures the release ships.
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          # Windows, both architectures the release ships. The arm64 runner
+          # has no Rust preinstalled, so the x64 installer is run under
+          # emulation, which sets up the native aarch64 toolchain.
+          - os: windows-latest
+          - os: windows-11-arm
+          # macOS aarch64 only.
+          - os: macos-latest
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install cmake pkg-config libfreetype6-dev libfontconfig1-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev python3 scdoc
+      - name: Install Rust
+        if: runner.os == 'Windows' && runner.arch == 'ARM64'
+        run: |
+          curl -sSfL -o rustup-init.exe https://win.rustup.rs/x86_64
+          ./rustup-init.exe -y --default-toolchain stable
+          echo "$USERPROFILE/.cargo/bin" >> "$GITHUB_PATH"
       - name: Stable
         run: cargo test
       - name: Stable (no default features)
@@ -27,11 +53,3 @@ jobs:
         run: |
           rustup component add clippy
           cargo clippy --all-targets
-  check-macos-x86_64:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install target
-        run: rustup update && rustup target add x86_64-apple-darwin
-      - name: Build
-        run: cargo build --target=x86_64-apple-darwin
