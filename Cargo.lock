@@ -519,7 +519,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crossfont"
 version = "0.8.1"
-source = "git+https://github.com/ahati/crossfont?branch=ligatures#4c94b2126d75b5bc2066b69957b4b58b408703d8"
+source = "git+https://github.com/ahati/crossfont?branch=ligatures#bd08fb44366598e3416f84c0ccb5b358eaeb493a"
 dependencies = [
  "core-foundation",
  "core-foundation-sys",
