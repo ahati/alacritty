@@ -1652,14 +1652,20 @@ mod tests {
         let update = apc(&mut store, "Ga=p,i=99");
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=99;ENOENT:image not found\x1b\\"));
 
-        // A shared memory object that cannot be opened reports the same
-        // information-free error a missing file does.
-        let payload = encode(b"/alacritty-graphics-missing");
-        let update = apc(&mut store, &format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{payload}"));
-        assert_eq!(
-            update.response.as_deref(),
-            Some("\x1b_Gi=4;EBADF:Failed to read image file\x1b\\")
-        );
+        // A shared memory object is read where the platform has a shared
+        // memory namespace, and refused outright where it does not; either
+        // way the reply tells the client which of the two this terminal is.
+        {
+            let payload = encode(b"/alacritty-graphics-missing");
+            let update = apc(&mut store, &format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{payload}"));
+
+            #[cfg(unix)]
+            let expected = "\x1b_Gi=4;EBADF:Failed to read image file\x1b\\";
+            #[cfg(windows)]
+            let expected = "\x1b_Gi=4;EUNSUPPORTED:unsupported command\x1b\\";
+
+            assert_eq!(update.response.as_deref(), Some(expected));
+        }
 
         // A file that cannot be read reports one information-free error.
         let missing = std::env::temp_dir().join("alacritty-graphics-missing-file");
@@ -1998,6 +2004,40 @@ mod tests {
                 "{name} must be refused"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_memory_name_ends_at_its_first_nul() {
+        // Whatever follows the name's NUL is not part of it, so a payload
+        // cannot carry a second path component past the form check.
+        let name = format!("/alacritty-graphics-{}-nul", std::process::id());
+        make_shm(&name, &[255, 0, 0, 255]);
+
+        let mut named = name.as_bytes().to_vec();
+        named.push(0);
+        named.extend_from_slice(b"/../../etc/passwd");
+
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let payload = format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{}", encode(&named));
+        let update = apc(&mut store, &payload);
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=4;OK\x1b\\"));
+        assert_eq!(store.memory_used(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_overlong_shared_memory_name_is_refused() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        let name = format!("/{}", "a".repeat(2048));
+        let payload = format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{}", encode(name.as_bytes()));
+        let update = apc(&mut store, &payload);
+
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=4;EINVAL:Filename too long\x1b\\")
+        );
     }
 
     #[cfg(unix)]
