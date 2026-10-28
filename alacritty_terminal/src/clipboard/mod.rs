@@ -31,6 +31,7 @@ pub use self::session::{Outcome, WriteSession};
 use std::sync::Arc;
 
 use crate::event::{Event, EventListener};
+use log::{debug, trace};
 
 /// The OSC number of the protocol and of the paste-events private mode.
 ///
@@ -116,11 +117,15 @@ pub fn handle_packet<T: EventListener>(
     }
 
     let packet = match packet::parse(params) {
-        Ok(packet) => packet,
+        Ok(packet) => {
+            trace!("Kitty clipboard packet: {packet:?}");
+            packet
+        },
         Err(malformed) => {
             // The write half must answer invalid packets with `EINVAL`; the
             // read half has no error status, so it silently ignores them.
             if malformed.write {
+                debug!("Kitty clipboard write refused: invalid packet");
                 let error = session.invalidate(malformed.id);
                 event_proxy.send_event(Event::PtyWrite(response::write_error(
                     error.code,
@@ -141,6 +146,7 @@ pub fn handle_packet<T: EventListener>(
             },
             ReadRequest::Mime(requested) => {
                 if config.read == Permission::Deny {
+                    debug!("Denied kitty clipboard read");
                     let reply = response::read_error(ErrorCode::EPERM, id.as_deref());
                     event_proxy.send_event(Event::PtyWrite(reply));
                     return;
@@ -177,6 +183,7 @@ pub fn handle_packet<T: EventListener>(
         },
         Packet::Write { loc, id } => {
             if config.write == Permission::Deny {
+                debug!("Denied kitty clipboard write");
                 let reply = response::write_error(ErrorCode::EPERM, id.as_deref());
                 event_proxy.send_event(Event::PtyWrite(reply));
                 return;
