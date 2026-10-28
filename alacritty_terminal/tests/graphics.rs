@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::test::TermSize;
@@ -1956,8 +1956,10 @@ fn compressed_file_data_inflating_short_is_its_own_error() {
 
     assert_eq!(
         command(&mut term, &mut parser, &recorder, "a=T,f=24,s=2,v=2,t=t,i=80,o=z", &payload),
-        vec!["\x1b_Gi=80;EINVAL:Image data size post inflation does not match expected size\x1b\\"
-            .to_owned()],
+        vec![
+            "\x1b_Gi=80;EINVAL:Image data size post inflation does not match expected size\x1b\\"
+                .to_owned()
+        ],
     );
     assert!(!file.exists(), "a marked temporary file is removed once opened");
 }

@@ -26,8 +26,8 @@ use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::index::{Line, Point};
 
@@ -1075,11 +1075,7 @@ impl GraphicsStore {
             self.images.remove(internal_id);
         }
 
-        if self.images.is_full(needed) {
-            Err(GraphicsError::NoSpace)
-        } else {
-            Ok(())
-        }
+        if self.images.is_full(needed) { Err(GraphicsError::NoSpace) } else { Ok(()) }
     }
 
     /// Build a successful response.
@@ -1246,11 +1242,9 @@ impl DecodeJob {
             Source::Inline(data) => {
                 decode_payload(&self.command, data, self.limit, self.max_dimension)
             },
-            Source::SharedMemory(source) => {
-                file::read_shm(&source, max_to_read).and_then(|data| {
-                    decode_payload(&self.command, data, self.limit, self.max_dimension)
-                })
-            },
+            Source::SharedMemory(source) => file::read_shm(&source, max_to_read).and_then(|data| {
+                decode_payload(&self.command, data, self.limit, self.max_dimension)
+            }),
             Source::File(file) => file::read(&file, max_to_read, self.allow_network_paths)
                 .and_then(|data| {
                     decode_payload(&self.command, data, self.limit, self.max_dimension)
@@ -1361,11 +1355,7 @@ fn decompression_limit(command: &Command, config: &GraphicsConfig) -> usize {
         .saturating_mul(command.source_height as usize)
         .saturating_mul(bytes_per_pixel);
 
-    if declared > 0 {
-        declared
-    } else {
-        config.memory_limit
-    }
+    if declared > 0 { declared } else { config.memory_limit }
 }
 
 #[cfg(test)]
@@ -1445,7 +1435,7 @@ mod tests {
     fn make_shm(name: &str, data: &[u8]) {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
-            CreateFileMappingA, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE, PAGE_READWRITE,
+            CreateFileMappingA, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
         };
 
         let cname = std::ffi::CString::new(name).unwrap();
@@ -1474,7 +1464,7 @@ mod tests {
     #[cfg(windows)]
     fn shm_exists(name: &str) -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Memory::{OpenFileMappingA, FILE_MAP_READ};
+        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, OpenFileMappingA};
 
         let cname = std::ffi::CString::new(name).unwrap();
         let handle = unsafe { OpenFileMappingA(FILE_MAP_READ, 0, cname.as_ptr().cast()) };
@@ -2009,8 +1999,7 @@ mod tests {
         make_shm(&name, &[255, 0, 0, 255, 0, 255, 0, 255]);
 
         let mut store = GraphicsStore::new(GraphicsConfig::default());
-        let payload =
-            format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s,S=4,O=4;{}", encode(name.as_bytes()));
+        let payload = format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s,S=4,O=4;{}", encode(name.as_bytes()));
         let update = apc(&mut store, &payload);
 
         assert_eq!(update.response.as_deref(), Some("\x1b_Gi=4;OK\x1b\\"));
@@ -2086,8 +2075,7 @@ mod tests {
 
         // A name has to begin with a `/` and contain no other.
         for name in ["no-slash", "em/bedded", "/", ""] {
-            let payload =
-                format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{}", encode(name.as_bytes()));
+            let payload = format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{}", encode(name.as_bytes()));
             let update = apc(&mut store, &payload);
 
             assert_eq!(
@@ -2126,10 +2114,7 @@ mod tests {
         let payload = format!("Ga=t,f=32,s=1,v=1,a=t,i=4,t=s;{}", encode(name.as_bytes()));
         let update = apc(&mut store, &payload);
 
-        assert_eq!(
-            update.response.as_deref(),
-            Some("\x1b_Gi=4;EINVAL:Filename too long\x1b\\")
-        );
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=4;EINVAL:Filename too long\x1b\\"));
     }
 
     #[cfg(unix)]

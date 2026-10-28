@@ -3,6 +3,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+use crate::clipboard::StoreOutcome;
 use crate::term::ClipboardType;
 use crate::vte::ansi::Rgb;
 
@@ -29,6 +30,22 @@ pub enum Event {
     /// The attached function is a formatter which will correctly transform the clipboard content
     /// into the expected escape sequence format.
     ClipboardLoad(ClipboardType, Arc<dyn Fn(&str) -> String + Sync + Send + 'static>),
+
+    /// Request to read the clipboard for the kitty clipboard protocol (OSC 5522).
+    ///
+    /// The attached function formats the whole reply; it receives `None` when the requested
+    /// clipboard location does not exist on this platform, such as a primary selection on
+    /// Windows or macOS, and must then produce the `ENOSYS` reply.
+    KittyClipboardRead(ClipboardType, Arc<dyn Fn(Option<&str>) -> String + Sync + Send + 'static>),
+
+    /// Request to store clipboard text for the kitty clipboard protocol (OSC 5522).
+    ///
+    /// The attached function turns the outcome of the store into the reply packet.
+    KittyClipboardStore(
+        ClipboardType,
+        String,
+        Arc<dyn Fn(StoreOutcome) -> String + Sync + Send + 'static>,
+    ),
 
     /// Request to write the RGB value of a color to the PTY.
     ///
@@ -63,6 +80,8 @@ impl Debug for Event {
         match self {
             Event::ClipboardStore(ty, text) => write!(f, "ClipboardStore({ty:?}, {text})"),
             Event::ClipboardLoad(ty, _) => write!(f, "ClipboardLoad({ty:?})"),
+            Event::KittyClipboardRead(ty, _) => write!(f, "KittyClipboardRead({ty:?})"),
+            Event::KittyClipboardStore(ty, _, _) => write!(f, "KittyClipboardStore({ty:?})"),
             Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),

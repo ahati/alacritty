@@ -4,6 +4,7 @@
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 #![cfg_attr(clippy, deny(warnings))]
 
+pub mod clipboard;
 pub mod event;
 pub mod event_loop;
 pub mod graphics;

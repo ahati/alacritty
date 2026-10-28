@@ -25,8 +25,8 @@ use std::ffi::CString;
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::io::{FromRawFd, OwnedFd};
 
-use super::command::{Command, Medium};
 use super::GraphicsError;
+use super::command::{Command, Medium};
 
 /// Longest path a client may name, in bytes.
 pub const MAX_FILENAME_LEN: usize = 2048;
@@ -144,11 +144,7 @@ impl SharedMemorySource {
             return Err(GraphicsError::FileUnreadable);
         }
 
-        Ok(Self {
-            name: name.to_vec(),
-            size: command.data_size,
-            offset: command.data_offset,
-        })
+        Ok(Self { name: name.to_vec(), size: command.data_size, offset: command.data_offset })
     }
 }
 
@@ -231,14 +227,10 @@ fn checked_window(data: Vec<u8>, max_to_read: usize) -> Result<Vec<u8>, Graphics
 /// command, so whatever the read's outcome the object is unlinked afterwards,
 /// just as a temporary file is removed whatever the read's outcome.
 #[cfg(unix)]
-pub fn read_shm(
-    source: &SharedMemorySource,
-    max_to_read: usize,
-) -> Result<Vec<u8>, GraphicsError> {
+pub fn read_shm(source: &SharedMemorySource, max_to_read: usize) -> Result<Vec<u8>, GraphicsError> {
     // The name has no NUL left in it, so this cannot fail; the conversion is
     // still checked rather than unwrapped.
-    let name =
-        CString::new(source.name.clone()).map_err(|_| GraphicsError::FileUnreadable)?;
+    let name = CString::new(source.name.clone()).map_err(|_| GraphicsError::FileUnreadable)?;
 
     // `O_NONBLOCK` has no meaning here, since opening the object cannot block;
     // `O_CLOEXEC` so that the descriptor cannot leak into a child process.
@@ -274,7 +266,9 @@ pub fn read_shm(
     #[cfg(not(target_os = "macos"))]
     drop(file);
     #[cfg(target_os = "macos")]
-    unsafe { libc::close(fd) };
+    unsafe {
+        libc::close(fd)
+    };
     if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
         log::debug!(
             "Failed to remove graphics image shared memory object {}: {}",
@@ -326,14 +320,7 @@ fn read_shm_mapping(
 
     let map_length = offset as usize + wanted;
     let map = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            map_length,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        )
+        libc::mmap(std::ptr::null_mut(), map_length, libc::PROT_READ, libc::MAP_SHARED, fd, 0)
     };
     if map == libc::MAP_FAILED {
         log::debug!(
@@ -343,9 +330,8 @@ fn read_shm_mapping(
         return Err(GraphicsError::FileUnreadable);
     }
 
-    let data =
-        unsafe { std::slice::from_raw_parts(map.cast::<u8>().add(offset as usize), wanted) }
-            .to_vec();
+    let data = unsafe { std::slice::from_raw_parts(map.cast::<u8>().add(offset as usize), wanted) }
+        .to_vec();
     unsafe { libc::munmap(map, map_length) };
 
     checked_window(data, max_to_read)
@@ -358,14 +344,11 @@ fn read_shm_mapping(
 /// for reading. There is nothing to unlink afterwards: the object lives as
 /// long as any handle to it is open, so the terminal only closes its own.
 #[cfg(windows)]
-pub fn read_shm(
-    source: &SharedMemorySource,
-    max_to_read: usize,
-) -> Result<Vec<u8>, GraphicsError> {
+pub fn read_shm(source: &SharedMemorySource, max_to_read: usize) -> Result<Vec<u8>, GraphicsError> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Memory::{
-        MapViewOfFile, OpenFileMappingA, UnmapViewOfFile, VirtualQuery, FILE_MAP_READ,
-        MEMORY_BASIC_INFORMATION,
+        FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MapViewOfFile, OpenFileMappingA, UnmapViewOfFile,
+        VirtualQuery,
     };
 
     let name = CString::new(source.name.clone()).map_err(|_| GraphicsError::FileUnreadable)?;
