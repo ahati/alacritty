@@ -18,6 +18,12 @@ This fork extends upstream Alacritty with the following features:
   shared memory, so clients like `kitten icat` work. Configured through
   the [`[terminal.graphics]`](extra/man/alacritty.5.scd) table (`enabled`,
   `max_image_dimension`, `memory_limit`, `allow_network_paths`).
+- **Kitty clipboard protocol** — read and write the clipboard over OSC 5522,
+  with chunked transfers, MIME type listings, multiplexer ids and the
+  paste-events mode (`CSI ? 5522 h`). Plain text is exchanged, and access is
+  gated by the [`[terminal.kitty_clipboard]`](extra/man/alacritty.5.scd)
+  table (`read`, `write`, `max_write_size`), which defaults to the same
+  write-allowed, read-denied posture as `terminal.osc52`.
 - **Font ligatures** — runs of identically-styled text are shaped with
   harfrust (a pure-Rust HarfBuzz port), so ligatures like `->`, `=>` or
   `fi` render as a single glyph spanning multiple cells, without

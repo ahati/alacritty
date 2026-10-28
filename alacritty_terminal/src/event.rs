@@ -7,6 +7,14 @@ use crate::clipboard::StoreOutcome;
 use crate::term::ClipboardType;
 use crate::vte::ansi::Rgb;
 
+/// The formatter a kitty clipboard read hands to the front end, turning the
+/// clipboard text it reads — or the absence of the requested location — into
+/// the PTY reply.
+pub type KittyReadFormat = Arc<dyn for<'a> Fn(Option<&'a str>) -> String + Sync + Send + 'static>;
+
+/// The formatter turning a kitty clipboard store's outcome into the reply.
+pub type KittyStoreFormat = Arc<dyn Fn(StoreOutcome) -> String + Sync + Send + 'static>;
+
 /// Terminal event.
 ///
 /// These events instruct the UI over changes that can't be handled by the terminal emulation layer
@@ -36,16 +44,12 @@ pub enum Event {
     /// The attached function formats the whole reply; it receives `None` when the requested
     /// clipboard location does not exist on this platform, such as a primary selection on
     /// Windows or macOS, and must then produce the `ENOSYS` reply.
-    KittyClipboardRead(ClipboardType, Arc<dyn Fn(Option<&str>) -> String + Sync + Send + 'static>),
+    KittyClipboardRead(ClipboardType, KittyReadFormat),
 
     /// Request to store clipboard text for the kitty clipboard protocol (OSC 5522).
     ///
     /// The attached function turns the outcome of the store into the reply packet.
-    KittyClipboardStore(
-        ClipboardType,
-        String,
-        Arc<dyn Fn(StoreOutcome) -> String + Sync + Send + 'static>,
-    ),
+    KittyClipboardStore(ClipboardType, String, KittyStoreFormat),
 
     /// Request to write the RGB value of a color to the PTY.
     ///

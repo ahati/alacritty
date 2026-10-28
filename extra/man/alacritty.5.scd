@@ -675,6 +675,40 @@ Windows: _"powershell"_
 
 	Default: _true_
 
+*[terminal.kitty_clipboard]*
+
+	This section documents the *[terminal.kitty_clipboard]* table, which
+	configures the _Kitty clipboard protocol_ (OSC 5522), the escape sequence
+	through which terminal programs exchange clipboard data, including its
+	chunked transfers, MIME type listings, multiplexer ids, and the
+	paste-events mode. Plain text is exchanged; the protocol's richer MIME
+	types are refused with the protocol's own error codes.
+
+	When both *read* and *write* are _"Deny"_, the protocol is disabled
+	entirely: its packets are ignored and a program probing for it is told
+	it is not supported.
+
+*read* = _"Deny"_ | _"Allow"_
+
+	Whether terminal programs may read clipboard content over the protocol.
+	Denied reads are answered with _EPERM_.
+
+	Default: _"Deny"_
+
+*write* = _"Deny"_ | _"Allow"_
+
+	Whether terminal programs may write clipboard content over the protocol.
+	Denied writes are answered with _EPERM_.
+
+	Default: _"Allow"_
+
+*max_write_size* = _<integer>_ 
+
+	The largest write accepted, in bytes, before it is refused with _EFBIG_.
+	The protocol requires terminals to accept at least 64 MiB.
+
+	Default: _67108864_
+
 # MOUSE
 
 This section documents the *[mouse]* table of the configuration file.
