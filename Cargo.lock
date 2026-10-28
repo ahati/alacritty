@@ -2255,7 +2255,7 @@ dependencies = [
 [[package]]
 name = "vte"
 version = "0.15.0"
-source = "git+https://github.com/ahati/vte.git?branch=kitty-graphics#cf40c3eae37405899c83dab2714df1e07c55fff5"
+source = "git+https://github.com/ahati/vte.git?branch=kitty-graphics#c9884abc9956ab75d489fb64027001a0eea34673"
 dependencies = [
  "arrayvec",
  "bitflags 2.9.4",
