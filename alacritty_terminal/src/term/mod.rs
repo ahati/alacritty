@@ -13,6 +13,7 @@ use bitflags::bitflags;
 use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
+use crate::clipboard::{self, KittyClipboardConfig, WriteSession};
 use crate::event::{Event, EventListener};
 use crate::graphics::{
     CellFootprint, DecodeJob, DecodeResult, GraphicsConfig, GraphicsStore, GraphicsUpdate,
@@ -80,6 +81,9 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        /// Paste events announce the clipboard's MIME types (kitty clipboard
+        /// protocol's private mode 5522).
+        const PASTE_EVENTS            = 1 << 23;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -334,6 +338,12 @@ pub struct Term<T> {
     /// Kitty graphics belonging to the inactive screen.
     inactive_graphics: GraphicsStore,
 
+    /// Kitty clipboard write in progress.
+    ///
+    /// The system clipboard is global, so unlike the graphics state there is
+    /// no per-screen twin.
+    clipboard_write: WriteSession,
+
     /// Config directly for the terminal.
     config: Config,
 }
@@ -363,6 +373,9 @@ pub struct Config {
 
     /// Kitty graphics protocol support.
     pub graphics: GraphicsConfig,
+
+    /// Kitty clipboard protocol support.
+    pub kitty_clipboard: KittyClipboardConfig,
 }
 
 impl Default for Config {
@@ -375,6 +388,7 @@ impl Default for Config {
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
             graphics: GraphicsConfig::default(),
+            kitty_clipboard: Default::default(),
         }
     }
 }
@@ -438,6 +452,8 @@ impl<T> Term<T> {
         let graphics_config = config.graphics;
         let graphics = GraphicsStore::new(graphics_config);
 
+        let clipboard_write = WriteSession::new(config.kitty_clipboard.max_write_size);
+
         Term {
             inactive_grid,
             scroll_region,
@@ -447,6 +463,7 @@ impl<T> Term<T> {
             grid,
             inactive_graphics: GraphicsStore::new(graphics_config),
             graphics,
+            clipboard_write,
             tabs,
             inactive_keyboard_mode_stack: Default::default(),
             keyboard_mode_stack: Default::default(),
@@ -548,6 +565,15 @@ impl<T> Term<T> {
         if self.config.graphics != old_config.graphics {
             self.graphics.set_config(self.config.graphics);
             self.inactive_graphics.set_config(self.config.graphics);
+        }
+
+        if self.config.kitty_clipboard != old_config.kitty_clipboard {
+            // A changed ceiling invalidates what was accumulated under the
+            // old one, and a disabled protocol forgets its private mode.
+            self.clipboard_write.reset();
+            if !self.config.kitty_clipboard.enabled() {
+                self.mode.remove(TermMode::PASTE_EVENTS);
+            }
         }
 
         // Damage everything on config updates.
@@ -1221,6 +1247,20 @@ impl<T> Dimensions for Term<T> {
 }
 
 impl<T: EventListener> Handler for Term<T> {
+    /// An OSC sequence the dispatcher does not know, which the kitty
+    /// clipboard protocol builds its packets on.
+    #[inline]
+    fn unhandled_osc(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.first().is_some_and(|osc| *osc == clipboard::OSC_BYTES) {
+            clipboard::handle_packet(
+                &params[1..],
+                &self.config.kitty_clipboard,
+                &mut self.clipboard_write,
+                &self.event_proxy,
+            );
+        }
+    }
+
     /// Start of an APC string, which carries Kitty graphics commands.
     #[inline]
     fn apc_start(&mut self) {
@@ -2051,6 +2091,9 @@ impl<T: EventListener> Handler for Term<T> {
         self.graphics.clear_visible();
         self.inactive_graphics.clear_visible();
 
+        // Whatever the client was writing to the clipboard is abandoned.
+        self.clipboard_write.reset();
+
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
         self.mode.insert(TermMode::default());
@@ -2137,7 +2180,13 @@ impl<T: EventListener> Handler for Term<T> {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
             PrivateMode::Unknown(mode) => {
-                debug!("Ignoring unknown mode {mode} in set_private_mode");
+                // Paste events ride on the kitty clipboard protocol's OSC
+                // number, so the mode answers to the same config.
+                if mode == clipboard::OSC_NUMBER && self.config.kitty_clipboard.enabled() {
+                    self.mode.insert(TermMode::PASTE_EVENTS);
+                } else {
+                    debug!("Ignoring unknown mode {mode} in set_private_mode");
+                }
                 return;
             },
         };
@@ -2200,7 +2249,11 @@ impl<T: EventListener> Handler for Term<T> {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
             PrivateMode::Unknown(mode) => {
-                debug!("Ignoring unknown mode {mode} in unset_private_mode");
+                if mode == clipboard::OSC_NUMBER && self.config.kitty_clipboard.enabled() {
+                    self.mode.remove(TermMode::PASTE_EVENTS);
+                } else {
+                    debug!("Ignoring unknown mode {mode} in unset_private_mode");
+                }
                 return;
             },
         };
@@ -2286,7 +2339,13 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
-            PrivateMode::Unknown(_) => ModeState::NotSupported,
+            PrivateMode::Unknown(mode) => {
+                if mode == clipboard::OSC_NUMBER && self.config.kitty_clipboard.enabled() {
+                    self.mode.contains(TermMode::PASTE_EVENTS).into()
+                } else {
+                    ModeState::NotSupported
+                }
+            },
         };
 
         self.event_proxy.send_event(Event::PtyWrite(format!(

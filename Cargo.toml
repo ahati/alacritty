@@ -25,8 +25,9 @@ toml_edit = "0.24.0"
 [patch.crates-io]
 x11-clipboard = { git = "https://github.com/quininer/x11-clipboard.git", rev = "19ab2163cf0bd0db607e827a5214571990307866" }
 
-# Streaming APC (`ESC _`) callbacks, required by the Kitty graphics protocol.
-# Upstream vte 0.15.0 drops APC payloads before they reach the terminal.
+# Streaming APC (`ESC _`) callbacks and unknown-OSC dispatch, required by the
+# Kitty graphics and clipboard protocols. Upstream vte 0.15.0 drops APC payloads
+# before they reach the terminal, and has no hook for OSC numbers it ignores.
 vte = { git = "https://github.com/ahati/vte.git", branch = "kitty-graphics" }
 
 # GlyphId rasterization and `font_path` lookup, required for text shaping.

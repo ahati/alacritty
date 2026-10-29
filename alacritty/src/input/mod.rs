@@ -26,6 +26,7 @@ use winit::keyboard::ModifiersState;
 use winit::platform::macos::ActiveEventLoopExtMacOS;
 use winit::window::CursorIcon;
 
+use alacritty_terminal::clipboard::paste_notification;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Point, Side};
@@ -324,14 +325,8 @@ impl<T: EventListener> Execute<T> for Action {
             #[cfg(not(any(target_os = "macos", windows)))]
             Action::CopySelection => ctx.copy_selection(ClipboardType::Selection),
             Action::ClearSelection => ctx.clear_selection(),
-            Action::Paste => {
-                let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
-                ctx.paste(&text, true);
-            },
-            Action::PasteSelection => {
-                let text = ctx.clipboard_mut().load(ClipboardType::Selection);
-                ctx.paste(&text, true);
-            },
+            Action::Paste => paste_from_clipboard(ctx, ClipboardType::Clipboard),
+            Action::PasteSelection => paste_from_clipboard(ctx, ClipboardType::Selection),
             Action::ToggleFullscreen => ctx.window().toggle_fullscreen(),
             Action::ToggleMaximized => ctx.window().toggle_maximized(),
             #[cfg(target_os = "macos")]
@@ -1146,6 +1141,25 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         scheduler.unschedule(timer_id);
         scheduler.schedule(event, SELECTION_SCROLLING_INTERVAL, true, timer_id);
     }
+}
+
+/// Paste from one of the clipboards.
+///
+/// With the kitty clipboard protocol's paste-events mode enabled it takes
+/// the place of bracketed paste: the program is told what MIME types the
+/// clipboard holds, and may then read them through the protocol. Only a
+/// real primary selection announces itself as one; where none exists the
+/// paste comes from the system clipboard on every platform.
+fn paste_from_clipboard<T: EventListener, A: ActionContext<T>>(ctx: &mut A, ty: ClipboardType) {
+    if ctx.terminal().mode().contains(TermMode::PASTE_EVENTS) {
+        let primary = ty == ClipboardType::Selection && ctx.clipboard_mut().has_selection();
+        ctx.on_terminal_input_start();
+        ctx.write_to_pty(paste_notification(primary).into_bytes());
+        return;
+    }
+
+    let text = ctx.clipboard_mut().load(ty);
+    ctx.paste(&text, true);
 }
 
 #[cfg(test)]

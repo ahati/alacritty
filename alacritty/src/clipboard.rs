@@ -1,6 +1,7 @@
 use log::{debug, warn};
 use winit::raw_window_handle::RawDisplayHandle;
 
+use alacritty_terminal::clipboard::StoreOutcome;
 use alacritty_terminal::term::ClipboardType;
 
 #[cfg(any(feature = "x11", target_os = "macos", windows))]
@@ -65,6 +66,33 @@ impl Clipboard {
         clipboard.set_contents(text.into()).unwrap_or_else(|err| {
             warn!("Unable to store text in clipboard: {err}");
         });
+    }
+
+    /// Store text, reporting whether it reached the clipboard, the location
+    /// was unavailable on this platform, or the provider failed.
+    pub fn store_checked(&mut self, ty: ClipboardType, text: impl Into<String>) -> StoreOutcome {
+        let clipboard = match (ty, &mut self.selection) {
+            (ClipboardType::Selection, Some(provider)) => provider,
+            // Like the primary selection on Windows or macOS.
+            (ClipboardType::Selection, None) => return StoreOutcome::Unavailable,
+            _ => &mut self.clipboard,
+        };
+
+        match clipboard.set_contents(text.into()) {
+            Ok(()) => StoreOutcome::Stored,
+            Err(err) => {
+                warn!("Unable to store text in clipboard: {err}");
+                StoreOutcome::Failed
+            },
+        }
+    }
+
+    /// Whether this platform has a clipboard of the given type.
+    ///
+    /// Only the primary selection is ever missing; it exists on neither
+    /// Windows nor macOS.
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
     }
 
     pub fn load(&mut self, ty: ClipboardType) -> String {

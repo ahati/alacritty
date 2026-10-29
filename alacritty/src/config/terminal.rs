@@ -1,9 +1,12 @@
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use toml::Value;
 
 use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
+use alacritty_terminal::clipboard::{
+    DEFAULT_MAX_WRITE_SIZE, KittyClipboardConfig, Permission as TerminalPermission,
+};
 use alacritty_terminal::graphics::{
-    GraphicsConfig, DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MEMORY_LIMIT,
+    DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MEMORY_LIMIT, GraphicsConfig,
 };
 use alacritty_terminal::term::Osc52;
 
@@ -15,6 +18,8 @@ pub struct Terminal {
     pub osc52: SerdeOsc52,
     /// Kitty graphics protocol support.
     pub graphics: Graphics,
+    /// Kitty clipboard protocol support.
+    pub kitty_clipboard: KittyClipboard,
     /// Path to a shell program to run on startup.
     pub shell: Option<Program>,
 }
@@ -79,6 +84,57 @@ impl From<&Graphics> for GraphicsConfig {
             max_image_dimension: graphics.max_image_dimension,
             memory_limit: graphics.memory_limit,
             allow_network_paths: graphics.allow_network_paths,
+        }
+    }
+}
+
+/// Whether terminal programs may use a clipboard operation.
+#[derive(ConfigDeserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    /// The operation is refused.
+    #[default]
+    Deny,
+    /// The operation is carried out.
+    Allow,
+}
+
+/// Kitty clipboard protocol settings.
+#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct KittyClipboard {
+    /// Whether terminal programs may read clipboard content through OSC 5522.
+    pub read: Permission,
+    /// Whether terminal programs may write clipboard content through OSC 5522.
+    pub write: Permission,
+    /// The largest write accepted before it is refused with `EFBIG`.
+    pub max_write_size: usize,
+}
+
+impl Default for KittyClipboard {
+    fn default() -> Self {
+        Self {
+            // The same compromise as `osc52 = "OnlyCopy"`: a program can
+            // only hand over what it already produced, while reading would
+            // give clipboard content to a program that did not have it.
+            read: Permission::Deny,
+            write: Permission::Allow,
+            max_write_size: DEFAULT_MAX_WRITE_SIZE,
+        }
+    }
+}
+
+impl From<&KittyClipboard> for KittyClipboardConfig {
+    fn from(kitty_clipboard: &KittyClipboard) -> Self {
+        Self {
+            read: match kitty_clipboard.read {
+                Permission::Deny => TerminalPermission::Deny,
+                Permission::Allow => TerminalPermission::Allow,
+            },
+            write: match kitty_clipboard.write {
+                Permission::Deny => TerminalPermission::Deny,
+                Permission::Allow => TerminalPermission::Allow,
+            },
+            max_write_size: kitty_clipboard.max_write_size,
         }
     }
 }

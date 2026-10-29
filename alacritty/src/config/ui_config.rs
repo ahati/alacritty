@@ -14,6 +14,7 @@ use winit::keyboard::{Key, ModifiersState};
 
 use alacritty_config::SerdeReplace;
 use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
+use alacritty_terminal::clipboard::KittyClipboardConfig;
 use alacritty_terminal::graphics::GraphicsConfig;
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::search::RegexSearch;
@@ -126,6 +127,7 @@ impl UiConfig {
             osc52: self.terminal.osc52.0,
             kitty_keyboard: true,
             graphics: GraphicsConfig::from(&self.terminal.graphics),
+            kitty_clipboard: KittyClipboardConfig::from(&self.terminal.kitty_clipboard),
         }
     }
 

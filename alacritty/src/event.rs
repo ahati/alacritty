@@ -1910,6 +1910,26 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             self.ctx.write_to_pty(text.into_bytes());
                         }
                     },
+                    TerminalEvent::KittyClipboardRead(clipboard_type, format) => {
+                        if self.ctx.terminal.is_focused {
+                            // A missing location, like the primary selection
+                            // on Windows or macOS, is reported as ENOSYS.
+                            let unavailable = clipboard_type == ClipboardType::Selection
+                                && !self.ctx.clipboard.has_selection();
+                            let reply = if unavailable {
+                                format(None)
+                            } else {
+                                format(Some(self.ctx.clipboard.load(clipboard_type).as_str()))
+                            };
+                            self.ctx.write_to_pty(reply.into_bytes());
+                        }
+                    },
+                    TerminalEvent::KittyClipboardStore(clipboard_type, content, format) => {
+                        if self.ctx.terminal.is_focused {
+                            let outcome = self.ctx.clipboard.store_checked(clipboard_type, content);
+                            self.ctx.write_to_pty(format(outcome).into_bytes());
+                        }
+                    },
                     TerminalEvent::ColorRequest(index, format) => {
                         let color = match self.ctx.terminal().colors()[index] {
                             Some(color) => Rgb(color),
