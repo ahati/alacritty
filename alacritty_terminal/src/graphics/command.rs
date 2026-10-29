@@ -94,6 +94,8 @@ pub enum Action {
     Compose,
 }
 
+use std::cmp::Ordering;
+
 impl Command {
     /// The animation frame this `a=f` command describes.
     ///
@@ -113,13 +115,13 @@ impl Command {
                 super::FrameBlend::Alpha
             },
             bgcolor: self.cell_offset_y,
-            gap: if self.z_index < 0 {
-                super::FrameGap::Gapless
-            } else if self.z_index > 0 {
-                super::FrameGap::At(self.z_index as u32)
-            } else {
-                // Absent and zero both pick the new-frame default.
-                super::FrameGap::Default
+            gap: match self.z_index.cmp(&0) {
+                Ordering::Less => super::FrameGap::Gapless,
+                Ordering::Greater => super::FrameGap::At(self.z_index as u32),
+                Ordering::Equal => {
+                    // Absent and zero both pick the new-frame default.
+                    super::FrameGap::Default
+                },
             },
         }
     }
