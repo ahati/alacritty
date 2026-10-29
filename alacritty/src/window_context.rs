@@ -36,12 +36,13 @@ use crate::config::UiConfig;
 use crate::display::Display;
 use crate::display::window::Window;
 use crate::event::{
-    ActionContext, Event, EventProxy, InlineSearchState, Mouse, SearchState, TouchPurpose,
+    ActionContext, Event, EventProxy, EventType, InlineSearchState, Mouse, SearchState,
+    TouchPurpose,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::{input, renderer};
 
 /// Event context for one individual Alacritty window.
@@ -395,6 +396,22 @@ impl WindowContext {
             &self.config,
             &mut self.search_state,
         );
+
+        // Re-arm the animation timer from the state this frame rendered. The
+        // redraw chain keeps the timer fresh: every frame advance redraws,
+        // and every redraw schedules the next deadline.
+        let next_animation = self.terminal.lock().next_animation_deadline();
+        let timer_id = TimerId::new(Topic::AnimationFrame, self.display.window.id());
+        scheduler.unschedule(timer_id);
+        if let Some(deadline) = next_animation {
+            let interval = deadline.saturating_duration_since(Instant::now());
+            scheduler.schedule(
+                Event::new(EventType::AnimationFrame, self.display.window.id()),
+                interval,
+                false,
+                timer_id,
+            );
+        }
     }
 
     /// Process events for this terminal window.

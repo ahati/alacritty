@@ -552,6 +552,8 @@ pub enum EventType {
     IpcGetConfig(Arc<UnixStream>),
     BlinkCursor,
     BlinkCursorTimeout,
+    /// Advance due kitty animation frames and re-arm the timer.
+    AnimationFrame,
     SearchNext,
     #[cfg(unix)]
     Shutdown,
@@ -1636,6 +1638,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let window_id = self.display.window.id();
         self.scheduler.unschedule(TimerId::new(Topic::BlinkCursor, window_id));
         self.scheduler.unschedule(TimerId::new(Topic::BlinkTimeout, window_id));
+        self.scheduler.unschedule(TimerId::new(Topic::AnimationFrame, window_id));
 
         // Reset blinking timeout.
         *self.cursor_blink_timed_out = false;
@@ -1655,6 +1658,22 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let event = Event::new(EventType::BlinkCursor, window_id);
         let blinking_interval = Duration::from_millis(self.config.cursor.blink_interval());
         self.scheduler.schedule(event, blinking_interval, true, timer_id);
+    }
+
+    /// Schedule the tick that advances due kitty animations.
+    ///
+    /// Called after any state change that can move a frame deadline: a frame
+    /// arriving, playback being armed, a seek, or a frame itself advancing.
+    /// With nothing animating the timer is simply removed.
+    fn schedule_animation_timer(&mut self) {
+        let window_id = self.display.window.id();
+        let timer_id = TimerId::new(Topic::AnimationFrame, window_id);
+        self.scheduler.unschedule(timer_id);
+        if let Some(deadline) = self.terminal.next_animation_deadline() {
+            let event = Event::new(EventType::AnimationFrame, window_id);
+            let interval = deadline.saturating_duration_since(Instant::now());
+            self.scheduler.schedule(event, interval, false, timer_id);
+        }
     }
 
     fn schedule_blinking_timeout(&mut self) {
@@ -1843,6 +1862,18 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
                 EventType::SearchNext => self.ctx.goto_match(None),
                 EventType::Scroll(scroll) => self.ctx.scroll(scroll),
+                EventType::AnimationFrame => {
+                    // Advance due animations, redraw anything that moved, and
+                    // re-arm the timer from the new state.
+                    let changed = self.ctx.terminal_mut().advance_animations(Instant::now());
+                    if changed {
+                        *self.ctx.dirty = true;
+                        if self.ctx.display.window.has_frame {
+                            self.ctx.display.window.request_redraw();
+                        }
+                    }
+                    self.ctx.schedule_animation_timer();
+                },
                 EventType::BlinkCursor => {
                     // Only change state when timeout isn't reached, since we could get
                     // BlinkCursor and BlinkCursorTimeout events at the same time.

@@ -101,8 +101,8 @@ impl Action {
     /// payload is acceptable is only known once that payload has been decoded.
     pub const fn is_deferred(self) -> bool {
         match self {
-            Self::Transmit | Self::TransmitAndDisplay | Self::Query => true,
-            Self::Put | Self::Delete | Self::Frame | Self::Animate | Self::Compose => false,
+            Self::Transmit | Self::TransmitAndDisplay | Self::Query | Self::Frame => true,
+            Self::Put | Self::Delete | Self::Animate | Self::Compose => false,
         }
     }
 
