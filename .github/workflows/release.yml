@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # Push events have been withheld for this repository before; a manual
+  # dispatch keeps releases possible when tag pushes stay silent, with the
+  # same ref: gh workflow run release.yml --ref <tag>
+  workflow_dispatch:
 
 # Uploading release assets writes to the repository, so the job needs a token
 # that may: a fork made today defaults to a read-only token, which fails every
