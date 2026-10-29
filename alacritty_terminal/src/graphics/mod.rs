@@ -25,6 +25,7 @@ use std::fmt::Write as _;
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -32,7 +33,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::index::{Line, Point};
 
 use self::command::{Action, Command, Compression, CursorMovement, Format, Medium};
-use self::image::{Decoded, ImageData, ImageStore};
+use self::image::{Animation, Decoded, ImageData, ImageStore, PlayState};
 pub use self::placement::CellFootprint;
 
 use self::placement::{Placement, PlacementStore, SourceRect};
@@ -151,6 +152,10 @@ pub enum GraphicsError {
     Unsupported,
     /// A referenced parent image does not exist.
     NoParent,
+    /// An animation frame was named that the image does not have.
+    FrameMissing(u32),
+    /// An animation frame is larger than the image it belongs to.
+    FrameTooLarge,
 }
 
 impl GraphicsError {
@@ -172,11 +177,13 @@ impl GraphicsError {
             Self::InflationSize => "EINVAL",
             Self::Unsupported => "EUNSUPPORTED",
             Self::NoParent => "ENOPARENT",
+            Self::FrameMissing(_) => "EINVAL",
+            Self::FrameTooLarge => "EINVAL",
         }
     }
 
     /// Human readable explanation reported to the client.
-    pub const fn message(self) -> &'static str {
+    pub fn message(self) -> &'static str {
         match self {
             Self::NotFound => "image not found",
             Self::Invalid => "invalid arguments",
@@ -193,6 +200,8 @@ impl GraphicsError {
             Self::InflationSize => "Image data size post inflation does not match expected size",
             Self::Unsupported => "unsupported command",
             Self::NoParent => "parent image not found",
+            Self::FrameMissing(_frame) => "no frame with that number",
+            Self::FrameTooLarge => "frame larger than image",
         }
     }
 }
@@ -565,7 +574,7 @@ impl GraphicsStore {
     /// Returns the update the caller should act on, which carries the response
     /// the client has been waiting for since it sent the payload.
     pub fn install(&mut self, result: DecodeResult) -> GraphicsUpdate {
-        let DecodeResult { internal_id, command, result, pending } = result;
+        let DecodeResult { internal_id, command, result, pending, frame } = result;
 
         // A file-medium transmission was not reserved when it was parsed, since
         // its file had not been read yet. Its image, and for `a=T` its
@@ -574,6 +583,17 @@ impl GraphicsStore {
             return match result {
                 Ok(decoded) => self.store_file_transmission(&command, decoded, pending),
                 Err(error) => self.failure(&command, error),
+            };
+        }
+
+        // An animation frame composes onto its image instead of replacing it.
+        if let Some(frame) = frame {
+            return match (internal_id, result) {
+                (Some(internal_id), Ok(decoded)) => {
+                    self.install_frame(internal_id, &command, decoded, frame)
+                },
+                (_, Err(error)) => self.failure(&command, error),
+                (None, Ok(_)) => GraphicsUpdate::default(),
             };
         }
 
@@ -661,7 +681,13 @@ impl GraphicsStore {
                 self.validate(command, source).map(|()| (false, None))
             },
             Action::Delete => self.delete(command, cursor).map(|()| (true, None)),
-            Action::Frame | Action::Animate | Action::Compose => Err(GraphicsError::Unsupported),
+            // A frame transmission is deferred: its reply comes from
+            // `install` once the patch has been decoded and composed. Rejections
+            // before the decode are answered here.
+            Action::Frame => self.transmit_frame(command, source).map(|()| (false, None)),
+            // An animation control replies for itself: success stays silent.
+            Action::Animate => return self.animate(command),
+            Action::Compose => Err(GraphicsError::Unsupported),
         };
 
         match outcome {
@@ -698,6 +724,7 @@ impl GraphicsStore {
             limit: decompression_limit(command, &self.config),
             max_dimension: self.config.max_image_dimension,
             allow_network_paths: self.config.allow_network_paths,
+            frame: None,
             pending: Some(Pending {
                 anchor: cursor,
                 display: command.action == Action::TransmitAndDisplay,
@@ -812,9 +839,320 @@ impl GraphicsStore {
             max_dimension,
             allow_network_paths: self.config.allow_network_paths,
             pending: None,
+            frame: None,
         });
 
         Ok(Some(internal_id))
+    }
+
+    /// Load an animation frame (`a=f`).
+    ///
+    /// The patch is decoded like an image payload, then composed onto its
+    /// canvas and stored as a frame of the target image by `install`. The
+    /// reply carries the 1-based frame number the data landed on.
+    fn transmit_frame(&mut self, command: &Command, source: Source) -> Result<(), GraphicsError> {
+        // A frame without an addressable image is ignored outright, as the
+        // reference does: the reply machinery already stays silent for a
+        // command without `i`/`I`. One that names a missing image is an
+        // ordinary `ENOENT`.
+        if command.image_id == 0 && command.image_number == 0 {
+            return Ok(());
+        }
+        let Some(internal_id) = self.images.resolve(command.image_id, command.image_number) else {
+            return Err(GraphicsError::NotFound);
+        };
+        if self.images.get(internal_id).is_none_or(|image| !image.is_ready()) {
+            // Frames compose onto pixel data a pending decode has not produced
+            // yet.
+            return Err(GraphicsError::Invalid);
+        }
+
+        check_dimensions(command)?;
+
+        // A raw patch must name its own size, and it has to sit inside the
+        // image. A PNG states its dimensions in the payload, so the same
+        // checks run once the decode has landed. The image itself may still be
+        // a pending decode — clients send the base and its frames in one
+        // burst — but the frame job is queued behind the base job, so by the
+        // time it composes, the base pixels exist and the remaining frame
+        // validations run in `install_frame`.
+        if command.format != Format::Png {
+            let (image_width, image_height) = match self.images.get(internal_id) {
+                Some(image) => (image.width, image.height),
+                None => return Err(GraphicsError::NotFound),
+            };
+            if command.source_width > image_width {
+                return Err(GraphicsError::FrameTooLarge);
+            }
+            if command.source_height > image_height {
+                return Err(GraphicsError::FrameTooLarge);
+            }
+        }
+
+        let frame_request = command.frame_request();
+
+        // Reserve the space the composed frame will occupy: the patch's own
+        // bytes for a raw payload, the full frame for a PNG whose dimensions
+        // are not known yet.
+        let (patch_width, patch_height, channels) = match self.images.get(internal_id) {
+            Some(image) => {
+                let channels = if command.format == Format::Rgb { 3 } else { 4 };
+                (image.width, image.height, channels)
+            },
+            None => return Err(GraphicsError::NoSpace),
+        };
+        let reserved = image::max_pixel_bytes(patch_width, patch_height, channels);
+        self.make_room(reserved)?;
+        if self.images.get(internal_id).is_none() {
+            // The frame's own image was an eviction candidate; the frame dies
+            // with it.
+            return Err(GraphicsError::NoSpace);
+        }
+
+        self.jobs.push(DecodeJob {
+            internal_id: Some(internal_id),
+            command: command.clone(),
+            source,
+            limit: decompression_limit(command, &self.config),
+            max_dimension: self.config.max_image_dimension,
+            allow_network_paths: self.config.allow_network_paths,
+            pending: None,
+            frame: Some(frame_request),
+        });
+
+        Ok(())
+    }
+
+    /// Control an animation (`a=a`).
+    ///
+    /// Success is silent, as the reference implementation's is; failures are
+    /// replied with unless `q` suppresses them. State changes re-arm the
+    /// playback deadline the front end's timer is driven from.
+    fn animate(&mut self, command: &Command) -> GraphicsUpdate {
+        let Some(internal_id) = self.images.resolve(command.image_id, command.image_number) else {
+            return self.failure(command, GraphicsError::NotFound);
+        };
+        let Some(image) = self.images.get(internal_id) else {
+            return self.failure(command, GraphicsError::NotFound);
+        };
+
+        let frame_count = image.frames().len() as u32;
+        let mut animation = image.animation().copied().unwrap_or_else(Animation::stopped);
+        let mut changed = false;
+
+        // An affected frame that does not exist is an error, but only when the
+        // command actually named one.
+        let retime = (command.rows != 0 && command.z_index != 0).then(|| {
+            let frame = if command.rows == 0 { 1 } else { command.rows };
+            if frame > frame_count {
+                return Err(GraphicsError::FrameMissing(command.rows));
+            }
+            let gap = if command.z_index < 0 { 0 } else { command.z_index as u32 };
+            Ok((frame as u16 - 1, gap))
+        });
+        let seek = (command.columns != 0).then(|| {
+            if command.columns > frame_count {
+                Err(GraphicsError::FrameMissing(command.columns))
+            } else {
+                Ok(command.columns as u16 - 1)
+            }
+        });
+
+        // The state key resets the loop counter however it is used; the loop
+        // key then overrides it when it was sent.
+        if command.source_width != 0 {
+            animation.state = match command.source_width {
+                1 => PlayState::Stopped,
+                2 => PlayState::Loading,
+                _ => PlayState::Running,
+            };
+            animation.loops_left = Animation::INFINITE;
+        }
+        if command.source_height != 0 {
+            animation.loops_left = match command.source_height {
+                1 => Animation::INFINITE,
+                loops => loops - 1,
+            };
+        }
+
+        if let Some(Ok((index, gap_ms))) = retime {
+            self.images.retime_frame(internal_id, index, gap_ms);
+        }
+        if let Some(Err(error)) = retime {
+            return self.failure(command, error);
+        }
+        if let Some(Err(error)) = seek {
+            return self.failure(command, error);
+        }
+        if let Some(Ok(index)) = seek {
+            changed = self.images.show_frame(internal_id, index);
+            animation.current = index;
+        }
+
+        // Retiming the displayed frame changes when it is due, as does any
+        // state change; a stopped animation has no deadline at all. Only an
+        // image that can actually play is ever armed.
+        if matches!(animation.state, PlayState::Loading | PlayState::Running) {
+            let animatable =
+                self.images.get(internal_id).is_some_and(|image| image.is_animatable());
+            animation.deadline = animatable.then(|| {
+                let gap = self
+                    .images
+                    .get(internal_id)
+                    .and_then(|image| image.frames().get(animation.current as usize))
+                    .map_or(40, |frame| frame.gap_ms);
+                Instant::now() + Duration::from_millis(u64::from(gap))
+            });
+            self.images.set_animation(internal_id, animation);
+        } else {
+            animation.deadline = None;
+            self.images.set_animation(internal_id, animation);
+        }
+
+        GraphicsUpdate { response: None, changed, cursor_advance: None }
+    }
+
+    /// Store a decoded animation frame (`a=f`), composing it onto its canvas.
+    fn install_frame(
+        &mut self,
+        internal_id: u32,
+        command: &Command,
+        decoded: Decoded,
+        request: FrameRequest,
+    ) -> GraphicsUpdate {
+        let Some(image) = self.images.get(internal_id) else {
+            return self.failure(command, GraphicsError::NotFound);
+        };
+        let (width, height, format) = (image.width, image.height, image.format);
+        let channels = format.channels();
+        let frame_count = image.frames().len() as u32;
+
+        // A PNG's own dimensions were unknown when the transmission was
+        // parsed, so the bounds checks run here for it. The frame references
+        // are validated here too, since frames sent in the same burst as the
+        // base only exist once the earlier jobs have installed.
+        if decoded.width > width {
+            return self.failure(command, GraphicsError::FrameTooLarge);
+        }
+        if decoded.height > height {
+            return self.failure(command, GraphicsError::FrameTooLarge);
+        }
+        if request.base.is_some_and(|base| base > frame_count)
+            || request.edit.is_some_and(|edit| edit > frame_count + 1)
+        {
+            return self.failure(command, GraphicsError::FrameMissing(0));
+        }
+
+        // The canvas the patch composes onto: another frame's pixels, or the
+        // background color, which defaults to transparent black.
+        let mut canvas = match request.base {
+            Some(base) => image.frames()[base as usize - 1].pixels.to_vec(),
+            None => {
+                let mut canvas = vec![0u8; (width as usize * height as usize) * channels];
+                if request.bgcolor != 0 {
+                    let [b, g, r, a] = request.bgcolor.to_le_bytes();
+                    for pixel in canvas.chunks_exact_mut(channels) {
+                        pixel[..3].copy_from_slice(&[r, g, b]);
+                        if channels == 4 {
+                            pixel[3] = a;
+                        }
+                    }
+                }
+                canvas
+            },
+        };
+
+        blend_patch(
+            &mut canvas,
+            (width, height),
+            &decoded.pixels,
+            (decoded.width, decoded.height),
+            (decoded.format.channels(), request.x, request.y),
+            request.blend,
+            channels,
+        );
+
+        // An edited frame keeps its own gap unless the command set one; a new
+        // frame without a gap gets the protocol's 40 ms default.
+        let edited = request.edit.map(|edit| edit <= frame_count).unwrap_or(false);
+        let gap_ms = match (edited, request.gap) {
+            (true, FrameGap::Default) => None,
+            (_, FrameGap::Gapless) => Some(0),
+            (_, FrameGap::At(gap)) => Some(gap),
+            (false, FrameGap::Default) => Some(40),
+        };
+
+        if self.images.is_full(canvas.len()) {
+            if let Err(error) = self.make_room(canvas.len()) {
+                return self.failure(command, error);
+            }
+        }
+
+        let (changed, frame) = match request.edit {
+            // One past the last frame is an append, as the reference clamps it.
+            Some(edit) if edit <= frame_count => {
+                let index = (edit - 1) as u16;
+                let changed = self.images.replace_frame(internal_id, index, canvas.clone().into());
+                if let Some(gap_ms) = gap_ms {
+                    self.images.retime_frame(internal_id, index, gap_ms);
+                }
+                (changed, edit)
+            },
+            _ => {
+                let gap_ms = gap_ms.unwrap_or(40);
+                let Some(frame) = self.images.append_frame(internal_id, canvas.into(), gap_ms)
+                else {
+                    return self.failure(command, GraphicsError::NoSpace);
+                };
+
+                // A loading animation held on the last frame resumes playback
+                // when the frame it was waiting for arrives.
+                if let Some(image) = self.images.get(internal_id) {
+                    if let Some(animation) = image.animation() {
+                        if animation.state == PlayState::Loading && animation.deadline.is_none() {
+                            let gap = image.frames[animation.current as usize].gap_ms;
+                            let deadline = Instant::now() + Duration::from_millis(u64::from(gap));
+                            self.images.set_animation(
+                                internal_id,
+                                Animation { deadline: Some(deadline), ..*animation },
+                            );
+                        }
+                    }
+                }
+
+                (false, frame)
+            },
+        };
+
+        let response =
+            if command.suppresses_ok() { None } else { self.frame_response(command, frame, "OK") };
+        GraphicsUpdate { response, changed, cursor_advance: None }
+    }
+
+    /// Format a frame reply, which carries the 1-based frame number in
+    /// addition to the usual prefix.
+    fn frame_response(&self, command: &Command, frame: u32, body: &str) -> Option<String> {
+        if !command.wants_response() {
+            return None;
+        }
+
+        let mut response = String::with_capacity(body.len() + 32);
+        response.push_str("\x1b_G");
+        let mut separator = "";
+        if command.image_id != 0 {
+            let _ = write!(response, "i={}", command.image_id);
+            separator = ",";
+        }
+        if command.image_number != 0 {
+            let _ = write!(response, "{separator}I={}", command.image_number);
+            separator = ",";
+        }
+        let _ = write!(response, "{separator}r={frame}");
+        response.push(';');
+        response.push_str(body);
+        response.push_str("\x1b\\");
+
+        Some(response)
     }
 
     /// Queue a validation of image data that is not stored (`a=q`).
@@ -829,6 +1167,7 @@ impl GraphicsStore {
             max_dimension: self.config.max_image_dimension,
             allow_network_paths: self.config.allow_network_paths,
             pending: None,
+            frame: None,
         });
 
         Ok(())
@@ -976,7 +1315,32 @@ impl GraphicsStore {
             b'y' => self.placements.remove_row(row),
             b'z' => self.placements.remove_with_z(command.z_index),
             // Animation frames are not implemented.
-            b'f' => return Err(GraphicsError::Unsupported),
+            // One animation frame, selected by `r` (default root). Frames
+            // renumber, the displayed frame follows the removal, and only the
+            // uppercase form removes an image whose frames are all gone.
+            b'f' => {
+                let Some(internal_id) = internal else {
+                    return Ok(());
+                };
+                let Some(image) = self.images.get(internal_id) else {
+                    return Ok(());
+                };
+                if image.frames().len() <= 1 {
+                    // Nothing beyond the root: `f` is a no-op and `F` removes
+                    // the image, placements included.
+                    if free_data {
+                        self.placements.remove_image(internal_id);
+                        self.images.remove(internal_id);
+                    }
+                    return Ok(());
+                }
+                let frame = if command.rows == 0 {
+                    1
+                } else {
+                    command.rows.min(image.frames().len() as u32)
+                };
+                self.images.remove_frame(internal_id, frame as u16 - 1);
+            },
             // A range of image identifiers.
             b'r' => {
                 let range = command.src_x..=command.src_y;
@@ -1047,6 +1411,18 @@ impl GraphicsStore {
     }
 
     /// Make room for `needed` bytes of pixel data.
+    /// Advance every animation whose frame deadline has passed.
+    ///
+    /// Returns whether any displayed pixels changed.
+    pub fn advance_animations(&mut self, now: Instant) -> bool {
+        self.images.advance_animations(now)
+    }
+
+    /// The earliest moment an animation is due to advance.
+    pub fn next_animation_deadline(&self) -> Option<Instant> {
+        self.images.next_animation_deadline()
+    }
+
     fn make_room(&mut self, needed: usize) -> Result<(), GraphicsError> {
         if !self.images.is_full(needed) {
             return Ok(());
@@ -1229,6 +1605,8 @@ pub struct DecodeJob {
     allow_network_paths: bool,
     /// Transmission to complete once the payload has been decoded.
     pending: Option<Pending>,
+    /// Animation frame the payload belongs to, when the action is `a=f`.
+    frame: Option<FrameRequest>,
 }
 
 impl DecodeJob {
@@ -1256,6 +1634,7 @@ impl DecodeJob {
             command: self.command,
             result,
             pending: self.pending,
+            frame: self.frame,
         }
     }
 }
@@ -1270,6 +1649,46 @@ pub struct DecodeResult {
     result: Result<Decoded, GraphicsError>,
     /// Transmission that still has to store and anchor its image.
     pending: Option<Pending>,
+    /// Animation frame the pixels belong to, when the action is `a=f`.
+    frame: Option<FrameRequest>,
+}
+
+/// How an `a=f` frame's gap (`z`) resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameGap {
+    /// No `z` was sent: a new frame gets the protocol's 40 ms default, an
+    /// edited frame keeps its own.
+    Default,
+    /// An explicit gap in milliseconds (`z > 0`).
+    At(u32),
+    /// A gapless frame (`z < 0`): never displayed, but usable as a base.
+    Gapless,
+}
+
+/// How an `a=f` patch blends onto its canvas (`X`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBlend {
+    /// Straight-alpha source-over; transparent source pixels are no-ops.
+    Alpha,
+    /// Replace the canvas pixels, transparent ones included (`X=1`).
+    Overwrite,
+}
+
+/// The animation frame an `a=f` transmission describes.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameRequest {
+    /// Left edge of the patch within the image (`x`).
+    pub x: u32,
+    /// Top edge of the patch within the image (`y`).
+    pub y: u32,
+    /// The 1-based frame whose pixels the patch composes onto (`c`).
+    pub base: Option<u32>,
+    /// The 1-based frame being edited in place (`r`).
+    pub edit: Option<u32>,
+    pub blend: FrameBlend,
+    /// Canvas fill color for pixels the patch does not cover (`Y`), 0xRRGGBBAA.
+    pub bgcolor: u32,
+    pub gap: FrameGap,
 }
 
 /// Bound on the bytes a file medium may read.
@@ -1356,6 +1775,61 @@ fn decompression_limit(command: &Command, config: &GraphicsConfig) -> usize {
         .saturating_mul(bytes_per_pixel);
 
     if declared > 0 { declared } else { config.memory_limit }
+}
+
+/// Blend an animation frame patch onto a canvas.
+///
+/// The patch is clipped at the canvas edges. With [`FrameBlend::Overwrite`]
+/// every canvas pixel in the patch rectangle is replaced, transparent ones
+/// included; with [`FrameBlend::Alpha`] the straight-alpha source-over rule
+/// applies, under which a fully transparent source pixel changes nothing. A
+/// patch without an alpha channel is opaque by construction.
+fn blend_patch(
+    canvas: &mut [u8],
+    (canvas_width, canvas_height): (u32, u32),
+    patch: &[u8],
+    (patch_width, patch_height): (u32, u32),
+    (patch_channels, x, y): (usize, u32, u32),
+    blend: FrameBlend,
+    canvas_channels: usize,
+) {
+    for row in 0..patch_height as usize {
+        let canvas_y = y as usize + row;
+        if canvas_y >= canvas_height as usize {
+            break;
+        }
+        for column in 0..patch_width as usize {
+            let canvas_x = x as usize + column;
+            if canvas_x >= canvas_width as usize {
+                break;
+            }
+            let src =
+                &patch[(row * patch_width as usize + column) * patch_channels..][..patch_channels];
+            let dst = &mut canvas
+                [(canvas_y * canvas_width as usize + canvas_x) * canvas_channels..]
+                [..canvas_channels];
+
+            let src_alpha = if patch_channels == 4 { src[3] } else { 255 };
+            if blend == FrameBlend::Overwrite || src_alpha == 255 {
+                dst[..3].copy_from_slice(&src[..3]);
+                if canvas_channels == 4 {
+                    dst[3] = src_alpha;
+                }
+            } else if src_alpha != 0 && canvas_channels == 4 {
+                // Straight-alpha source-over, in 16 bits so the intermediates
+                // cannot overflow.
+                let sa = u16::from(src_alpha);
+                let da = u16::from(dst[3]);
+                let out_alpha = sa + da * (255 - sa) / 255;
+                for channel in 0..3 {
+                    dst[channel] = ((u16::from(src[channel]) * sa
+                        + u16::from(dst[channel]) * da * (255 - sa) / 255)
+                        / out_alpha) as u8;
+                }
+                dst[3] = out_alpha as u8;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2138,5 +2612,186 @@ mod tests {
             update.response.as_deref(),
             Some("\x1b_Gi=9;EBADF:Failed to read image file\x1b\\")
         );
+    }
+
+    // --- Animation frame tests (`a=f`, `a=a`, `d=f`) ---
+
+    /// Settle an animation control (`a=a`), which replies for itself.
+    fn control(store: &mut GraphicsStore, payload: &str) -> GraphicsUpdate {
+        apc(store, payload)
+    }
+
+    /// The image an animation command addresses.
+    fn animated(store: &GraphicsStore, client_id: u32) -> &image::ImageData {
+        store.images.by_client_id(client_id).unwrap()
+    }
+
+    /// A base image with two frames: red root, green frame 2.
+    fn animated_store() -> (GraphicsStore, u32) {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        apc(&mut store, &format!("Ga=t,i=7,f=32,s=1,v=1;{}", encode(&[255, 0, 0, 255])));
+        apc(&mut store, &format!("Ga=f,i=7,f=32,s=1,v=1;{}", encode(&[0, 255, 0, 255])));
+        (store, 7)
+    }
+
+    #[test]
+    fn frame_append_replies_with_the_frame_number() {
+        let (mut store, _) = animated_store();
+
+        let update =
+            apc(&mut store, &format!("Ga=f,i=7,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 255])));
+
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=7,r=3;OK\x1b\\"));
+        assert_eq!(animated(&store, 7).frames().len(), 3);
+    }
+
+    #[test]
+    fn frame_gaps_resolve_like_the_spec_says() {
+        let (mut store, _) = animated_store();
+
+        // Absent and zero both mean the 40 ms default; negative is gapless.
+        apc(&mut store, &format!("Ga=f,i=7,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 255])));
+        apc(&mut store, &format!("Ga=f,i=7,f=32,s=1,v=1,z=0;{}", encode(&[0, 0, 255, 255])));
+        apc(&mut store, &format!("Ga=f,i=7,f=32,s=1,v=1,z=100;{}", encode(&[0, 0, 255, 255])));
+        apc(&mut store, &format!("Ga=f,i=7,f=32,s=1,v=1,z=-1;{}", encode(&[0, 0, 255, 255])));
+
+        let gaps: Vec<u32> =
+            animated(&store, 7).frames().iter().map(|frame| frame.gap_ms).collect();
+        // The root frame is gapless by construction; the helper's frame took
+        // the 40 ms default.
+        assert_eq!(gaps, [0, 40, 40, 40, 100, 0]);
+    }
+
+    #[test]
+    fn frame_patch_composes_onto_the_named_base() {
+        // The root is an opaque red pixel; the patch is a fully transparent
+        // blue one. Alpha blending keeps the red, overwrite takes the blue.
+        let (mut store, _) = animated_store();
+
+        apc(&mut store, &format!("Ga=f,i=7,c=1,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 0])));
+        apc(&mut store, &format!("Ga=f,i=7,c=1,X=1,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 0])));
+
+        let frames = animated(&store, 7).frames();
+        assert_eq!(*frames[2].pixels, [255, 0, 0, 255], "alpha keeps the base");
+        assert_eq!(*frames[3].pixels, [0, 0, 255, 0], "overwrite takes the patch");
+    }
+
+    #[test]
+    fn frame_patch_clips_at_the_image_edge() {
+        // A 2x1 patch on a 1x1 image: an oversized patch width is refused
+        // outright, while a patch starting at the edge loses its overhang.
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        apc(&mut store, &format!("Ga=t,i=7,f=32,s=1,v=1;{}", red_pixel()));
+        let update = apc(
+            &mut store,
+            &format!("Ga=f,i=7,f=32,s=2,v=1;{}", encode(&[0, 0, 255, 255, 0, 0, 255, 255])),
+        );
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=7;EINVAL:frame larger than image\x1b\\")
+        );
+
+        // A patch starting at the edge simply loses its overhang.
+        let update =
+            apc(&mut store, &format!("Ga=f,i=7,x=1,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 255])));
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=7,r=2;OK\x1b\\"));
+    }
+
+    #[test]
+    fn editing_the_displayed_frame_marks_the_screen_changed() {
+        let (mut store, _) = animated_store();
+        apc(&mut store, "Ga=a,i=7,s=3,r=1,z=40");
+
+        // Frame 1 is displayed; editing it changes the screen.
+        let update =
+            apc(&mut store, &format!("Ga=f,i=7,r=1,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 255])));
+        assert!(update.changed);
+
+        // Editing the hidden frame does not.
+        let update =
+            apc(&mut store, &format!("Ga=f,i=7,r=3,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 255])));
+        assert!(!update.changed);
+    }
+
+    #[test]
+    fn control_runs_stops_and_seeks() {
+        let (mut store, _) = animated_store();
+
+        // Running arms a deadline.
+        let update = control(&mut store, "Ga=a,i=7,s=3,v=2");
+        assert!(update.response.is_none(), "control success is silent");
+        assert!(animated(&store, 7).animation().unwrap().deadline.is_some());
+        assert_eq!(animated(&store, 7).animation().unwrap().loops_left, 1);
+
+        // A seek shows the requested frame and changes the screen.
+        let update = control(&mut store, "Ga=a,i=7,c=2");
+        assert!(update.changed);
+
+        // Stopping clears the deadline.
+        control(&mut store, "Ga=a,i=7,s=1");
+        assert_eq!(animated(&store, 7).animation().unwrap().state, image::PlayState::Stopped);
+        assert!(animated(&store, 7).animation().unwrap().deadline.is_none());
+    }
+
+    #[test]
+    fn editing_the_root_of_a_never_controlled_image_refreshes_it() {
+        // A client may add frames and edit the root without ever starting
+        // playback; the displayed pixels must still follow the edits.
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        apc(&mut store, &format!("Ga=t,i=7,f=32,s=1,v=1;{}", red_pixel()));
+
+        let update =
+            apc(&mut store, &format!("Ga=f,i=7,r=1,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 255])));
+        assert!(update.changed, "the displayed root frame was edited");
+        assert_eq!(*animated(&store, 7).pixels, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn control_errors_name_the_problem() {
+        let (mut store, _) = animated_store();
+
+        let update = control(&mut store, "Ga=a,i=42,s=3");
+        assert_eq!(update.response.as_deref(), Some("\x1b_Gi=42;ENOENT:image not found\x1b\\"));
+
+        let update = control(&mut store, "Ga=a,i=7,c=9");
+        assert_eq!(
+            update.response.as_deref(),
+            Some("\x1b_Gi=7;EINVAL:no frame with that number\x1b\\")
+        );
+    }
+
+    #[test]
+    fn a_single_frame_image_is_never_armed() {
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        apc(&mut store, &format!("Ga=t,i=8,f=32,s=1,v=1;{}", red_pixel()));
+
+        control(&mut store, "Ga=a,i=8,s=3");
+
+        assert!(animated(&store, 8).animation().unwrap().deadline.is_none());
+    }
+
+    #[test]
+    fn deleting_a_frame_renumbers_and_follows_the_display() {
+        let (mut store, _) = animated_store();
+        apc(&mut store, &format!("Ga=f,i=7,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 255])));
+        apc(&mut store, "Ga=a,i=7,c=2");
+
+        // Frame 2 is displayed; deleting it shows its successor, and the old
+        // frame 3 becomes frame 2.
+        control(&mut store, "Ga=d,d=f,i=7,r=2");
+
+        let image = animated(&store, 7);
+        assert_eq!(image.frames().len(), 2);
+        assert_eq!(image.animation().unwrap().current, 1);
+
+        // Deleting every extra frame leaves a static image, which `f` keeps
+        // and `F` removes entirely.
+        control(&mut store, "Ga=d,d=f,i=7,r=1");
+        assert_eq!(animated(&store, 7).frames().len(), 1);
+        control(&mut store, "Ga=d,d=f,i=7,r=1");
+        assert!(!animated(&store, 7).frames().is_empty(), "`f` keeps the image");
+
+        control(&mut store, "Ga=d,d=F,i=7,r=1");
+        assert!(store.images.resolve(7, 0).is_none(), "`F` removes the image");
     }
 }

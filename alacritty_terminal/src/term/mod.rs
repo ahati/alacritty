@@ -2,6 +2,7 @@
 
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
+use std::time::Instant;
 use std::{cmp, mem, ptr, slice, str};
 
 #[cfg(feature = "serde")]
@@ -720,6 +721,29 @@ impl<T> Term<T> {
     /// [`install_graphics`](Self::install_graphics).
     pub fn take_graphics_jobs(&mut self) -> Vec<DecodeJob> {
         self.graphics.take_jobs()
+    }
+
+    /// Advance every animation whose frame deadline has passed.
+    ///
+    /// Returns whether any displayed pixels changed. Only the active screen's
+    /// animations advance; the alternate screen's resume when switched back
+    /// to. The caller drives the clock: `now` is passed in rather than read,
+    /// which keeps playback testable and lets the front end batch ticks.
+    pub fn advance_animations(&mut self, now: Instant) -> bool {
+        let changed = self.graphics.advance_animations(now);
+        if changed {
+            self.mark_fully_damaged();
+        }
+        changed
+    }
+
+    /// The earliest moment an animation on the active screen is due to
+    /// advance.
+    ///
+    /// The front end schedules a timer for this instant, or stops scheduling
+    /// when it is `None`.
+    pub fn next_animation_deadline(&self) -> Option<Instant> {
+        self.graphics.next_animation_deadline()
     }
 
     /// Apply the outcome of a decode taken from

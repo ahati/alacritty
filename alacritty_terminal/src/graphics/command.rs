@@ -94,6 +94,39 @@ pub enum Action {
     Compose,
 }
 
+use std::cmp::Ordering;
+
+impl Command {
+    /// The animation frame this `a=f` command describes.
+    ///
+    /// The frame keys reuse letters the other actions assign different
+    /// meanings to, so the reinterpretation happens here rather than at the
+    /// dispatch site, exactly as the reference implementation's shared
+    /// storage does.
+    pub(super) fn frame_request(&self) -> super::FrameRequest {
+        super::FrameRequest {
+            x: self.src_x,
+            y: self.src_y,
+            base: (self.columns != 0).then_some(self.columns),
+            edit: (self.rows != 0).then_some(self.rows),
+            blend: if self.cell_offset_x == 1 {
+                super::FrameBlend::Overwrite
+            } else {
+                super::FrameBlend::Alpha
+            },
+            bgcolor: self.cell_offset_y,
+            gap: match self.z_index.cmp(&0) {
+                Ordering::Less => super::FrameGap::Gapless,
+                Ordering::Greater => super::FrameGap::At(self.z_index as u32),
+                Ordering::Equal => {
+                    // Absent and zero both pick the new-frame default.
+                    super::FrameGap::Default
+                },
+            },
+        }
+    }
+}
+
 impl Action {
     /// Whether the command's payload is decoded away from the parse path.
     ///
@@ -101,8 +134,8 @@ impl Action {
     /// payload is acceptable is only known once that payload has been decoded.
     pub const fn is_deferred(self) -> bool {
         match self {
-            Self::Transmit | Self::TransmitAndDisplay | Self::Query => true,
-            Self::Put | Self::Delete | Self::Frame | Self::Animate | Self::Compose => false,
+            Self::Transmit | Self::TransmitAndDisplay | Self::Query | Self::Frame => true,
+            Self::Put | Self::Delete | Self::Animate | Self::Compose => false,
         }
     }
 

@@ -47,7 +47,7 @@ impl PixelFormat {
 }
 
 /// A decoded image, shared with the renderer.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ImageData {
     /// Identifier the client used in `i`, or `0` for an anonymous image.
     pub client_id: u32,
@@ -61,6 +61,9 @@ pub struct ImageData {
     ///
     /// Empty while a deferred decode is still outstanding; see
     /// [`is_ready`](Self::is_ready).
+    ///
+    /// For an animation this is always the pixels of the current frame, see
+    /// [`frames`](Self::frames).
     pub pixels: Arc<[u8]>,
     /// Bumped whenever the image data is replaced, so renderers can invalidate
     /// cached textures.
@@ -73,6 +76,14 @@ pub struct ImageData {
     /// Before the pixels exist this is the reservation made for them, since a
     /// decode that has not run yet still has to hold its space.
     charge: usize,
+    /// Animation frames beyond the root, fully composed.
+    ///
+    /// The root frame is the image's own [`pixels`](Self::pixels); frame 1 on
+    /// the wire is this image, and the entries here are frames 2 and onward.
+    /// Empty for a static image.
+    pub frames: Vec<Frame>,
+    /// Playback state, present once a client controls the image's animation.
+    pub animation: Option<Animation>,
 }
 
 impl ImageData {
@@ -88,6 +99,47 @@ impl ImageData {
     pub fn charge(&self) -> usize {
         self.charge
     }
+
+    /// The stored animation frames, not counting the root frame.
+    pub fn frames(&self) -> &[Frame] {
+        &self.frames
+    }
+
+    /// The playback state, if the client has animated this image.
+    pub fn animation(&self) -> Option<&Animation> {
+        self.animation.as_ref()
+    }
+
+    /// Whether playing this image can ever show more than one frame.
+    ///
+    /// A single-frame image has nothing to advance to, and one whose frames
+    /// are all gapless is never visible, so neither is armed for playback.
+    pub fn is_animatable(&self) -> bool {
+        self.frames.len() >= 2 && self.frames.iter().map(|frame| frame.gap_ms).sum::<u32>() > 0
+    }
+
+    /// Replace the frame data wholesale, as a frame edit does.
+    fn with_frames(self, frames: Vec<Frame>) -> Self {
+        let frame_bytes =
+            |frames: &[Frame]| frames.iter().map(|frame| frame.pixels.len()).sum::<usize>();
+        // The quota counts every stored frame once; the root frame's bytes are
+        // shared with `pixels`, which is an `Arc` into the same buffer.
+        let charge = self.charge - frame_bytes(&self.frames) + frame_bytes(&frames);
+        Self { charge, frames, ..self }
+    }
+
+    /// Show the frame at `index`, making its pixels the displayed ones.
+    fn with_current(self, index: u16) -> Self {
+        let pixels = self.frames[index as usize].pixels.clone();
+        let mut animation = self.animation.unwrap_or(Animation::stopped());
+        animation.current = index;
+        Self { pixels, animation: Some(animation), ..self }
+    }
+
+    /// Replace the playback state.
+    fn with_animation(self, animation: Animation) -> Self {
+        Self { animation: Some(animation), ..self }
+    }
 }
 
 /// Pixels decoded from a transmission, before an identifier is assigned.
@@ -98,6 +150,8 @@ pub struct Decoded {
     pub format: PixelFormat,
     pub pixels: Vec<u8>,
 }
+
+use std::time::Instant;
 
 /// An image on its way into an [`ImageStore`].
 struct Stored {
@@ -141,6 +195,51 @@ pub struct ImageStore {
 impl Default for ImageStore {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+/// One animation frame: fully composed pixels and the gap shown before the
+/// frame that follows it.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    /// The composed W×H pixels of the frame, in the image's format.
+    pub pixels: Arc<[u8]>,
+    /// Milliseconds this frame is shown before the next one. Zero marks a
+    /// gapless frame, which is never displayed.
+    pub gap_ms: u32,
+}
+
+/// How far an animation has played.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayState {
+    /// Not playing; resumes where it stopped when restarted.
+    Stopped,
+    /// Playing, but holding on the last frame instead of wrapping, waiting
+    /// for further frames to arrive.
+    Loading,
+    /// Playing with wrap-around.
+    Running,
+}
+
+/// The playback state of an animating image.
+#[derive(Clone, Copy, Debug)]
+pub struct Animation {
+    pub state: PlayState,
+    /// Index of the displayed frame in the image's [`frames`](super::ImageData::frames).
+    pub current: u16,
+    /// Full cycles left before the animation stops; [`u32::MAX`] is infinite.
+    pub loops_left: u32,
+    /// When the current frame's gap has elapsed and the next one is due.
+    pub deadline: Option<Instant>,
+}
+
+impl Animation {
+    /// Loop count that never stops playing.
+    pub const INFINITE: u32 = u32::MAX;
+
+    /// A fresh, idle playback state.
+    pub fn stopped() -> Self {
+        Self { state: PlayState::Stopped, current: 0, loops_left: Self::INFINITE, deadline: None }
     }
 }
 
@@ -207,6 +306,227 @@ impl ImageStore {
     /// Look up an image by its internal identifier.
     pub fn get(&self, internal_id: u32) -> Option<&Arc<ImageData>> {
         self.images.get(&internal_id)
+    }
+
+    /// Apply a mutation to one image, replacing it in place the way
+    /// [`complete`](Self::complete) does.
+    ///
+    /// The closure receives a clone of the image and returns it with the frame
+    /// or playback changes applied; the quota accounting follows the charge
+    /// difference. Returns whether the image was still stored.
+    fn update(&mut self, internal_id: u32, change: impl FnOnce(&ImageData) -> ImageData) -> bool {
+        let Some(existing) = self.images.get(&internal_id) else { return false };
+        let mut updated = change(existing);
+        self.used = self.used + updated.charge - existing.charge;
+        self.generation += 1;
+        // The new generation is what makes renderers drop their cached
+        // texture for the image.
+        updated.generation = self.generation;
+        self.images.insert(internal_id, Arc::new(updated));
+        true
+    }
+
+    /// Append a composed animation frame, returning its 1-based number.
+    pub fn append_frame(
+        &mut self,
+        internal_id: u32,
+        pixels: Arc<[u8]>,
+        gap_ms: u32,
+    ) -> Option<u32> {
+        if !self.update(internal_id, |image| {
+            let mut image = image.clone();
+            image.frames.push(Frame { pixels, gap_ms });
+            let frames = std::mem::take(&mut image.frames);
+            image.with_frames(frames)
+        }) {
+            return None;
+        }
+        Some(self.get(internal_id)?.frames().len() as u32)
+    }
+
+    /// Overwrite an existing frame's pixels, leaving its gap alone.
+    ///
+    /// Returns whether the displayed pixels changed, which happens only when
+    /// the edited frame is the one on screen.
+    pub fn replace_frame(&mut self, internal_id: u32, index: u16, pixels: Arc<[u8]>) -> bool {
+        // The displayed frame is the animation's current one, or the root when
+        // the client has never controlled playback.
+        let displayed = self
+            .get(internal_id)
+            .map(|image| image.animation.map(|animation| animation.current).unwrap_or(0))
+            == Some(index);
+        self.update(internal_id, |image| {
+            let mut image = image.clone();
+            image.frames[index as usize].pixels = pixels;
+            if displayed {
+                image.pixels = image.frames[index as usize].pixels.clone();
+            }
+            let frames = std::mem::take(&mut image.frames);
+            image.with_frames(frames)
+        }) && displayed
+    }
+
+    /// Change one frame's gap, in milliseconds.
+    pub fn retime_frame(&mut self, internal_id: u32, index: u16, gap_ms: u32) -> bool {
+        self.update(internal_id, |image| {
+            let mut image = image.clone();
+            image.frames[index as usize].gap_ms = gap_ms;
+            let frames = std::mem::take(&mut image.frames);
+            image.with_frames(frames)
+        })
+    }
+
+    /// Make the frame at `index` the displayed one.
+    ///
+    /// Returns whether the displayed pixels changed, which is false when the
+    /// frame was already current or the image is gone.
+    pub fn show_frame(&mut self, internal_id: u32, index: u16) -> bool {
+        let displayed = self
+            .get(internal_id)
+            .and_then(|image| image.animation)
+            .map(|animation| animation.current)
+            == Some(index);
+        if displayed {
+            return false;
+        }
+        self.update(internal_id, |image| image.clone().with_current(index))
+    }
+
+    /// Store the playback state for an image.
+    pub fn set_animation(&mut self, internal_id: u32, animation: Animation) -> bool {
+        self.update(internal_id, |image| image.clone().with_animation(animation))
+    }
+
+    /// Remove the frame at `index`, renumbering the frames after it.
+    ///
+    /// The displayed frame follows the removal the way the reference
+    /// implementation's does: the successor takes the removed frame's place,
+    /// unless the last frame was removed, in which case the predecessor is
+    /// displayed. Returns whether the displayed pixels changed. Removing the
+    /// only frame of an image is a no-op, as the reference makes it.
+    pub fn remove_frame(&mut self, internal_id: u32, index: u16) -> bool {
+        let Some(image) = self.get(internal_id) else { return false };
+        if image.frames.len() <= 1 || index as usize >= image.frames.len() {
+            return false;
+        }
+        let frame_count = image.frames.len();
+        let current = image.animation.map(|animation| animation.current).unwrap_or(0);
+
+        // Only the removal of the displayed frame changes the displayed
+        // pixels: its successor (or predecessor, for the last frame) is shown
+        // instead.
+        let changed_display = current == index;
+
+        self.update(internal_id, |image| {
+            let mut image = image.clone();
+            image.frames.remove(index as usize);
+            if let Some(animation) = &mut image.animation {
+                if index < animation.current {
+                    animation.current -= 1;
+                } else if animation.current as usize == frame_count - 1 {
+                    // The last frame was removed: show its predecessor.
+                    animation.current -= 1;
+                }
+                animation.current = animation.current.min(image.frames.len() as u16 - 1);
+            }
+            // Without playback the image displays its root frame, which after
+            // the removal is whatever frame now sits at the root's place.
+            image.pixels = image.frames[0].pixels.clone();
+            let frames = std::mem::take(&mut image.frames);
+            image.with_frames(frames)
+        });
+
+        changed_display
+    }
+
+    /// Advance every image whose frame deadline has passed.
+    ///
+    /// Returns whether any displayed pixels changed. A gapless frame is
+    /// skipped without being shown, a loading animation holds on its last
+    /// frame instead of wrapping, and a running one stops once its loop count
+    /// is exhausted.
+    pub fn advance_animations(&mut self, now: Instant) -> bool {
+        let due: Vec<u32> = self
+            .images
+            .iter()
+            .filter_map(|(internal_id, image)| {
+                let animation = image.animation()?;
+                if animation.state == PlayState::Stopped || !image.is_animatable() {
+                    return None;
+                }
+                animation.deadline.filter(|deadline| *deadline <= now).map(|_| *internal_id)
+            })
+            .collect();
+
+        let mut changed = false;
+        for internal_id in due {
+            changed |= self.advance_one(internal_id, now);
+        }
+        changed
+    }
+
+    /// Advance one animation past its deadline.
+    fn advance_one(&mut self, internal_id: u32, now: Instant) -> bool {
+        let Some(image) = self.get(internal_id) else { return false };
+        let Some(animation) = image.animation else { return false };
+        let frame_count = image.frames.len();
+        if frame_count < 2 {
+            return false;
+        }
+
+        let mut animation = animation;
+        let mut current = animation.current as usize;
+        loop {
+            current += 1;
+            if current >= frame_count {
+                // The last frame's gap has elapsed: loading animations hold
+                // here until a new frame arrives, running ones wrap or stop.
+                // Neither changes the displayed pixels.
+                if animation.state == PlayState::Loading {
+                    animation.deadline = None;
+                    self.set_animation(internal_id, animation);
+                    return false;
+                }
+                if animation.loops_left == 0 {
+                    animation.state = PlayState::Stopped;
+                    animation.deadline = None;
+                    self.set_animation(internal_id, animation);
+                    return false;
+                }
+                if animation.loops_left != Animation::INFINITE {
+                    animation.loops_left -= 1;
+                }
+                current = 0;
+            }
+            if image.frames[current].gap_ms > 0 {
+                break;
+            }
+            // A gapless frame is never displayed: walk over it.
+        }
+
+        animation.current = current as u16;
+        animation.deadline =
+            Some(now + std::time::Duration::from_millis(image.frames[current].gap_ms as u64));
+        self.update(internal_id, |image| {
+            let mut image = image.clone();
+            image.pixels = image.frames[current].pixels.clone();
+            image.animation = Some(animation);
+            image
+        })
+    }
+
+    /// The earliest moment some animation is due to advance.
+    pub fn next_animation_deadline(&self) -> Option<Instant> {
+        self.images
+            .values()
+            .filter_map(|image| {
+                let animation = image.animation()?;
+                if animation.state == PlayState::Stopped || !image.is_animatable() {
+                    return None;
+                }
+                animation.deadline
+            })
+            .min()
     }
 
     /// Iterate over every stored image and its internal identifier.
@@ -325,10 +645,14 @@ impl ImageStore {
             width: stored.width,
             height: stored.height,
             format: stored.format,
-            pixels: stored.pixels,
+            pixels: stored.pixels.clone(),
             generation: self.generation,
             transient: stored.transient,
             charge: stored.charge,
+            // The decoded pixels are the root frame, from which the animation
+            // frames the client adds later are composed.
+            frames: vec![Frame { pixels: stored.pixels, gap_ms: 0 }],
+            animation: None,
         });
         self.images.insert(internal_id, Arc::clone(&image));
 
@@ -359,10 +683,17 @@ impl ImageStore {
             width: stored.width,
             height: stored.height,
             format: stored.format,
-            pixels: stored.pixels,
+            pixels: stored.pixels.clone(),
             generation: self.generation,
             transient: stored.transient,
             charge: stored.charge,
+            frames: if stored.pixels.is_empty() {
+                // A pending image has no root frame until its decode lands.
+                Vec::new()
+            } else {
+                vec![Frame { pixels: stored.pixels, gap_ms: 0 }]
+            },
+            animation: None,
         });
 
         self.used += image.charge();

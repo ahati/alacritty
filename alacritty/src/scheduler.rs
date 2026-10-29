@@ -29,6 +29,8 @@ pub enum Topic {
     BlinkCursor,
     BlinkTimeout,
     Frame,
+    /// Kitty animation frames coming due.
+    AnimationFrame,
 }
 
 /// Event scheduled to be emitted at a specific time.
