@@ -12,7 +12,7 @@ Dependencies:
   - PackageIdentifier: Microsoft.VCRedist.2015+.x64
 Installers:
 - Architecture: x64
-  InstallerUrl: https://github.com/ahati/alacritty/releases/download/v0.17.0-rel-fork-v2026-10-24-r1/Alacritty-v0.17.0-rel-fork-v2026-10-24-r1-portable.exe
-  InstallerSha256: 81B52A310E3837203E9EAA2497A648FDD575F239B3D0044906F87BB4D6720E4C
+  InstallerUrl: https://github.com/ahati/alacritty/releases/download/v0.17.0-rel-fork-v2026-10-29-r1/Alacritty-v0.17.0-rel-fork-v2026-10-29-r1-portable.exe
+  InstallerSha256: 83CA7C942914E47FDCD45D2286FF1D1474287273545A113E3394E7C1E20E240A
 ManifestType: installer
 ManifestVersion: 1.12.0
