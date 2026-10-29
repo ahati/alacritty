@@ -349,10 +349,11 @@ impl ImageStore {
     /// Returns whether the displayed pixels changed, which happens only when
     /// the edited frame is the one on screen.
     pub fn replace_frame(&mut self, internal_id: u32, index: u16, pixels: Arc<[u8]>) -> bool {
+        // The displayed frame is the animation's current one, or the root when
+        // the client has never controlled playback.
         let displayed = self
             .get(internal_id)
-            .and_then(|image| image.animation)
-            .map(|animation| animation.current)
+            .map(|image| image.animation.map(|animation| animation.current).unwrap_or(0))
             == Some(index);
         self.update(internal_id, |image| {
             let mut image = image.clone();
@@ -409,11 +410,12 @@ impl ImageStore {
             return false;
         }
         let frame_count = image.frames.len();
-        let current = image.animation.map(|animation| animation.current);
-        let was_last = index as usize == frame_count - 1;
+        let current = image.animation.map(|animation| animation.current).unwrap_or(0);
 
-        let changed_display =
-            current.is_some_and(|current| current == index || (!was_last && current > index));
+        // Only the removal of the displayed frame changes the displayed
+        // pixels: its successor (or predecessor, for the last frame) is shown
+        // instead.
+        let changed_display = current == index;
 
         self.update(internal_id, |image| {
             let mut image = image.clone();
@@ -426,8 +428,10 @@ impl ImageStore {
                     animation.current -= 1;
                 }
                 animation.current = animation.current.min(image.frames.len() as u16 - 1);
-                image.pixels = image.frames[animation.current as usize].pixels.clone();
             }
+            // Without playback the image displays its root frame, which after
+            // the removal is whatever frame now sits at the root's place.
+            image.pixels = image.frames[0].pixels.clone();
             let frames = std::mem::take(&mut image.frames);
             image.with_frames(frames)
         });

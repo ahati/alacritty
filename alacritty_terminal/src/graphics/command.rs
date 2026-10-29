@@ -94,6 +94,37 @@ pub enum Action {
     Compose,
 }
 
+impl Command {
+    /// The animation frame this `a=f` command describes.
+    ///
+    /// The frame keys reuse letters the other actions assign different
+    /// meanings to, so the reinterpretation happens here rather than at the
+    /// dispatch site, exactly as the reference implementation's shared
+    /// storage does.
+    pub(super) fn frame_request(&self) -> super::FrameRequest {
+        super::FrameRequest {
+            x: self.src_x,
+            y: self.src_y,
+            base: (self.columns != 0).then_some(self.columns),
+            edit: (self.rows != 0).then_some(self.rows),
+            blend: if self.cell_offset_x == 1 {
+                super::FrameBlend::Overwrite
+            } else {
+                super::FrameBlend::Alpha
+            },
+            bgcolor: self.cell_offset_y,
+            gap: if self.z_index < 0 {
+                super::FrameGap::Gapless
+            } else if self.z_index > 0 {
+                super::FrameGap::At(self.z_index as u32)
+            } else {
+                // Absent and zero both pick the new-frame default.
+                super::FrameGap::Default
+            },
+        }
+    }
+}
+
 impl Action {
     /// Whether the command's payload is decoded away from the parse path.
     ///

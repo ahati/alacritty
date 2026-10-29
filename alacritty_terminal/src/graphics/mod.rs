@@ -1038,7 +1038,7 @@ impl GraphicsStore {
             return self.failure(command, GraphicsError::FrameTooLarge);
         }
         if request.base.is_some_and(|base| base > frame_count)
-            || request.edit.is_some_and(|edit| edit > frame_count)
+            || request.edit.is_some_and(|edit| edit > frame_count + 1)
         {
             return self.failure(command, GraphicsError::FrameMissing(0));
         }
@@ -1689,32 +1689,6 @@ pub struct FrameRequest {
     /// Canvas fill color for pixels the patch does not cover (`Y`), 0xRRGGBBAA.
     pub bgcolor: u32,
     pub gap: FrameGap,
-}
-
-impl Command {
-    /// The animation frame this `a=f` command describes.
-    ///
-    /// The frame keys reuse letters the other actions assign different
-    /// meanings to, so the reinterpretation happens here rather than in the
-    /// parser, exactly as the reference implementation's shared storage does.
-    fn frame_request(&self) -> FrameRequest {
-        FrameRequest {
-            x: self.src_x,
-            y: self.src_y,
-            base: (self.columns != 0).then_some(self.columns),
-            edit: (self.rows != 0).then_some(self.rows),
-            blend: if self.cell_offset_x == 1 { FrameBlend::Overwrite } else { FrameBlend::Alpha },
-            bgcolor: self.cell_offset_y,
-            gap: if self.z_index < 0 {
-                FrameGap::Gapless
-            } else if self.z_index > 0 {
-                FrameGap::At(self.z_index as u32)
-            } else {
-                // Absent and zero both pick the new-frame default.
-                FrameGap::Default
-            },
-        }
-    }
 }
 
 /// Bound on the bytes a file medium may read.
@@ -2757,6 +2731,19 @@ mod tests {
         control(&mut store, "Ga=a,i=7,s=1");
         assert_eq!(animated(&store, 7).animation().unwrap().state, image::PlayState::Stopped);
         assert!(animated(&store, 7).animation().unwrap().deadline.is_none());
+    }
+
+    #[test]
+    fn editing_the_root_of_a_never_controlled_image_refreshes_it() {
+        // A client may add frames and edit the root without ever starting
+        // playback; the displayed pixels must still follow the edits.
+        let mut store = GraphicsStore::new(GraphicsConfig::default());
+        apc(&mut store, &format!("Ga=t,i=7,f=32,s=1,v=1;{}", red_pixel()));
+
+        let update =
+            apc(&mut store, &format!("Ga=f,i=7,r=1,f=32,s=1,v=1;{}", encode(&[0, 0, 255, 255])));
+        assert!(update.changed, "the displayed root frame was edited");
+        assert_eq!(*animated(&store, 7).pixels, [0, 0, 255, 255]);
     }
 
     #[test]
