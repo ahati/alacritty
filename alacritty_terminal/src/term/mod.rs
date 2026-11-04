@@ -727,24 +727,32 @@ impl<T> Term<T> {
             return;
         }
 
-        let virt_keys: Vec<(u32, u32, u32)> = self
-            .graphics
-            .raw_placements()
-            .iter()
-            .filter(|p| p.is_virtual)
-            .map(|p| {
-                let img = self.graphics.image(p.internal_id);
-                let cid = img.map_or(0, |i| i.client_id);
-                (p.internal_id, p.placement_id, cid)
-            })
-            .collect();
+        let mut virt_keys_stack = arrayvec::ArrayVec::<(u32, u32, u32), 64>::new();
+        let mut virt_keys_heap = Vec::new();
+        for p in self.graphics.raw_placements().iter().filter(|p| p.is_virtual) {
+            let cid = self.graphics.image(p.internal_id).map_or(0, |i| i.client_id);
+            if virt_keys_heap.is_empty() {
+                if virt_keys_stack.try_push((p.internal_id, p.placement_id, cid)).is_err() {
+                    virt_keys_heap.extend(virt_keys_stack.drain(..));
+                    virt_keys_heap.push((p.internal_id, p.placement_id, cid));
+                }
+            } else {
+                virt_keys_heap.push((p.internal_id, p.placement_id, cid));
+            }
+        }
+
+        let virt_keys: &[(u32, u32, u32)] = if virt_keys_heap.is_empty() {
+            &virt_keys_stack
+        } else {
+            &virt_keys_heap
+        };
 
         if virt_keys.is_empty() {
             return;
         }
 
-        let mut anchors: std::collections::HashMap<(u32, u32), (Line, Column)> =
-            std::collections::HashMap::new();
+        let mut anchors = arrayvec::ArrayVec::<((u32, u32), (Line, Column)), 64>::new();
+        let mut anchors_overflow = std::collections::HashMap::new();
 
         for cell in self.grid.display_iter() {
             if cell.c == '\u{10EEEE}' {
@@ -787,24 +795,35 @@ impl<T> Term<T> {
                     }
                 }
 
-                for &(int_id, pl_id, cid) in &virt_keys {
+                for &(int_id, pl_id, cid) in virt_keys {
                     if (placement_id == 0 || pl_id == 0 || pl_id == placement_id)
                         && cid == image_id
                     {
                         let point = cell.point;
-                        anchors
-                            .entry((int_id, pl_id))
-                            .and_modify(|p: &mut (Line, Column)| {
-                                p.0 = std::cmp::min(p.0, point.line);
-                                p.1 = std::cmp::min(p.1, point.column);
-                            })
-                            .or_insert((point.line, point.column));
+                        if let Some(entry) = anchors.iter_mut().find(|e| e.0 == (int_id, pl_id)) {
+                            entry.1 .0 = std::cmp::min(entry.1 .0, point.line);
+                            entry.1 .1 = std::cmp::min(entry.1 .1, point.column);
+                        } else if anchors
+                            .try_push(((int_id, pl_id), (point.line, point.column)))
+                            .is_err()
+                        {
+                            anchors_overflow
+                                .entry((int_id, pl_id))
+                                .and_modify(|p: &mut (Line, Column)| {
+                                    p.0 = std::cmp::min(p.0, point.line);
+                                    p.1 = std::cmp::min(p.1, point.column);
+                                })
+                                .or_insert((point.line, point.column));
+                        }
                     }
                 }
             }
         }
 
         for ((int_id, pl_id), (line, col)) in anchors {
+            self.graphics.update_virtual_parent_anchor(int_id, pl_id, Point::new(line, col));
+        }
+        for ((int_id, pl_id), (line, col)) in anchors_overflow {
             self.graphics.update_virtual_parent_anchor(int_id, pl_id, Point::new(line, col));
         }
     }

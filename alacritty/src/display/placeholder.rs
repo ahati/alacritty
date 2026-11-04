@@ -227,15 +227,38 @@ where
                 continue;
             }
 
+            let src_x = p.src.x.min(img.width) as f32;
+            let src_y = p.src.y.min(img.height) as f32;
+            let src_w = (if p.src.width == 0 { img.width } else { p.src.width })
+                .min(img.width.saturating_sub(p.src.x.min(img.width))) as f32;
+            let src_h = (if p.src.height == 0 { img.height } else { p.src.height })
+                .min(img.height.saturating_sub(p.src.y.min(img.height))) as f32;
+
+            if src_w <= 0. || src_h <= 0. {
+                continue;
+            }
+
+            let source_w = src_w.max(1.0);
+            let source_h = src_h.max(1.0);
+            let offset_x = p.offset_x as f32;
+            let offset_y = p.offset_y as f32;
+
             let total_cols = if p.columns > 0 {
                 p.columns as f32
+            } else if p.rows > 0 {
+                let height = cell_h * p.rows as f32 + offset_y;
+                (height * source_w / source_h / cell_w).ceil().max(1.0)
             } else {
-                ((img.width as f32) / cell_w).ceil().max(1.0)
+                ((source_w + offset_x) / cell_w).ceil().max(1.0)
             };
+
             let total_rows = if p.rows > 0 {
                 p.rows as f32
+            } else if p.columns > 0 {
+                let width = cell_w * p.columns as f32 + offset_x;
+                (width * source_h / source_w / cell_h).ceil().max(1.0)
             } else {
-                ((img.height as f32) / cell_h).ceil().max(1.0)
+                ((source_h + offset_y) / cell_h).ceil().max(1.0)
             };
 
             let box_w = total_cols * cell_w;
@@ -262,17 +285,6 @@ where
                     let x_off = (box_w - img_w * scale) / 2.0;
                     (x_off, 0.0, scale)
                 };
-
-            let src_x = p.src.x.min(img.width) as f32;
-            let src_y = p.src.y.min(img.height) as f32;
-            let src_w = (if p.src.width == 0 { img.width } else { p.src.width })
-                .min(img.width.saturating_sub(p.src.x.min(img.width))) as f32;
-            let src_h = (if p.src.height == 0 { img.height } else { p.src.height })
-                .min(img.height.saturating_sub(p.src.y.min(img.height))) as f32;
-
-            if src_w <= 0. || src_h <= 0. {
-                continue;
-            }
 
             let sub_x0 = x_offset + src_x * scale;
             let sub_x1 = sub_x0 + src_w * scale;
@@ -850,5 +862,126 @@ mod tests {
         // Clamped width ensures UVs do not exceed 1.0
         assert!(behind[0].uv[2] <= 1.0);
         assert!(behind[0].uv[3] <= 1.0);
+    }
+
+    #[test]
+    fn display_placeholder_quads_auto_columns_derived_from_rows() {
+        // Image 100x100, cell size 10x20, c=0, r=2.
+        // Derived columns = ceil(40px / 10px) = 4.
+        let size_info = SizeInfo::new(100.0, 100.0, 10.0, 20.0, 0.0, 0.0, true);
+        let image = Arc::new(alacritty_terminal::graphics::image::ImageData::new(
+            42,
+            0,
+            100,
+            100,
+            alacritty_terminal::graphics::image::PixelFormat::Rgba,
+            Arc::new([0u8; 100 * 100 * 4]),
+        ));
+
+        let placement = Placement {
+            internal_id: 1,
+            placement_id: 0,
+            anchor: Point::new(Line(0), Column(0)),
+            footprint: alacritty_terminal::graphics::placement::CellFootprint { columns: 4, rows: 2 },
+            offset_x: 0,
+            offset_y: 0,
+            columns: 0,
+            rows: 2,
+            src: alacritty_terminal::graphics::placement::SourceRect { x: 0, y: 0, width: 100, height: 100 },
+            z_index: 0,
+            is_virtual: true,
+            parent: None,
+            relative_offset: (0, 0),
+        };
+
+        // Diacritic for col 0 row 0 is \u{0305}\u{0305}
+        // Diacritic for col 3 row 1: col 3 is index 3, row 1 is index 1.
+        // ROWCOLUMN_DIACRITICS[3] is diacritic for col 3, ROWCOLUMN_DIACRITICS[1] for row 1.
+        let mut cells = vec![
+            make_placeholder_cell(0, 0, Color::Indexed(42), None, Some(vec!['\u{0305}', '\u{0305}'])),
+            make_placeholder_cell(
+                1,
+                3,
+                Color::Indexed(42),
+                None,
+                Some(vec![
+                    char::from_u32(ROWCOLUMN_DIACRITICS[1]).unwrap(),
+                    char::from_u32(ROWCOLUMN_DIACRITICS[3]).unwrap(),
+                ]),
+            ),
+        ];
+
+        let (behind, front) = build_placeholder_quads(
+            &mut cells,
+            &[(placement, image)],
+            &size_info,
+            |_p, _img| 1,
+        );
+
+        assert!(front.is_empty());
+        assert_eq!(behind.len(), 2);
+        // Tile (0, 0)
+        assert_eq!(behind[0].uv, [0.0, 0.0, 0.25, 0.5]);
+        // Tile (3, 1)
+        assert_eq!(behind[1].uv, [0.75, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn display_placeholder_quads_auto_rows_derived_from_columns() {
+        // Image 100x100, cell size 10x20, c=2, r=0.
+        // Derived rows = ceil(20px / 20px) = 1.
+        let size_info = SizeInfo::new(100.0, 100.0, 10.0, 20.0, 0.0, 0.0, true);
+        let image = Arc::new(alacritty_terminal::graphics::image::ImageData::new(
+            42,
+            0,
+            100,
+            100,
+            alacritty_terminal::graphics::image::PixelFormat::Rgba,
+            Arc::new([0u8; 100 * 100 * 4]),
+        ));
+
+        let placement = Placement {
+            internal_id: 1,
+            placement_id: 0,
+            anchor: Point::new(Line(0), Column(0)),
+            footprint: alacritty_terminal::graphics::placement::CellFootprint { columns: 2, rows: 1 },
+            offset_x: 0,
+            offset_y: 0,
+            columns: 2,
+            rows: 0,
+            src: alacritty_terminal::graphics::placement::SourceRect { x: 0, y: 0, width: 100, height: 100 },
+            z_index: 0,
+            is_virtual: true,
+            parent: None,
+            relative_offset: (0, 0),
+        };
+
+        let mut cells = vec![
+            make_placeholder_cell(0, 0, Color::Indexed(42), None, Some(vec!['\u{0305}', '\u{0305}'])),
+            make_placeholder_cell(
+                0,
+                1,
+                Color::Indexed(42),
+                None,
+                Some(vec![
+                    char::from_u32(ROWCOLUMN_DIACRITICS[0]).unwrap(),
+                    char::from_u32(ROWCOLUMN_DIACRITICS[1]).unwrap(),
+                ]),
+            ),
+        ];
+
+        let (behind, front) = build_placeholder_quads(
+            &mut cells,
+            &[(placement, image)],
+            &size_info,
+            |_p, _img| 1,
+        );
+
+        assert!(front.is_empty());
+        assert_eq!(behind.len(), 2);
+        // Tile (0, 0)
+        assert_eq!(behind[0].uv, [0.0, 0.0, 0.5, 1.0]);
+        // Tile (1, 0)
+        assert_eq!(behind[1].uv, [0.5, 0.0, 1.0, 1.0]);
     }
 }

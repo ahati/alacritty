@@ -476,13 +476,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let is_pixel_mouse = self.ctx.terminal().mode().contains(TermMode::SGR_PIXEL_MOUSE);
 
         // If the mouse hasn't changed cells (or pixels in pixel mouse mode), do nothing.
-        if !is_pixel_mouse
+        if (!is_pixel_mouse
             && !cell_changed
             && self.ctx.mouse().cell_side == cell_side
-            && self.ctx.mouse().inside_text_area == inside_text_area
+            && self.ctx.mouse().inside_text_area == inside_text_area)
+            || (is_pixel_mouse && !pixel_changed)
         {
-            return;
-        } else if is_pixel_mouse && !pixel_changed {
             return;
         }
 

@@ -16,7 +16,7 @@
 
 ## 1. Verdict
 
-**The Kitty 0.50.0 graphics protocol is fully implemented and verified compliant**, with
+**The Kitty 0.50.0 graphics protocol is implemented with documented deviations (§7)**, with
 all protocol features, actions, formats, relative placements, and Unicode placeholders complete
 and verified against Kitty 0.50.0 reference implementation.
 
@@ -258,6 +258,8 @@ Virtual parent anchors dynamically resolve and update relative children.
 - `display_placeholder_quads_truecolor_behind_text` (asserting 24-bit RGB foreground ID, underline placement ID, and behind-text layer placement)
 - `display_placeholder_quads_aspect_ratio_letterboxing` (asserting aspect ratio preserving fit and vertical centering)
 - `display_placeholder_quads_auto_dimensions_recalculated_on_cell_size_change` (asserting dynamic recalculation of auto dimensions when cell size changes)
+- `display_placeholder_quads_auto_columns_derived_from_rows` (asserting aspect-derived columns when c=0, r>0)
+- `display_placeholder_quads_auto_rows_derived_from_columns` (asserting aspect-derived rows when r=0, c>0)
 - `display_placeholder_quads_clamps_out_of_bounds_source_rect` (asserting source rectangle clamping against image dimensions)
 - `display_placeholder_strictly_matches_client_id_not_number` (asserting strict client ID resolution)
 - `rowcolumn_diacritic_indices` (asserting indices 0, 1, 2, 15, 255)
@@ -439,7 +441,7 @@ All identified implementation items and protocol gaps have been resolved and ver
 | 5 | `f=8`/`f=16` decode + palette + repaint | ✅ Complete | `indexed_color_formats_transmission_and_rejection`, `keys_separate_generations` |
 | 6 | `a=c` compose with spec defaults | ✅ Complete | `frame_composition_composes_rectangles`, `frame_composition_default_rectangle_uses_full_dimensions` |
 | 7 | Relative placements `P/Q/H/V` + error codes | ✅ Complete | `relative_placements_anchoring_and_error_handling`, `cascading_relative_placements_delete_transitively`, `relative_child_pruned_when_parent_scrolls_out`, `relative_child_with_q0_follows_named_parent_placement`, `relative_child_follows_moving_parent_within_scroll_margins` |
-| 8 | Unicode placeholders + virtual delete rules | ✅ Complete | `display_placeholder_quads_2x2_matrix_and_glyph_suppression`, `display_placeholder_quads_aspect_ratio_letterboxing`, `display_placeholder_quads_auto_dimensions_recalculated_on_cell_size_change`, `display_placeholder_quads_clamps_out_of_bounds_source_rect`, `display_placeholder_strictly_matches_client_id_not_number`, `relative_placement_anchored_to_virtual_parent_succeeds` |
+| 8 | Unicode placeholders + virtual delete rules | ✅ Complete | `display_placeholder_quads_2x2_matrix_and_glyph_suppression`, `display_placeholder_quads_aspect_ratio_letterboxing`, `display_placeholder_quads_auto_dimensions_recalculated_on_cell_size_change`, `display_placeholder_quads_auto_columns_derived_from_rows`, `display_placeholder_quads_auto_rows_derived_from_columns`, `display_placeholder_quads_clamps_out_of_bounds_source_rect`, `display_placeholder_strictly_matches_client_id_not_number`, `relative_placement_anchored_to_virtual_parent_succeeds` |
 | 9 | Margin clipping, SHM name policy, unsupported format replies | ✅ Complete | `relative_child_persists_across_parent_top_clip_scroll`, `unsupported_format_and_quiet_clamping` |
 | 10 | `CSI ? 1016` pixel mouse | ✅ Complete | `vte` Mode 1016 parser tests in `vte-forked`, sub-cell motion tests in `alacritty` |
 
