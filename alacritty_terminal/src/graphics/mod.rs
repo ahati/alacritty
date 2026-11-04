@@ -418,6 +418,12 @@ impl GraphicsStore {
         self.placements.sorted()
     }
 
+    /// View placements without sorting or allocating.
+    #[inline]
+    pub fn raw_placements(&self) -> &[Placement] {
+        self.placements.as_slice()
+    }
+
     /// Whether any virtual placement is currently stored.
     #[inline]
     pub fn has_virtual_placements(&self) -> bool {
@@ -1387,7 +1393,7 @@ impl GraphicsStore {
 
     /// Validate image data synchronously without storing it (`a=q`).
     fn validate(&mut self, command: &Command, source: Source) -> Result<(), GraphicsError> {
-        if command.has_feature_query {
+        if command.action == Action::Query && command.has_feature_query {
             return Ok(());
         }
 
@@ -1876,12 +1882,10 @@ impl GraphicsStore {
         if command.data_offset != 0 && is_trans_action {
             let _ = write!(response, ",O={}", command.data_offset);
         }
-        if command.format != Format::Rgba {
-            if is_t || is_big_t || is_q {
-                let _ = write!(response, ",f={}", command.format.code());
-            } else if is_f && (command.format == Format::Rgb || command.format == Format::Png) {
-                let _ = write!(response, ",f={}", command.format.code());
-            }
+        if command.format != Format::Rgba
+            && (is_t || is_big_t || is_q || (is_f && (command.format == Format::Rgb || command.format == Format::Png)))
+        {
+            let _ = write!(response, ",f={}", command.format.code());
         }
         if command.medium != Medium::Direct && is_trans_action {
             let _ = write!(response, ",t={}", match command.medium {
@@ -2144,7 +2148,7 @@ fn decode_payload(
 /// The reference makes both checks before it reads a file medium's file, so
 /// the checks belong here rather than after a decode.
 fn check_dimensions(command: &Command) -> Result<(), GraphicsError> {
-    if command.has_feature_query {
+    if command.action == Action::Query && command.has_feature_query {
         return Ok(());
     }
 

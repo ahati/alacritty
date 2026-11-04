@@ -227,8 +227,16 @@ where
                 continue;
             }
 
-            let total_cols = (if p.columns > 0 { p.columns } else { p.footprint.columns.max(1) }) as f32;
-            let total_rows = (if p.rows > 0 { p.rows } else { p.footprint.rows.max(1) }) as f32;
+            let total_cols = if p.columns > 0 {
+                p.columns as f32
+            } else {
+                ((img.width as f32) / cell_w).ceil().max(1.0)
+            };
+            let total_rows = if p.rows > 0 {
+                p.rows as f32
+            } else {
+                ((img.height as f32) / cell_h).ceil().max(1.0)
+            };
 
             let box_w = total_cols * cell_w;
             let box_h = total_rows * cell_h;
@@ -255,10 +263,16 @@ where
                     (x_off, 0.0, scale)
                 };
 
-            let src_x = p.src.x as f32;
-            let src_y = p.src.y as f32;
-            let src_w = (if p.src.width == 0 { img.width } else { p.src.width }) as f32;
-            let src_h = (if p.src.height == 0 { img.height } else { p.src.height }) as f32;
+            let src_x = p.src.x.min(img.width) as f32;
+            let src_y = p.src.y.min(img.height) as f32;
+            let src_w = (if p.src.width == 0 { img.width } else { p.src.width })
+                .min(img.width.saturating_sub(p.src.x.min(img.width))) as f32;
+            let src_h = (if p.src.height == 0 { img.height } else { p.src.height })
+                .min(img.height.saturating_sub(p.src.y.min(img.height))) as f32;
+
+            if src_w <= 0. || src_h <= 0. {
+                continue;
+            }
 
             let sub_x0 = x_offset + src_x * scale;
             let sub_x1 = sub_x0 + src_w * scale;
@@ -529,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn display_placeholder_quads_truecolor_and_negative_z_index() {
+    fn display_placeholder_quads_truecolor_behind_text() {
         let size_info = SizeInfo::new(100.0, 100.0, 10.0, 20.0, 0.0, 0.0, true);
         let fg = Color::Spec(VteRgb { r: 10, g: 20, b: 30 });
         let expected_image_id = (10 << 16) | (20 << 8) | 30;
@@ -738,5 +752,103 @@ mod tests {
         // Must NOT match on image.number (42 != client_id 99)
         assert!(behind.is_empty());
         assert!(front.is_empty());
+    }
+
+    #[test]
+    fn display_placeholder_quads_auto_dimensions_recalculated_on_cell_size_change() {
+        // Image is 50x100 pixels.
+        // Initially cell size is 10x20 => natural columns: ceil(50/10) = 5, rows: ceil(100/20) = 5.
+        // If font size changes so cell size becomes 25x25 => natural columns: ceil(50/25) = 2, rows: ceil(100/25) = 4.
+        let image = Arc::new(alacritty_terminal::graphics::image::ImageData::new(
+            42,
+            0,
+            50,
+            100,
+            alacritty_terminal::graphics::image::PixelFormat::Rgba,
+            Arc::new([0u8; 50 * 100 * 4]),
+        ));
+
+        let placement = Placement {
+            internal_id: 1,
+            placement_id: 0,
+            anchor: Point::new(Line(0), Column(0)),
+            footprint: alacritty_terminal::graphics::placement::CellFootprint { columns: 5, rows: 5 },
+            offset_x: 0,
+            offset_y: 0,
+            columns: 0,
+            rows: 0,
+            src: alacritty_terminal::graphics::placement::SourceRect { x: 0, y: 0, width: 50, height: 100 },
+            z_index: 0,
+            is_virtual: true,
+            parent: None,
+            relative_offset: (0, 0),
+        };
+
+        // Render with new cell size 25x25 (simulating font resize)
+        let resized_size_info = SizeInfo::new(200.0, 200.0, 25.0, 25.0, 0.0, 0.0, true);
+        let mut cells = vec![
+            make_placeholder_cell(0, 0, Color::Indexed(42), None, Some(vec!['\u{0305}', '\u{0305}'])),
+        ];
+
+        let (behind, front) = build_placeholder_quads(
+            &mut cells,
+            &[(placement, image)],
+            &resized_size_info,
+            |_p, _img| 1,
+        );
+
+        assert!(front.is_empty());
+        assert_eq!(behind.len(), 1);
+        // Destination box recalculated dynamically: 2 cols * 25px = 50px width; 4 rows * 25px = 100px height.
+        // Image fits 50x100 into 50x100 box with scale 1.0.
+        // Cell (0,0) covers 25x25 out of 50x100: u1 = 25/50 = 0.5, v1 = 25/100 = 0.25.
+        assert_eq!(behind[0].uv, [0.0, 0.0, 0.5, 0.25]);
+    }
+
+    #[test]
+    fn display_placeholder_quads_clamps_out_of_bounds_source_rect() {
+        let size_info = SizeInfo::new(100.0, 100.0, 10.0, 20.0, 0.0, 0.0, true);
+        let image = Arc::new(alacritty_terminal::graphics::image::ImageData::new(
+            42,
+            0,
+            20,
+            20,
+            alacritty_terminal::graphics::image::PixelFormat::Rgba,
+            Arc::new([0u8; 20 * 20 * 4]),
+        ));
+
+        // Placement specifies src with width=50, height=50 (exceeds image dimensions 20x20)
+        let placement = Placement {
+            internal_id: 1,
+            placement_id: 0,
+            anchor: Point::new(Line(0), Column(0)),
+            footprint: alacritty_terminal::graphics::placement::CellFootprint { columns: 2, rows: 1 },
+            offset_x: 0,
+            offset_y: 0,
+            columns: 2,
+            rows: 1,
+            src: alacritty_terminal::graphics::placement::SourceRect { x: 0, y: 0, width: 50, height: 50 },
+            z_index: 0,
+            is_virtual: true,
+            parent: None,
+            relative_offset: (0, 0),
+        };
+
+        let mut cells = vec![
+            make_placeholder_cell(0, 0, Color::Indexed(42), None, Some(vec!['\u{0305}', '\u{0305}'])),
+        ];
+
+        let (behind, front) = build_placeholder_quads(
+            &mut cells,
+            &[(placement, image)],
+            &size_info,
+            |_p, _img| 1,
+        );
+
+        assert!(front.is_empty());
+        assert_eq!(behind.len(), 1);
+        // Clamped width ensures UVs do not exceed 1.0
+        assert!(behind[0].uv[2] <= 1.0);
+        assert!(behind[0].uv[3] <= 1.0);
     }
 }

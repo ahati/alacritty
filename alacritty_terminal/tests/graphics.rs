@@ -2602,7 +2602,7 @@ fn feature_query_frame_echoes_rgb_and_png_but_omits_indexed() {
 }
 
 #[test]
-fn relative_child_clipped_at_scroll_margins() {
+fn relative_child_persists_across_parent_top_clip_scroll() {
     let (mut term, _recorder) = terminal();
     let mut parser = Processor::new();
     let pixel_b64 = BASE64.encode(&vec![255u8; 100 * 100 * 4]);

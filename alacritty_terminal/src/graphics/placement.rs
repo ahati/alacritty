@@ -445,6 +445,12 @@ impl PlacementStore {
         self.placements.iter().any(|p| p.is_virtual)
     }
 
+    /// View placements without sorting or allocating.
+    #[inline]
+    pub fn as_slice(&self) -> &[Placement] {
+        &self.placements
+    }
+
     /// Placements ordered back to front, matching the protocol's tie-breaking
     /// rules.
     pub fn sorted(&self) -> Vec<&Placement> {

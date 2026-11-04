@@ -30,7 +30,7 @@ requirements are fully met and covered with automated test suites.
 | Is the common client surface covered? | **Yes** — `kitten icat`, `chafa`, `timg`, `viuer`, `yazi`, and graphical environments work (`f=8/16/24/32/100`, `a=T`, `a=p`, `a=d`, `a=q`, `a=c`, `o=z`, chunking, `i/I/p`, `c/r`, `X/Y`, `z`, `C`, `e`, `P/Q/H/V`, `U=1`). |
 | Is the whole 0.50.0 protocol implemented? | **Yes** — `f=8`/`f=16` indexed formats with special palette indices 248–254, `e` feature query, `a=c` compose, `P/Q/H/V` relative placements with cycle/depth checks and transitive cascading deletes, `U=1` Unicode placeholders with diacritic inheritance, Mode 1016 pixel mouse tracking with sub-cell motion reporting. |
 | Are there correctness bugs? | **Resolved** — Synchronous query reply preceding DA1, alt‑screen clearing on entry, chunk abort, virtual placement protection, SHM names without leading slash, DECSTBM margin clipping, BEL (`0x07`) APC termination, query quiet modes all fixed and verified. |
-| Does it implement more than upstream Alacritty? | **Yes** — 100% Kitty 0.50.0 graphics protocol conformance. |
+| Does it implement more than upstream Alacritty? | **Yes** — Full Kitty 0.50.0 graphics protocol implementation (with documented architectural deviations in §7). |
 
 ---
 
@@ -248,13 +248,18 @@ Virtual placements are immune to physical deletes (`a/A/c/C/p/P/q/Q/x/X/y/Y/z/Z`
 `alacritty/src/display/mod.rs`, and `alacritty_terminal/src/term/mod.rs:sync_virtual_placements`.
 The official 297-entry `ROWCOLUMN_DIACRITICS` constant powers `O(log N)` binary search.
 `placeholder::build_placeholder_quads` decodes cells before glyph suppression, performs
-aspect-ratio-preserved letterboxing matching Kitty reference `grman_put_cell_image`, and routes
-quads into behind-text or in-front layers. Virtual parent anchors dynamically resolve and update relative children.
+aspect-ratio-preserved letterboxing matching Kitty reference `grman_put_cell_image`, dynamically computes
+auto `c/r` dimensions at render time from current cell dimensions, clamps source rectangles to image bounds,
+and routes quads into the behind-text layer (drawn before text rendering, subject to the documented single background layer deviation in §7).
+Virtual parent anchors dynamically resolve and update relative children.
 
 **Verification:** Covered by display-level and unit tests in `alacritty/src/display/placeholder.rs`:
 - `display_placeholder_quads_2x2_matrix_and_glyph_suppression` (asserting 2×2 spec matrix, exact UVs, texture binding, and glyph suppression to space)
-- `display_placeholder_quads_truecolor_and_negative_z_index` (asserting 24-bit RGB foreground ID, underline placement ID, and negative z-index)
+- `display_placeholder_quads_truecolor_behind_text` (asserting 24-bit RGB foreground ID, underline placement ID, and behind-text layer placement)
 - `display_placeholder_quads_aspect_ratio_letterboxing` (asserting aspect ratio preserving fit and vertical centering)
+- `display_placeholder_quads_auto_dimensions_recalculated_on_cell_size_change` (asserting dynamic recalculation of auto dimensions when cell size changes)
+- `display_placeholder_quads_clamps_out_of_bounds_source_rect` (asserting source rectangle clamping against image dimensions)
+- `display_placeholder_strictly_matches_client_id_not_number` (asserting strict client ID resolution)
 - `rowcolumn_diacritic_indices` (asserting indices 0, 1, 2, 15, 255)
 - `decode_palette_indexed_foreground_and_default_underline` (`38;5;42` example from spec)
 - `decode_truecolor_foreground_and_indexed_underline`
@@ -399,10 +404,13 @@ Not protocol gaps, but worth knowing:
 These are already called out in the repo and are consequences of Alacritty's
 design, not oversights:
 
-1. **Plain negative `z` is not distinguished from `z < INT32_MIN/2`.** Alacritty
-   draws cell backgrounds and glyphs in one pass, so an image can sit behind both
-   or in front of both, but not between them
-   (`alacritty/src/display/mod.rs:894`).
+1. **Plain negative `z` and Kitty cell-image `z = -1` are not distinguished from `z < INT32_MIN/2`.**
+   Alacritty draws cell backgrounds and glyphs in one combined pass (`draw_runs`). Negative z-index
+   images and cell-image placeholders are drawn in the behind-text pass before `draw_runs`.
+   Consequently, an image sits behind both text glyphs and cell backgrounds, or in front of both, but
+   cannot sit between cell backgrounds and glyphs. If a placeholder cell has a non-default background
+   color, that background paints over the image. In Kitty, cell images sit above cell backgrounds and
+   below text glyphs.
 2. **`f=100` + `o=z` is inflated under the terminal lock**, because the PNG
    header is needed to anchor the placement before the decode runs off‑lock.
 3. **Decoding is single‑threaded** and intentionally backpressures the PTY reader;
@@ -420,7 +428,7 @@ design, not oversights:
 
 ## 8. Resolution and verification status
 
-All identified implementation items and protocol gaps have been implemented and verified with automated tests:
+All identified implementation items and protocol gaps have been resolved and verified with automated tests (with documented architectural deviations noted in §7):
 
 | Priority | Item | Status | Verification tests |
 |---|---|---|---|
@@ -431,8 +439,8 @@ All identified implementation items and protocol gaps have been implemented and 
 | 5 | `f=8`/`f=16` decode + palette + repaint | ✅ Complete | `indexed_color_formats_transmission_and_rejection`, `keys_separate_generations` |
 | 6 | `a=c` compose with spec defaults | ✅ Complete | `frame_composition_composes_rectangles`, `frame_composition_default_rectangle_uses_full_dimensions` |
 | 7 | Relative placements `P/Q/H/V` + error codes | ✅ Complete | `relative_placements_anchoring_and_error_handling`, `cascading_relative_placements_delete_transitively`, `relative_child_pruned_when_parent_scrolls_out`, `relative_child_with_q0_follows_named_parent_placement`, `relative_child_follows_moving_parent_within_scroll_margins` |
-| 8 | Unicode placeholders + virtual delete rules | ✅ Complete | `display_placeholder_quads_2x2_matrix_and_glyph_suppression`, `display_placeholder_quads_aspect_ratio_letterboxing`, `display_placeholder_quads_auto_dimensions_uses_footprint`, `display_placeholder_strictly_matches_client_id_not_number`, `relative_placement_anchored_to_virtual_parent_succeeds` |
-| 9 | Margin clipping, SHM name policy, unsupported format replies | ✅ Complete | `relative_child_clipped_at_scroll_margins`, `unsupported_format_and_quiet_clamping` |
+| 8 | Unicode placeholders + virtual delete rules | ✅ Complete | `display_placeholder_quads_2x2_matrix_and_glyph_suppression`, `display_placeholder_quads_aspect_ratio_letterboxing`, `display_placeholder_quads_auto_dimensions_recalculated_on_cell_size_change`, `display_placeholder_quads_clamps_out_of_bounds_source_rect`, `display_placeholder_strictly_matches_client_id_not_number`, `relative_placement_anchored_to_virtual_parent_succeeds` |
+| 9 | Margin clipping, SHM name policy, unsupported format replies | ✅ Complete | `relative_child_persists_across_parent_top_clip_scroll`, `unsupported_format_and_quiet_clamping` |
 | 10 | `CSI ? 1016` pixel mouse | ✅ Complete | `vte` Mode 1016 parser tests in `vte-forked`, sub-cell motion tests in `alacritty` |
 
 ---

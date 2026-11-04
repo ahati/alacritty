@@ -729,7 +729,7 @@ impl<T> Term<T> {
 
         let virt_keys: Vec<(u32, u32, u32)> = self
             .graphics
-            .placements()
+            .raw_placements()
             .iter()
             .filter(|p| p.is_virtual)
             .map(|p| {
