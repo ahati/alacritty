@@ -63,6 +63,7 @@ pub fn collect(
     store: &GraphicsStore,
     size_info: &SizeInfo,
     display_offset: usize,
+    palette_hash: u64,
 ) -> Vec<RenderableImage> {
     let mut images = Vec::new();
 
@@ -83,7 +84,7 @@ pub fn collect(
             continue;
         }
 
-        let Some(rendered) = resolve(placement, image, display_offset, size_info) else {
+        let Some(rendered) = resolve(placement, image, display_offset, size_info, palette_hash) else {
             continue;
         };
 
@@ -103,6 +104,7 @@ fn resolve(
     image: &Arc<ImageData>,
     display_offset: usize,
     size_info: &SizeInfo,
+    palette_hash: u64,
 ) -> Option<RenderableImage> {
     let cell_width = size_info.cell_width();
     let cell_height = size_info.cell_height();
@@ -158,9 +160,17 @@ fn resolve(
         (source_y + source_height) as f32 / image_height,
     ];
 
+    let key = if image.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
+        || image.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
+    {
+        image_key(placement.internal_id, image.generation ^ palette_hash)
+    } else {
+        image_key(placement.internal_id, image.generation)
+    };
+
     Some(RenderableImage {
         image: Arc::clone(image),
-        key: image_key(placement.internal_id, image.generation),
+        key,
         x,
         y,
         width,

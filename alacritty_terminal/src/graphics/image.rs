@@ -34,12 +34,18 @@ pub enum PixelFormat {
     Rgb,
     /// Red, green, blue and straight alpha.
     Rgba,
+    /// One byte per pixel, palette index.
+    Indexed,
+    /// Two bytes per pixel, palette index and straight alpha.
+    IndexedAlpha,
 }
 
 impl PixelFormat {
     /// Number of bytes one pixel occupies in this layout.
     pub const fn channels(self) -> usize {
         match self {
+            Self::Indexed => 1,
+            Self::IndexedAlpha => 2,
             Self::Rgb => RGB_CHANNELS,
             Self::Rgba => RGBA_CHANNELS,
         }
@@ -825,7 +831,9 @@ pub fn decode(
 ) -> Result<Decoded, GraphicsError> {
     match format {
         Format::Png => decode_png(data, max_dimension),
-        Format::Rgb | Format::Rgba => decode_raw(format, data, width, height, max_dimension),
+        Format::Rgb | Format::Rgba | Format::Indexed | Format::IndexedAlpha => {
+            decode_raw(format, data, width, height, max_dimension)
+        },
     }
 }
 
@@ -869,6 +877,8 @@ fn decode_raw(
     let format = match format {
         Format::Rgb => PixelFormat::Rgb,
         Format::Rgba => PixelFormat::Rgba,
+        Format::Indexed => PixelFormat::Indexed,
+        Format::IndexedAlpha => PixelFormat::IndexedAlpha,
         Format::Png => return Err(GraphicsError::Invalid),
     };
 

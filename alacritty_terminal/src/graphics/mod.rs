@@ -152,6 +152,10 @@ pub enum GraphicsError {
     Unsupported,
     /// A referenced parent image does not exist.
     NoParent,
+    /// A relative placement introduces a cycle in the parent chain.
+    Cycle,
+    /// A relative placement chain exceeds the maximum depth of 8.
+    TooDeep,
     /// An animation frame was named that the image does not have.
     FrameMissing(u32),
     /// An animation frame is larger than the image it belongs to.
@@ -177,6 +181,8 @@ impl GraphicsError {
             Self::InflationSize => "EINVAL",
             Self::Unsupported => "EUNSUPPORTED",
             Self::NoParent => "ENOPARENT",
+            Self::Cycle => "ECYCLE",
+            Self::TooDeep => "ETOODEEP",
             Self::FrameMissing(_) => "EINVAL",
             Self::FrameTooLarge => "EINVAL",
         }
@@ -200,6 +206,8 @@ impl GraphicsError {
             Self::InflationSize => "Image data size post inflation does not match expected size",
             Self::Unsupported => "unsupported command",
             Self::NoParent => "parent image not found",
+            Self::Cycle => "cycle in placement parent chain",
+            Self::TooDeep => "relative placement chain too deep",
             Self::FrameMissing(_frame) => "no frame with that number",
             Self::FrameTooLarge => "frame larger than image",
         }
@@ -470,6 +478,29 @@ impl GraphicsStore {
             };
         }
 
+        // A query is evaluated immediately without interrupting an in-flight transfer.
+        if command.action == Action::Query {
+            let mut query_transfer = Transfer::new(command);
+            query_transfer.chars = mem::take(&mut self.chars);
+            let command = query_transfer.command.clone();
+
+            return match query_transfer.finish() {
+                Ok(payload) => self.dispatch(&command, payload, cursor),
+                Err(error) => self.failure(&command, error),
+            };
+        }
+
+        if let Some(existing) = self.transfer.as_ref() {
+            let is_continuation = command.delete.is_none()
+                && command.action != Action::Delete
+                && command.action != Action::Put
+                && (command.image_id == 0 || command.image_id == existing.command.image_id);
+
+            if !is_continuation {
+                self.transfer = None;
+            }
+        }
+
         let mut transfer = match self.transfer.take() {
             Some(mut transfer) => {
                 // A continuation chunk carries only `m` and `q`. A chunk that
@@ -539,6 +570,11 @@ impl GraphicsStore {
         }
     }
 
+    /// Whether an in-flight chunked transfer is pending.
+    pub fn has_pending_transfer(&self) -> bool {
+        self.transfer.is_some()
+    }
+
     /// Remove every image and placement.
     pub fn clear(&mut self) {
         self.images.clear();
@@ -601,11 +637,15 @@ impl GraphicsStore {
             Ok(decoded) => {
                 // A query stores nothing, so it can never change the screen. For a
                 // transmission, the image may have been evicted or deleted while
-                // the decode ran; its pixels are then dropped and the
-                // transmission counts as having changed nothing, exactly as an
-                // eviction does.
+                // the decode ran; its pixels are then dropped and no success reply
+                // is sent for an image that no longer exists.
                 let changed = match internal_id {
-                    Some(internal_id) => self.images.complete(internal_id, decoded),
+                    Some(internal_id) => {
+                        if !self.images.complete(internal_id, decoded) {
+                            return GraphicsUpdate::default();
+                        }
+                        true
+                    },
                     None => false,
                 };
 
@@ -626,6 +666,10 @@ impl GraphicsStore {
 
     /// Carry out a parsed command.
     fn dispatch(&mut self, command: &Command, data: Vec<u8>, cursor: Point) -> GraphicsUpdate {
+        if command.unsupported_format {
+            return self.failure(command, GraphicsError::Invalid);
+        }
+
         // The identifier and the number are two different addressing schemes,
         // and the reference rejects a command that mixes them.
         if command.image_id != 0 && command.image_number != 0 {
@@ -638,13 +682,13 @@ impl GraphicsStore {
         // is well formed, as the reference does.
         let source = match command.medium {
             Medium::Direct => Source::Inline(data),
-            Medium::File | Medium::TempFile if command.action.is_deferred() => {
+            Medium::File | Medium::TempFile if command.action.is_deferred() || command.action == Action::Query => {
                 match file::FileSource::new(command, &data) {
                     Ok(source) => Source::File(source),
                     Err(error) => return self.failure(command, error),
                 }
             },
-            Medium::SharedMemory if command.action.is_deferred() => {
+            Medium::SharedMemory if command.action.is_deferred() || command.action == Action::Query => {
                 match file::SharedMemorySource::new(command, &data) {
                     Ok(source) => Source::SharedMemory(source),
                     Err(error) => return self.failure(command, error),
@@ -658,8 +702,12 @@ impl GraphicsStore {
             Action::TransmitAndDisplay => match self.transmit(command, source, cursor) {
                 // A file medium cannot be reserved until its file has been read,
                 // so its placement is added once the decode has landed.
-                Ok(Some(internal_id)) => {
-                    self.place(command, internal_id, cursor).map(|advance| (true, advance))
+                Ok(Some(internal_id)) => match self.place(command, internal_id, cursor) {
+                    Ok(advance) => Ok((true, advance)),
+                    Err(error) => {
+                        self.images.remove(internal_id);
+                        Err(error)
+                    },
                 },
                 Ok(None) => Ok((true, None)),
                 Err(error) => Err(error),
@@ -687,7 +735,7 @@ impl GraphicsStore {
             Action::Frame => self.transmit_frame(command, source).map(|()| (false, None)),
             // An animation control replies for itself: success stays silent.
             Action::Animate => return self.animate(command),
-            Action::Compose => Err(GraphicsError::Unsupported),
+            Action::Compose => self.compose(command).map(|changed| (changed, None)),
         };
 
         match outcome {
@@ -867,6 +915,16 @@ impl GraphicsStore {
             return Err(GraphicsError::Invalid);
         }
 
+        if command.format == Format::Indexed || command.format == Format::IndexedAlpha {
+            return Err(GraphicsError::Invalid);
+        }
+
+        if let Some(img) = self.images.get(internal_id) {
+            if img.format == image::PixelFormat::Indexed || img.format == image::PixelFormat::IndexedAlpha {
+                return Err(GraphicsError::Invalid);
+            }
+        }
+
         check_dimensions(command)?;
 
         // A raw patch must name its own size, and it has to sit inside the
@@ -921,6 +979,99 @@ impl GraphicsStore {
         });
 
         Ok(())
+    }
+
+    /// Compose a rectangle from one frame onto another (`a=c`).
+    fn compose(&mut self, command: &Command) -> Result<bool, GraphicsError> {
+        let Some(internal_id) = self.images.resolve(command.image_id, command.image_number) else {
+            return Err(GraphicsError::NotFound);
+        };
+
+        let Some(image) = self.images.get(internal_id) else {
+            return Err(GraphicsError::NotFound);
+        };
+
+        if !image.is_ready() {
+            return Err(GraphicsError::Invalid);
+        }
+
+        if image.format == image::PixelFormat::Indexed || image.format == image::PixelFormat::IndexedAlpha {
+            return Err(GraphicsError::Invalid);
+        }
+
+        let width = image.width;
+        let height = image.height;
+        let channels = image.format.channels();
+
+        // 1-based frame numbers: r is source, c is destination (default 1)
+        let src_frame_num = if command.rows == 0 { 1 } else { command.rows };
+        let dst_frame_num = if command.columns == 0 { 1 } else { command.columns };
+
+        let src_idx = (src_frame_num as usize).checked_sub(1).ok_or(GraphicsError::Invalid)?;
+        let dst_idx = (dst_frame_num as usize).checked_sub(1).ok_or(GraphicsError::Invalid)?;
+
+        let frames = image.frames();
+        if src_idx >= frames.len() || dst_idx >= frames.len() {
+            return Err(GraphicsError::NotFound);
+        }
+
+        let w = command.src_width;
+        let h = command.src_height;
+        if w == 0 || h == 0 {
+            return Err(GraphicsError::Invalid);
+        }
+
+        let src_x = command.cell_offset_x;
+        let src_y = command.cell_offset_y;
+        let dst_x = command.src_x;
+        let dst_y = command.src_y;
+
+        if src_x.saturating_add(w) > width || src_y.saturating_add(h) > height {
+            return Err(GraphicsError::Invalid);
+        }
+        if dst_x.saturating_add(w) > width || dst_y.saturating_add(h) > height {
+            return Err(GraphicsError::Invalid);
+        }
+
+        // On same frame, overlapping rectangles are invalid
+        if src_idx == dst_idx {
+            let x_overlap = src_x < dst_x + w && src_x + w > dst_x;
+            let y_overlap = src_y < dst_y + h && src_y + h > dst_y;
+            if x_overlap && y_overlap {
+                return Err(GraphicsError::Invalid);
+            }
+        }
+
+        let blend = if command.cursor_movement == CursorMovement::Stay {
+            FrameBlend::Overwrite
+        } else {
+            FrameBlend::Alpha
+        };
+
+        // Extract source patch
+        let mut patch = Vec::with_capacity((w as usize) * (h as usize) * channels);
+        let src_pixels = &frames[src_idx].pixels;
+        for row in 0..h {
+            let y = (src_y + row) as usize;
+            let start = (y * (width as usize) + src_x as usize) * channels;
+            let end = start + (w as usize) * channels;
+            patch.extend_from_slice(&src_pixels[start..end]);
+        }
+
+        // Blit patch onto destination frame
+        let mut dst_pixels = frames[dst_idx].pixels.to_vec();
+        blend_patch(
+            &mut dst_pixels,
+            (width, height),
+            &patch,
+            (w, h),
+            (channels, dst_x, dst_y),
+            blend,
+            channels,
+        );
+
+        let changed = self.images.replace_frame(internal_id, dst_idx as u16, dst_pixels.into());
+        Ok(changed)
     }
 
     /// Control an animation (`a=a`).
@@ -1155,20 +1306,23 @@ impl GraphicsStore {
         Some(response)
     }
 
-    /// Queue a validation of image data that is not stored (`a=q`).
+    /// Validate image data synchronously without storing it (`a=q`).
     fn validate(&mut self, command: &Command, source: Source) -> Result<(), GraphicsError> {
         check_dimensions(command)?;
 
-        self.jobs.push(DecodeJob {
-            internal_id: None,
-            command: command.clone(),
-            source,
-            limit: decompression_limit(command, &self.config),
-            max_dimension: self.config.max_image_dimension,
-            allow_network_paths: self.config.allow_network_paths,
-            pending: None,
-            frame: None,
-        });
+        let max_to_read = max_read_size(command);
+        let limit = decompression_limit(command, &self.config);
+        let max_dimension = self.config.max_image_dimension;
+
+        let data = match source {
+            Source::Inline(data) => data,
+            Source::SharedMemory(source) => file::read_shm(&source, max_to_read)?,
+            Source::File(file) => file::read(&file, max_to_read, self.config.allow_network_paths)?,
+        };
+
+        if !data.is_empty() || command.source_width > 0 || command.source_height > 0 {
+            decode_payload(command, data, limit, max_dimension)?;
+        }
 
         Ok(())
     }
@@ -1246,10 +1400,59 @@ impl GraphicsStore {
         };
 
         let footprint = resolve_footprint(command, source, self.cell_size);
+
+        let (parent, anchor) = if command.parent_image_id != 0 {
+            if command.virtual_placement {
+                return Err(GraphicsError::Invalid);
+            }
+            let parent_internal = self
+                .images
+                .resolve(command.parent_image_id, 0)
+                .or_else(|| self.images.resolve(0, command.parent_image_id))
+                .ok_or(GraphicsError::NoParent)?;
+
+            let parent_p = self
+                .placements
+                .find(parent_internal, command.parent_placement_id)
+                .ok_or(GraphicsError::NoParent)?;
+
+            let this_id = (internal_id, command.placement_id);
+            if (parent_p.internal_id, parent_p.placement_id) == this_id {
+                return Err(GraphicsError::Cycle);
+            }
+
+            let mut depth = 1;
+            let mut curr = parent_p.parent;
+            while let Some((pid, plid)) = curr {
+                depth += 1;
+                if depth > 8 {
+                    return Err(GraphicsError::TooDeep);
+                }
+                if (pid, plid) == this_id {
+                    return Err(GraphicsError::Cycle);
+                }
+                if let Some(next_p) = self.placements.find(pid, plid) {
+                    curr = next_p.parent;
+                } else {
+                    break;
+                }
+            }
+
+            let anchor_line = Line(parent_p.anchor.line.0 + command.parent_offset_y);
+            let anchor_col =
+                crate::index::Column((parent_p.anchor.column.0 as i32 + command.parent_offset_x).max(0) as usize);
+            (
+                Some((parent_internal, command.parent_placement_id)),
+                Point::new(anchor_line, anchor_col),
+            )
+        } else {
+            (None, cursor)
+        };
+
         let placement = Placement {
             internal_id,
             placement_id: command.placement_id,
-            anchor: cursor,
+            anchor,
             footprint,
             offset_x: clamp_to_u16(command.cell_offset_x),
             offset_y: clamp_to_u16(command.cell_offset_y),
@@ -1260,9 +1463,14 @@ impl GraphicsStore {
             src: source,
             z_index: command.z_index,
             is_virtual: command.virtual_placement,
+            parent,
+            relative_offset: (command.parent_offset_x, command.parent_offset_y),
         };
 
-        let advance = if command.cursor_movement == CursorMovement::Move && !placement.is_virtual {
+        let advance = if command.parent_image_id == 0
+            && command.cursor_movement == CursorMovement::Move
+            && !placement.is_virtual
+        {
             Some(placement.footprint)
         } else {
             None
@@ -1294,7 +1502,7 @@ impl GraphicsStore {
 
         match selector.to_ascii_lowercase() {
             // Everything on the screen; scrollback placements survive.
-            b'a' => self.placements.retain_scrollback(),
+            b'a' => self.placements.delete_all_visible(),
             // Everything belonging to one image, optionally one placement.
             b'i' | b'n' => match internal {
                 Some(internal_id) => {
@@ -1396,7 +1604,7 @@ impl GraphicsStore {
         let matching: Vec<(u32, u32)> = self
             .placements
             .iter()
-            .filter(|placement| placement.z_index == z_index && placement.contains(point))
+            .filter(|placement| !placement.is_virtual && placement.z_index == z_index && placement.contains(point))
             .map(|placement| (placement.internal_id, placement.placement_id))
             .collect();
 
@@ -1456,11 +1664,12 @@ impl GraphicsStore {
 
     /// Build a successful response.
     fn success(&self, command: &Command, changed: bool) -> GraphicsUpdate {
-        GraphicsUpdate {
-            response: if command.suppresses_ok() { None } else { self.response(command, "OK") },
-            changed,
-            cursor_advance: None,
-        }
+        let response = if command.suppresses_ok() && command.feature_query.is_none() {
+            None
+        } else {
+            self.response(command, "OK")
+        };
+        GraphicsUpdate { response, changed, cursor_advance: None }
     }
 
     /// Build a failure response.
@@ -1495,12 +1704,113 @@ impl GraphicsStore {
         }
         if command.placement_id != 0 {
             let _ = write!(response, "{separator}p={}", command.placement_id);
+            separator = ",";
         }
+
+        if command.action == Action::Query {
+            if let Some(queried_action) = command.feature_query {
+                self.format_feature_query_echo(&mut response, &mut separator, command, queried_action);
+            }
+        }
+
         response.push(';');
         response.push_str(body);
         response.push_str("\x1b\\");
 
         Some(response)
+    }
+
+    fn format_feature_query_echo(
+        &self,
+        response: &mut String,
+        separator: &mut &str,
+        command: &Command,
+        queried_action: Action,
+    ) {
+        let _ = write!(response, "{separator}e={}", queried_action.as_char());
+        *separator = ",";
+
+        let is_t = queried_action == Action::Transmit;
+        let is_big_t = queried_action == Action::TransmitAndDisplay;
+        let is_p = queried_action == Action::Put;
+        let is_d = queried_action == Action::Delete;
+        let is_f = queried_action == Action::Frame;
+        let is_a = queried_action == Action::Animate;
+        let is_c = queried_action == Action::Compose;
+
+        if let Some(del) = command.delete {
+            if is_d {
+                let _ = write!(response, ",d={}", del as char);
+            }
+        }
+        if command.cursor_movement == CursorMovement::Stay && (is_big_t || is_p || is_c) {
+            response.push_str(",C=1");
+        }
+        if command.virtual_placement && (is_big_t || is_p) {
+            response.push_str(",U=1");
+        }
+        if command.columns != 0 && (is_big_t || is_p || is_f || is_c || is_a) {
+            let _ = write!(response, ",c={}", command.columns);
+        }
+        if command.rows != 0 && (is_big_t || is_p || is_f || is_a || is_c) {
+            let _ = write!(response, ",r={}", command.rows);
+        }
+        if command.z_index != 0 && (is_big_t || is_p || is_d || is_f || is_a) {
+            let _ = write!(response, ",z={}", command.z_index);
+        }
+        if command.cell_offset_x != 0 && (is_big_t || is_p || is_f || is_c) {
+            let _ = write!(response, ",X={}", command.cell_offset_x);
+        }
+        if command.cell_offset_y != 0 && (is_big_t || is_p || is_f || is_c) {
+            let _ = write!(response, ",Y={}", command.cell_offset_y);
+        }
+        if command.src_x != 0 && (is_big_t || is_p || is_d || is_f || is_c) {
+            let _ = write!(response, ",x={}", command.src_x);
+        }
+        if command.src_y != 0 && (is_big_t || is_p || is_d || is_f || is_c) {
+            let _ = write!(response, ",y={}", command.src_y);
+        }
+        if command.src_width != 0 && (is_big_t || is_p || is_f || is_c) {
+            let _ = write!(response, ",w={}", command.src_width);
+        }
+        if command.src_height != 0 && (is_big_t || is_p || is_f || is_c) {
+            let _ = write!(response, ",h={}", command.src_height);
+        }
+        if command.source_width != 0 && (is_t || is_big_t || is_f || is_a) {
+            let _ = write!(response, ",s={}", command.source_width);
+        }
+        if command.source_height != 0 && (is_t || is_big_t || is_f || is_a) {
+            let _ = write!(response, ",v={}", command.source_height);
+        }
+        if command.format != Format::Rgba && (is_t || is_big_t || is_f) {
+            let _ = write!(response, ",f={}", command.format.code());
+        }
+        if command.medium != Medium::Direct && (is_t || is_big_t || is_f) {
+            let _ = write!(response, ",t={}", match command.medium {
+                Medium::File => 'f',
+                Medium::TempFile => 't',
+                Medium::SharedMemory => 's',
+                Medium::Direct => 'd',
+            });
+        }
+        if command.compression.is_some() && (is_t || is_big_t || is_f) {
+            response.push_str(",o=z");
+        }
+        if command.transient && (is_t || is_big_t) {
+            response.push_str(",N=1");
+        }
+        if command.parent_image_id != 0 && (is_big_t || is_p) {
+            let _ = write!(response, ",P={}", command.parent_image_id);
+        }
+        if command.parent_placement_id != 0 && (is_big_t || is_p) {
+            let _ = write!(response, ",Q={}", command.parent_placement_id);
+        }
+        if command.parent_offset_x != 0 && (is_big_t || is_p) {
+            let _ = write!(response, ",H={}", command.parent_offset_x);
+        }
+        if command.parent_offset_y != 0 && (is_big_t || is_p) {
+            let _ = write!(response, ",V={}", command.parent_offset_y);
+        }
     }
 }
 
@@ -1736,6 +2046,10 @@ fn decode_payload(
 /// The reference makes both checks before it reads a file medium's file, so
 /// the checks belong here rather than after a decode.
 fn check_dimensions(command: &Command) -> Result<(), GraphicsError> {
+    if command.feature_query.is_some() {
+        return Ok(());
+    }
+
     if command.format != Format::Png && (command.source_width == 0 || command.source_height == 0) {
         return Err(GraphicsError::ZeroDimensions);
     }

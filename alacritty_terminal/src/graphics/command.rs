@@ -65,8 +65,11 @@ const KEY_PARENT_PLACEMENT: u8 = b'Q';
 const KEY_TRANSIENT: u8 = b'N';
 const KEY_PARENT_OFFSET_X: u8 = b'H';
 const KEY_PARENT_OFFSET_Y: u8 = b'V';
+const KEY_FEATURE_QUERY: u8 = b'e';
 
 // Numeric key values.
+const FORMAT_INDEXED: u32 = 8;
+const FORMAT_INDEXED_ALPHA: u32 = 16;
 const FORMAT_RGB: u32 = 24;
 const FORMAT_RGBA: u32 = 32;
 const FORMAT_PNG: u32 = 100;
@@ -134,8 +137,21 @@ impl Action {
     /// payload is acceptable is only known once that payload has been decoded.
     pub const fn is_deferred(self) -> bool {
         match self {
-            Self::Transmit | Self::TransmitAndDisplay | Self::Query | Self::Frame => true,
-            Self::Put | Self::Delete | Self::Animate | Self::Compose => false,
+            Self::Transmit | Self::TransmitAndDisplay | Self::Frame => true,
+            Self::Query | Self::Put | Self::Delete | Self::Animate | Self::Compose => false,
+        }
+    }
+
+    pub const fn as_char(self) -> char {
+        match self {
+            Self::Transmit => 't',
+            Self::TransmitAndDisplay => 'T',
+            Self::Put => 'p',
+            Self::Delete => 'd',
+            Self::Query => 'q',
+            Self::Frame => 'f',
+            Self::Animate => 'a',
+            Self::Compose => 'c',
         }
     }
 
@@ -164,6 +180,10 @@ pub enum Format {
     Rgba,
     /// A PNG stream.
     Png,
+    /// One byte per pixel, palette index.
+    Indexed,
+    /// Two bytes per pixel, palette index and straight alpha.
+    IndexedAlpha,
 }
 
 impl Format {
@@ -172,6 +192,8 @@ impl Format {
             FORMAT_RGB => Ok(Self::Rgb),
             FORMAT_RGBA => Ok(Self::Rgba),
             FORMAT_PNG => Ok(Self::Png),
+            FORMAT_INDEXED => Ok(Self::Indexed),
+            FORMAT_INDEXED_ALPHA => Ok(Self::IndexedAlpha),
             _ => Err(ParseError::Unsupported),
         }
     }
@@ -179,9 +201,21 @@ impl Format {
     /// Number of bytes each pixel occupies, if the format has a fixed one.
     pub const fn bytes_per_pixel(self) -> Option<usize> {
         match self {
+            Self::Indexed => Some(1),
+            Self::IndexedAlpha => Some(2),
             Self::Rgb => Some(3),
             Self::Rgba => Some(4),
             Self::Png => None,
+        }
+    }
+
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Indexed => FORMAT_INDEXED,
+            Self::IndexedAlpha => FORMAT_INDEXED_ALPHA,
+            Self::Rgb => FORMAT_RGB,
+            Self::Rgba => FORMAT_RGBA,
+            Self::Png => FORMAT_PNG,
         }
     }
 }
@@ -306,6 +340,8 @@ pub struct Command {
     pub parent_placement_id: u32,
     pub parent_offset_x: i32,
     pub parent_offset_y: i32,
+    pub feature_query: Option<Action>,
+    pub unsupported_format: bool,
 }
 
 impl Command {
@@ -372,11 +408,18 @@ impl Command {
             KEY_FORMAT => self.format = Format::parse(unsigned(value)?)?,
             KEY_MEDIUM => self.medium = Medium::parse(flag(value)?)?,
             KEY_MORE => self.more = boolean(value)?,
-            KEY_TRANSIENT => self.transient = boolean(value)?,
-            KEY_VIRTUAL => self.virtual_placement = boolean(value)?,
+            KEY_TRANSIENT => {
+                let v = unsigned(value)?;
+                self.transient = (v & 1) != 0;
+            },
+            KEY_VIRTUAL => {
+                let v = unsigned(value)?;
+                self.virtual_placement = v != 0;
+            },
             KEY_CURSOR_MOVEMENT => {
+                let v = unsigned(value)?;
                 self.cursor_movement =
-                    if boolean(value)? { CursorMovement::Stay } else { CursorMovement::Move };
+                    if v != 0 { CursorMovement::Stay } else { CursorMovement::Move };
             },
             KEY_IMAGE_ID => self.image_id = unsigned(value)?,
             KEY_IMAGE_NUMBER => self.image_number = unsigned(value)?,
@@ -398,6 +441,7 @@ impl Command {
             KEY_PARENT_PLACEMENT => self.parent_placement_id = unsigned(value)?,
             KEY_PARENT_OFFSET_X => self.parent_offset_x = signed(value)?,
             KEY_PARENT_OFFSET_Y => self.parent_offset_y = signed(value)?,
+            KEY_FEATURE_QUERY => self.feature_query = Action::parse(flag(value)?).ok(),
             KEY_QUIET => {
                 let quiet = unsigned(value)?;
                 if quiet > QUIET_MAX {

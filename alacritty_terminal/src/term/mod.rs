@@ -85,6 +85,7 @@ bitflags! {
         /// Paste events announce the clipboard's MIME types (kitty clipboard
         /// protocol's private mode 5522).
         const PASTE_EVENTS            = 1 << 23;
+        const SGR_PIXEL_MOUSE         = 1 << 24;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -926,6 +927,9 @@ impl<T> Term<T> {
 
             // Reset alternate screen contents.
             self.inactive_grid.reset_region(..);
+
+            // Reset alternate screen graphics.
+            self.inactive_graphics.clear();
         }
 
         mem::swap(&mut self.keyboard_mode_stack, &mut self.inactive_keyboard_mode_stack);
@@ -2245,11 +2249,15 @@ impl<T: EventListener> Handler for Term<T> {
             NamedPrivateMode::BracketedPaste => self.mode.insert(TermMode::BRACKETED_PASTE),
             // Mouse encodings are mutually exclusive.
             NamedPrivateMode::SgrMouse => {
-                self.mode.remove(TermMode::UTF8_MOUSE);
+                self.mode.remove(TermMode::UTF8_MOUSE | TermMode::SGR_PIXEL_MOUSE);
                 self.mode.insert(TermMode::SGR_MOUSE);
             },
+            NamedPrivateMode::SgrPixelMouse => {
+                self.mode.remove(TermMode::UTF8_MOUSE | TermMode::SGR_MOUSE);
+                self.mode.insert(TermMode::SGR_PIXEL_MOUSE);
+            },
             NamedPrivateMode::Utf8Mouse => {
-                self.mode.remove(TermMode::SGR_MOUSE);
+                self.mode.remove(TermMode::SGR_MOUSE | TermMode::SGR_PIXEL_MOUSE);
                 self.mode.insert(TermMode::UTF8_MOUSE);
             },
             NamedPrivateMode::AlternateScroll => self.mode.insert(TermMode::ALTERNATE_SCROLL),
@@ -2307,6 +2315,7 @@ impl<T: EventListener> Handler for Term<T> {
             NamedPrivateMode::ReportFocusInOut => self.mode.remove(TermMode::FOCUS_IN_OUT),
             NamedPrivateMode::BracketedPaste => self.mode.remove(TermMode::BRACKETED_PASTE),
             NamedPrivateMode::SgrMouse => self.mode.remove(TermMode::SGR_MOUSE),
+            NamedPrivateMode::SgrPixelMouse => self.mode.remove(TermMode::SGR_PIXEL_MOUSE),
             NamedPrivateMode::Utf8Mouse => self.mode.remove(TermMode::UTF8_MOUSE),
             NamedPrivateMode::AlternateScroll => self.mode.remove(TermMode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.remove(TermMode::LINE_WRAP),
@@ -2348,6 +2357,7 @@ impl<T: EventListener> Handler for Term<T> {
                 },
                 NamedPrivateMode::Utf8Mouse => self.mode.contains(TermMode::UTF8_MOUSE).into(),
                 NamedPrivateMode::SgrMouse => self.mode.contains(TermMode::SGR_MOUSE).into(),
+                NamedPrivateMode::SgrPixelMouse => self.mode.contains(TermMode::SGR_PIXEL_MOUSE).into(),
                 NamedPrivateMode::AlternateScroll => {
                     self.mode.contains(TermMode::ALTERNATE_SCROLL).into()
                 },
@@ -3583,5 +3593,29 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    #[test]
+    fn sgr_pixel_mouse_mode_handling() {
+        let size = TermSize::new(100, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+
+        term.set_private_mode(NamedPrivateMode::SgrPixelMouse.into());
+        assert!(term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+        assert!(!term.mode().contains(TermMode::SGR_MOUSE));
+        assert!(!term.mode().contains(TermMode::UTF8_MOUSE));
+
+        term.set_private_mode(NamedPrivateMode::SgrMouse.into());
+        assert!(term.mode().contains(TermMode::SGR_MOUSE));
+        assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+
+        term.set_private_mode(NamedPrivateMode::SgrPixelMouse.into());
+        assert!(term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+        assert!(!term.mode().contains(TermMode::SGR_MOUSE));
+
+        term.unset_private_mode(NamedPrivateMode::SgrPixelMouse.into());
+        assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
     }
 }

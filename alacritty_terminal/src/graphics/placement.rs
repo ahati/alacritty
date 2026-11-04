@@ -51,6 +51,10 @@ pub struct Placement {
     /// Virtual placements back Unicode placeholder cells and are never drawn
     /// directly.
     pub is_virtual: bool,
+    /// Parent placement if this is a relative placement (parent_internal_id, parent_placement_id).
+    pub parent: Option<(u32, u32)>,
+    /// Relative offset from parent anchor in cells (H, V).
+    pub relative_offset: (i32, i32),
 }
 
 impl Placement {
@@ -106,12 +110,20 @@ impl PlacementStore {
         // Anonymous placements (`p=0`) of the same image coexist, while a named
         // placement replaces the previous one with the same identity.
         if placement.placement_id != 0 {
-            let existing = self.placements.iter_mut().find(|existing| {
+            let existing_idx = self.placements.iter().position(|existing| {
                 existing.internal_id == placement.internal_id
                     && existing.placement_id == placement.placement_id
             });
-            if let Some(existing) = existing {
-                *existing = placement;
+            if let Some(idx) = existing_idx {
+                let old_anchor = self.placements[idx].anchor;
+                self.placements[idx] = placement;
+                let delta_line = self.placements[idx].anchor.line.0 - old_anchor.line.0;
+                let delta_col = self.placements[idx].anchor.column.0 as i32 - old_anchor.column.0 as i32;
+                if delta_line != 0 || delta_col != 0 {
+                    let parent_id = self.placements[idx].internal_id;
+                    let parent_plid = self.placements[idx].placement_id;
+                    self.shift_children(parent_id, parent_plid, delta_line, delta_col);
+                }
                 return;
             }
         }
@@ -119,44 +131,106 @@ impl PlacementStore {
         self.placements.push(placement);
     }
 
-    /// Remove every placement of one image.
-    pub fn remove_image(&mut self, internal_id: u32) {
-        self.placements.retain(|placement| placement.internal_id != internal_id);
+    fn shift_children(&mut self, parent_id: u32, parent_placement_id: u32, delta_line: i32, delta_col: i32) {
+        for i in 0..self.placements.len() {
+            if let Some((pid, plid)) = self.placements[i].parent {
+                if pid == parent_id && (plid == parent_placement_id || plid == 0) {
+                    let old_line = self.placements[i].anchor.line.0;
+                    let old_col = self.placements[i].anchor.column.0 as i32;
+                    self.placements[i].anchor.line = Line(old_line + delta_line);
+                    self.placements[i].anchor.column = Column((old_col + delta_col).max(0) as usize);
+                    let child_id = self.placements[i].internal_id;
+                    let child_plid = self.placements[i].placement_id;
+                    self.shift_children(child_id, child_plid, delta_line, delta_col);
+                }
+            }
+        }
     }
 
-    /// Remove a single placement of an image.
+    /// Prune any relative placement whose parent no longer exists.
+    /// Runs iteratively until all transitive orphans are removed.
+    pub fn prune_orphans(&mut self) {
+        loop {
+            let initial_len = self.placements.len();
+            let parent_keys: std::collections::HashSet<(u32, u32)> = self
+                .placements
+                .iter()
+                .map(|p| (p.internal_id, p.placement_id))
+                .collect();
+            self.placements.retain(|placement| {
+                if let Some((parent_id, parent_placement_id)) = placement.parent {
+                    if parent_placement_id == 0 {
+                        parent_keys.iter().any(|(pid, _)| *pid == parent_id)
+                    } else {
+                        parent_keys.contains(&(parent_id, parent_placement_id))
+                    }
+                } else {
+                    true
+                }
+            });
+            if self.placements.len() == initial_len {
+                break;
+            }
+        }
+    }
+
+    /// Find a placement by internal image id and placement id. If placement_id is 0,
+    /// returns the first placement for internal_id.
+    pub fn find(&self, internal_id: u32, placement_id: u32) -> Option<&Placement> {
+        self.placements.iter().find(|p| {
+            p.internal_id == internal_id
+                && (placement_id == 0 || p.placement_id == placement_id)
+        })
+    }
+
+    /// Remove every placement of one image, and any relative children.
+    pub fn remove_image(&mut self, internal_id: u32) {
+        self.placements.retain(|placement| placement.internal_id != internal_id);
+        self.prune_orphans();
+    }
+
+    /// Remove a single placement of an image, and any relative children.
     pub fn remove_placement(&mut self, internal_id: u32, placement_id: u32) {
         self.placements.retain(|placement| {
             !(placement.internal_id == internal_id && placement.placement_id == placement_id)
         });
+        self.prune_orphans();
     }
 
     /// Remove every placement covering `point`.
     pub fn remove_at(&mut self, point: Point) {
-        self.placements.retain(|placement| !placement.contains(point));
+        self.placements.retain(|placement| placement.is_virtual || !placement.contains(point));
+        self.prune_orphans();
     }
 
     /// Remove every placement with the given stacking order.
     pub fn remove_with_z(&mut self, z_index: i32) {
-        self.placements.retain(|placement| placement.z_index != z_index);
+        self.placements.retain(|placement| placement.is_virtual || placement.z_index != z_index);
+        self.prune_orphans();
     }
 
     /// Remove every placement covering `column`.
     pub fn remove_column(&mut self, column: Column) {
         self.placements.retain(|placement| {
-            let start = placement.anchor.column.0;
-            let end = start + usize::from(placement.columns.max(1));
-            !(start..end).contains(&column.0)
+            placement.is_virtual || {
+                let start = placement.anchor.column.0;
+                let end = start + usize::from(placement.columns.max(1));
+                !(start..end).contains(&column.0)
+            }
         });
+        self.prune_orphans();
     }
 
     /// Remove every placement covering `line`.
     pub fn remove_row(&mut self, line: Line) {
         self.placements.retain(|placement| {
-            let start = placement.anchor.line;
-            let end = start + i32::from(placement.rows.max(1));
-            !(start..end).contains(&line)
+            placement.is_virtual || {
+                let start = placement.anchor.line;
+                let end = start + i32::from(placement.rows.max(1));
+                !(start..end).contains(&line)
+            }
         });
+        self.prune_orphans();
     }
 
     /// Shift placements covered by a scrolling region.
@@ -172,33 +246,68 @@ impl PlacementStore {
         // lines with it, exactly as `Selection::rotate` assumes.
         let carries_scrollback = region.start == Line(0);
 
-        for placement in &mut self.placements {
+        self.placements.retain_mut(|placement| {
             // A virtual placement backs Unicode placeholder cells rather than
             // being anchored to the grid, so scrolling never moves it and only
             // an explicit delete or a reset removes it, as in the reference.
             if placement.is_virtual {
-                continue;
+                return true;
             }
 
             let line = placement.anchor.line;
             if !(carries_scrollback || line >= region.start) || line >= region.end {
-                continue;
+                return true;
             }
 
-            placement.anchor.line = Line(placement.anchor.line.0 - delta);
+            let new_line = Line(placement.anchor.line.0 - delta);
 
             // With page margins in use, an image may not leave the region; the
-            // protocol requires it to be clipped instead.
-            if !carries_scrollback && placement.anchor.line < region.start {
-                placement.anchor.line = region.start;
-            }
-        }
+            // protocol requires it to be clipped instead, or dropped once scrolled past.
+            if !carries_scrollback {
+                let bottom_line = Line(new_line.0 + i32::from(placement.footprint.rows));
+                if bottom_line <= region.start || new_line >= region.end {
+                    return false;
+                }
 
-        // A placement is deliberately *not* destroyed as it leaves the
-        // viewport. The reference implementation keeps one for as long as the
-        // line it is anchored to survives in the scrollback, so scrolling back
-        // brings the image into view again; the caller drops it once that line
-        // is discarded, through `retain_within`.
+                if new_line < region.start {
+                    let clipped_rows = (region.start.0 - new_line.0) as u16;
+                    if clipped_rows >= placement.footprint.rows {
+                        return false;
+                    }
+                    let total_rows = placement.footprint.rows.max(1);
+                    placement.footprint.rows = placement.footprint.rows.saturating_sub(clipped_rows);
+                    if placement.rows > 0 {
+                        placement.rows = placement.rows.saturating_sub(clipped_rows);
+                    }
+                    let frac = clipped_rows as f32 / total_rows as f32;
+                    let clip_src_y = (placement.src.height as f32 * frac).round() as u32;
+                    placement.src.y = placement.src.y.saturating_add(clip_src_y);
+                    placement.src.height = placement.src.height.saturating_sub(clip_src_y);
+                    placement.anchor.line = region.start;
+                    return true;
+                }
+
+                if bottom_line > region.end {
+                    let clipped_rows = (bottom_line.0 - region.end.0) as u16;
+                    if clipped_rows >= placement.footprint.rows {
+                        return false;
+                    }
+                    let total_rows = placement.footprint.rows.max(1);
+                    placement.footprint.rows = placement.footprint.rows.saturating_sub(clipped_rows);
+                    if placement.rows > 0 {
+                        placement.rows = placement.rows.saturating_sub(clipped_rows);
+                    }
+                    let frac = clipped_rows as f32 / total_rows as f32;
+                    let clip_src_y = (placement.src.height as f32 * frac).round() as u32;
+                    placement.src.height = placement.src.height.saturating_sub(clip_src_y);
+                }
+            }
+
+            placement.anchor.line = new_line;
+            true
+        });
+
+        self.prune_orphans();
     }
 
     /// Pull pixel offsets back inside a cell.
@@ -250,6 +359,17 @@ impl PlacementStore {
         });
     }
 
+    /// Remove visible placements for `d=a/A`, leaving scrollback and virtual placements.
+    pub fn delete_all_visible(&mut self) {
+        self.placements.retain(|placement| {
+            placement.is_virtual || {
+                let end = Line(placement.anchor.line.0 + i32::from(placement.footprint.rows));
+                end <= Line(0)
+            }
+        });
+        self.prune_orphans();
+    }
+
     /// Remove every placement.
     pub fn clear(&mut self) {
         self.placements.clear();
@@ -283,6 +403,8 @@ mod tests {
             src: SourceRect::default(),
             z_index: 0,
             is_virtual: false,
+            parent: None,
+            relative_offset: (0, 0),
         }
     }
 

@@ -7,6 +7,7 @@ use std::fmt::{self, Formatter};
 use std::mem::{self, ManuallyDrop};
 use std::num::NonZeroU32;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glutin::config::GetGlConfig;
@@ -44,7 +45,7 @@ use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
-use crate::display::color::{List, Rgb};
+use crate::display::color::{CellRgb, List, Rgb};
 use crate::display::content::{RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
@@ -809,6 +810,39 @@ impl Display {
         let selection_range = content.selection_range();
         let foreground_color = content.color(NamedColor::Foreground as usize);
         let background_color = content.color(NamedColor::Background as usize);
+
+        // Build palette for indexed images.
+        let mut palette = [alacritty_terminal::vte::ansi::Rgb::default(); 256];
+        let sel_bg = config.colors.selection.background.color(foreground_color, background_color);
+        let sel_fg = config.colors.selection.foreground.color(foreground_color, background_color);
+        let cursor_bg = config.colors.cursor.background.color(foreground_color, background_color);
+        let cursor_fg = config.colors.cursor.foreground.color(foreground_color, background_color);
+        let url_color = match config.colors.hints.end.foreground {
+            CellRgb::Rgb(rgb) => rgb,
+            _ => content.color(alacritty_terminal::vte::ansi::NamedColor::BrightBlue as usize),
+        };
+
+        for (i, pal_entry) in palette.iter_mut().enumerate() {
+            let rgb = match i {
+                248 => background_color,
+                249 => foreground_color,
+                250 => sel_bg,
+                251 => sel_fg,
+                252 => cursor_bg,
+                253 => cursor_fg,
+                254 => url_color,
+                _ => content.color(i),
+            };
+            *pal_entry = alacritty_terminal::vte::ansi::Rgb { r: rgb.r, g: rgb.g, b: rgb.b };
+        }
+
+        let palette_hash = palette.iter().fold(0u64, |acc, c| {
+            acc.wrapping_mul(31)
+                .wrapping_add(c.r as u64)
+                .wrapping_add((c.g as u64) << 8)
+                .wrapping_add((c.b as u64) << 16)
+        });
+
         let display_offset = content.display_offset();
         let cursor = content.cursor();
 
@@ -832,15 +866,33 @@ impl Display {
         terminal.reset_damage();
 
         // Collect graphics before the terminal lock is dropped.
-        let images = image::collect(terminal.graphics(), &size_info, display_offset);
+        let images = image::collect(terminal.graphics(), &size_info, display_offset, palette_hash);
 
         // Textures are retained for every image the terminal still holds, not
         // just the visible ones, so that scrolling does not re-upload them.
         let live: HashSet<ImageKey> = terminal
             .graphics()
             .images()
-            .map(|(internal_id, image)| image::image_key(internal_id, image.generation))
+            .map(|(internal_id, image)| {
+                if image.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
+                    || image.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
+                {
+                    image::image_key(internal_id, image.generation ^ palette_hash)
+                } else {
+                    image::image_key(internal_id, image.generation)
+                }
+            })
             .collect();
+
+        // Extract virtual placements for Unicode placeholders.
+        let mut virtual_placements = Vec::new();
+        for p in terminal.graphics().placements() {
+            if p.is_virtual {
+                if let Some(img) = terminal.graphics().image(p.internal_id) {
+                    virtual_placements.push((p.clone(), Arc::clone(img)));
+                }
+            }
+        }
 
         // Drop terminal as early as possible to free lock.
         drop(terminal);
@@ -879,7 +931,136 @@ impl Display {
                     image.image.height,
                     image.image.format,
                     &image.image.pixels,
+                    Some(&palette),
                 );
+            }
+        }
+
+        // Process Unicode placeholder cells (U+10EEEE)
+        let mut placeholder_quads = Vec::new();
+        let mut last_placeholder: Option<(usize, usize, u32, u32, u32, u32)> = None;
+        for cell in &mut grid_cells {
+            if cell.character == '\u{10EEEE}' {
+                cell.character = ' ';
+
+                let mut image_id = ((cell.fg.r as u32) << 16) | ((cell.fg.g as u32) << 8) | (cell.fg.b as u32);
+                let placement_id = ((cell.underline.r as u32) << 16) | ((cell.underline.g as u32) << 8) | (cell.underline.b as u32);
+
+                let mut explicit_row = None;
+                let mut explicit_col = None;
+                if let Some(extra) = &cell.extra {
+                    if let Some(zerowidth) = &extra.zerowidth {
+                        if !zerowidth.is_empty() {
+                            explicit_row = Some((zerowidth[0] as u32).saturating_sub(0x0305));
+                        }
+                        if zerowidth.len() > 1 {
+                            explicit_col = Some((zerowidth[1] as u32).saturating_sub(0x0305));
+                        }
+                        if zerowidth.len() > 2 {
+                            let msb = (zerowidth[2] as u32).saturating_sub(0x0305);
+                            image_id |= (msb & 0xFF) << 24;
+                        }
+                    }
+                }
+
+                let (row, col) = match (explicit_row, explicit_col) {
+                    (Some(r), Some(c)) => (r, c),
+                    (Some(r), None) => {
+                        let c = if let Some((last_line, last_grid_col, last_img, last_pl, _, last_c)) = last_placeholder {
+                            if last_line == cell.point.line && last_grid_col + 1 == cell.point.column.0 && last_img == image_id && last_pl == placement_id {
+                                last_c + 1
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        (r, c)
+                    },
+                    (None, Some(c)) => {
+                        let r = if let Some((last_line, last_grid_col, last_img, last_pl, last_r, _)) = last_placeholder {
+                            if last_line == cell.point.line && last_grid_col + 1 == cell.point.column.0 && last_img == image_id && last_pl == placement_id {
+                                last_r
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        (r, c)
+                    },
+                    (None, None) => {
+                        if let Some((last_line, last_grid_col, last_img, last_pl, last_r, last_c)) = last_placeholder {
+                            if last_line == cell.point.line && last_grid_col + 1 == cell.point.column.0 && last_img == image_id && last_pl == placement_id {
+                                (last_r, last_c + 1)
+                            } else {
+                                (0, 0)
+                            }
+                        } else {
+                            (0, 0)
+                        }
+                    }
+                };
+
+                last_placeholder = Some((cell.point.line, cell.point.column.0, image_id, placement_id, row, col));
+
+                if let Some((p, img)) = virtual_placements.iter().find(|(p, img)| {
+                    (placement_id == 0 || p.placement_id == placement_id)
+                        && (img.client_id == image_id || img.number == image_id || p.internal_id == image_id)
+                }) {
+                    if img.is_ready() {
+                        let key = if img.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
+                            || img.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
+                        {
+                            image::image_key(p.internal_id, img.generation ^ palette_hash)
+                        } else {
+                            image::image_key(p.internal_id, img.generation)
+                        };
+
+                        let texture = if let Some(tex) = self.image_cache.get(key) {
+                            tex
+                        } else {
+                            self.image_cache.upload(
+                                key,
+                                img.width,
+                                img.height,
+                                img.format,
+                                &img.pixels,
+                                Some(&palette),
+                            )
+                        };
+
+                        if texture != 0 {
+                            let total_cols = p.columns.max(1) as f32;
+                            let total_rows = p.rows.max(1) as f32;
+
+                            let src_x = p.src.x as f32;
+                            let src_y = p.src.y as f32;
+                            let src_w = (if p.src.width == 0 { img.width } else { p.src.width }) as f32;
+                            let src_h = (if p.src.height == 0 { img.height } else { p.src.height }) as f32;
+
+                            let tile_w = src_w / total_cols;
+                            let tile_h = src_h / total_rows;
+
+                            let u0 = (src_x + col as f32 * tile_w) / img.width as f32;
+                            let u1 = (src_x + (col + 1) as f32 * tile_w) / img.width as f32;
+                            let v0 = (src_y + row as f32 * tile_h) / img.height as f32;
+                            let v1 = (src_y + (row + 1) as f32 * tile_h) / img.height as f32;
+
+                            let px = cell.point.column.0 as f32 * size_info.cell_width() + size_info.padding_x();
+                            let py = cell.point.line as f32 * size_info.cell_height() + size_info.padding_y();
+
+                            placeholder_quads.push(crate::renderer::images::ImageQuad {
+                                x: px,
+                                y: py,
+                                width: size_info.cell_width(),
+                                height: size_info.cell_height(),
+                                uv: [u0, v0, u1, v1],
+                                texture,
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -893,7 +1074,8 @@ impl Display {
         let (behind, in_front): (Vec<_>, Vec<_>) =
             images.iter().partition(|image| image.z_index < 0);
         let behind_quads = image_quads(&behind, &self.image_cache);
-        let front_quads = image_quads(&in_front, &self.image_cache);
+        let mut front_quads = image_quads(&in_front, &self.image_cache);
+        front_quads.extend(placeholder_quads);
 
         self.renderer.draw_images(&size_info, &behind_quads);
 
