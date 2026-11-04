@@ -342,6 +342,7 @@ pub struct Command {
     pub parent_offset_y: i32,
     pub feature_query: Option<Action>,
     pub unsupported_format: bool,
+    pub has_explicit_action: bool,
 }
 
 impl Command {
@@ -402,10 +403,16 @@ impl Command {
     /// Apply a single `key=value` entry.
     fn set_key(&mut self, key: u8, value: &[u8]) -> Result<(), ParseError> {
         match key {
-            KEY_ACTION => self.action = Action::parse(flag(value)?)?,
+            KEY_ACTION => {
+                self.has_explicit_action = true;
+                self.action = Action::parse(flag(value)?)?;
+            },
             KEY_COMPRESSION => self.compression = Some(Compression::parse(flag(value)?)?),
             KEY_DELETE => self.delete = Some(flag(value)?),
-            KEY_FORMAT => self.format = Format::parse(unsigned(value)?)?,
+            KEY_FORMAT => match Format::parse(unsigned(value)?) {
+                Ok(fmt) => self.format = fmt,
+                Err(_) => self.unsupported_format = true,
+            },
             KEY_MEDIUM => self.medium = Medium::parse(flag(value)?)?,
             KEY_MORE => self.more = boolean(value)?,
             KEY_TRANSIENT => {
@@ -444,10 +451,7 @@ impl Command {
             KEY_FEATURE_QUERY => self.feature_query = Action::parse(flag(value)?).ok(),
             KEY_QUIET => {
                 let quiet = unsigned(value)?;
-                if quiet > QUIET_MAX {
-                    return Err(ParseError::Unsupported);
-                }
-                self.quiet = quiet as u8;
+                self.quiet = quiet.min(QUIET_MAX) as u8;
             },
             _ => return Err(ParseError::UnknownKey(key)),
         }
@@ -591,9 +595,9 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_and_out_of_range() {
-        assert_eq!(Command::parse(b"f=1"), Err(ParseError::Unsupported));
+        assert!(Command::parse(b"f=1").unwrap().unsupported_format);
         assert_eq!(Command::parse(b"a=Z"), Err(ParseError::Unsupported));
-        assert_eq!(Command::parse(b"q=3"), Err(ParseError::Unsupported));
+        assert_eq!(Command::parse(b"q=3").unwrap().quiet, 2);
         assert_eq!(Command::parse(b"i=4294967296"), Err(ParseError::ValueOutOfRange));
         assert_eq!(Command::parse(b"z=2147483648"), Err(ParseError::ValueOutOfRange));
         assert_eq!(Command::parse(b"i=12345678901"), Err(ParseError::ValueOutOfRange));

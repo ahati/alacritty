@@ -714,6 +714,83 @@ impl<T> Term<T> {
         &self.graphics
     }
 
+    /// Mutable access to Kitty graphics displayed on the active screen.
+    #[inline]
+    pub fn graphics_mut(&mut self) -> &mut GraphicsStore {
+        &mut self.graphics
+    }
+
+    /// Sync virtual placement anchors from the minimum line and column of their
+    /// associated Unicode placeholder cells in the grid.
+    pub fn sync_virtual_placements(&mut self) {
+        let virt_keys: Vec<(u32, u32, u32, u32)> = self
+            .graphics
+            .placements()
+            .iter()
+            .filter(|p| p.is_virtual)
+            .map(|p| {
+                let img = self.graphics.image(p.internal_id);
+                let (cid, num) = img.map_or((0, 0), |i| (i.client_id, i.number));
+                (p.internal_id, p.placement_id, cid, num)
+            })
+            .collect();
+
+        if virt_keys.is_empty() {
+            return;
+        }
+
+        let mut anchors: std::collections::HashMap<(u32, u32), (Line, Column)> =
+            std::collections::HashMap::new();
+
+        for cell in self.grid.display_iter() {
+            if cell.c == '\u{10EEEE}' {
+                let mut image_id = match cell.fg {
+                    Color::Indexed(idx) => u32::from(idx),
+                    Color::Spec(rgb) => {
+                        (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
+                    },
+                    Color::Named(named) => named as u8 as u32,
+                };
+                let placement_id = match cell.underline_color() {
+                    None => 0,
+                    Some(Color::Indexed(idx)) => u32::from(idx),
+                    Some(Color::Spec(rgb)) => {
+                        (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
+                    },
+                    Some(Color::Named(named)) => named as u8 as u32,
+                };
+                if let Some(zerowidth) = cell.zerowidth() {
+                    if zerowidth.len() > 2 {
+                        if let Ok(idx) = crate::graphics::ROWCOLUMN_DIACRITICS
+                            .binary_search(&(zerowidth[2] as u32))
+                        {
+                            image_id |= (idx as u32 & 0xFF) << 24;
+                        }
+                    }
+                }
+
+                for &(int_id, pl_id, cid, num) in &virt_keys {
+                    if (placement_id == 0 || pl_id == 0 || pl_id == placement_id)
+                        && (int_id == image_id || cid == image_id || num == image_id)
+                    {
+                        let point = cell.point;
+                        anchors
+                            .entry((int_id, pl_id))
+                            .and_modify(|p: &mut (Line, Column)| {
+                                p.0 = std::cmp::min(p.0, point.line);
+                                p.1 = std::cmp::min(p.1, point.column);
+                            })
+                            .or_insert((point.line, point.column));
+                    }
+                }
+            }
+        }
+
+        for ((int_id, pl_id), (line, col)) in anchors {
+            self.graphics.update_virtual_parent_anchor(int_id, pl_id, Point::new(line, col));
+        }
+    }
+
     /// Take the image decodes queued by the parser.
     ///
     /// Decoding is proportional to the image rather than to the command that

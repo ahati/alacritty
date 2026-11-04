@@ -195,6 +195,8 @@ pub struct RenderableCell {
     pub underline: Rgb,
     pub flags: Flags,
     pub extra: Option<Box<RenderableCellExtra>>,
+    pub raw_fg: Color,
+    pub raw_underline: Option<Color>,
 }
 
 /// Extra storage with rarely present fields for [`RenderableCell`], to reduce the cell size we
@@ -295,7 +297,21 @@ impl RenderableCell {
             })
         });
 
-        RenderableCell { flags, character, bg_alpha, point, fg, bg, underline, extra }
+        let raw_fg = cell.fg;
+        let raw_underline = cell.underline_color();
+
+        RenderableCell {
+            flags,
+            character,
+            bg_alpha,
+            point,
+            fg,
+            bg,
+            underline,
+            extra,
+            raw_fg,
+            raw_underline,
+        }
     }
 
     /// Check if cell contains any renderable content.

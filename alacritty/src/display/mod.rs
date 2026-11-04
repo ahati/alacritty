@@ -67,6 +67,7 @@ pub mod content;
 pub mod cursor;
 pub mod hint;
 pub mod image;
+pub mod placeholder;
 pub mod window;
 
 mod bell;
@@ -864,6 +865,7 @@ impl Display {
             },
         }
         terminal.reset_damage();
+        terminal.sync_virtual_placements();
 
         // Collect graphics before the terminal lock is dropped.
         let images = image::collect(terminal.graphics(), &size_info, display_offset, palette_hash);
@@ -938,126 +940,69 @@ impl Display {
 
         // Process Unicode placeholder cells (U+10EEEE)
         let mut placeholder_quads = Vec::new();
-        let mut last_placeholder: Option<(usize, usize, u32, u32, u32, u32)> = None;
+        let mut last_placeholder = None;
         for cell in &mut grid_cells {
             if cell.character == '\u{10EEEE}' {
                 cell.character = ' ';
 
-                let mut image_id = ((cell.fg.r as u32) << 16) | ((cell.fg.g as u32) << 8) | (cell.fg.b as u32);
-                let placement_id = ((cell.underline.r as u32) << 16) | ((cell.underline.g as u32) << 8) | (cell.underline.b as u32);
-
-                let mut explicit_row = None;
-                let mut explicit_col = None;
-                if let Some(extra) = &cell.extra {
-                    if let Some(zerowidth) = &extra.zerowidth {
-                        if !zerowidth.is_empty() {
-                            explicit_row = Some((zerowidth[0] as u32).saturating_sub(0x0305));
-                        }
-                        if zerowidth.len() > 1 {
-                            explicit_col = Some((zerowidth[1] as u32).saturating_sub(0x0305));
-                        }
-                        if zerowidth.len() > 2 {
-                            let msb = (zerowidth[2] as u32).saturating_sub(0x0305);
-                            image_id |= (msb & 0xFF) << 24;
-                        }
-                    }
-                }
-
-                let (row, col) = match (explicit_row, explicit_col) {
-                    (Some(r), Some(c)) => (r, c),
-                    (Some(r), None) => {
-                        let c = if let Some((last_line, last_grid_col, last_img, last_pl, _, last_c)) = last_placeholder {
-                            if last_line == cell.point.line && last_grid_col + 1 == cell.point.column.0 && last_img == image_id && last_pl == placement_id {
-                                last_c + 1
+                if let Some(decoded) = placeholder::decode_placeholder(cell, &mut last_placeholder) {
+                    if let Some((p, img)) = virtual_placements.iter().find(|(p, img)| {
+                        (decoded.placement_id == 0 || p.placement_id == decoded.placement_id)
+                            && (img.client_id == decoded.image_id
+                                || img.number == decoded.image_id
+                                || p.internal_id == decoded.image_id)
+                    }) {
+                        if img.is_ready() {
+                            let key = if img.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
+                                || img.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
+                            {
+                                image::image_key(p.internal_id, img.generation ^ palette_hash)
                             } else {
-                                0
-                            }
-                        } else {
-                            0
-                        };
-                        (r, c)
-                    },
-                    (None, Some(c)) => {
-                        let r = if let Some((last_line, last_grid_col, last_img, last_pl, last_r, _)) = last_placeholder {
-                            if last_line == cell.point.line && last_grid_col + 1 == cell.point.column.0 && last_img == image_id && last_pl == placement_id {
-                                last_r
+                                image::image_key(p.internal_id, img.generation)
+                            };
+
+                            let texture = if let Some(tex) = self.image_cache.get(key) {
+                                tex
                             } else {
-                                0
+                                self.image_cache.upload(
+                                    key,
+                                    img.width,
+                                    img.height,
+                                    img.format,
+                                    &img.pixels,
+                                    Some(&palette),
+                                )
+                            };
+
+                            if texture != 0 {
+                                let total_cols = p.columns.max(1) as f32;
+                                let total_rows = p.rows.max(1) as f32;
+
+                                let src_x = p.src.x as f32;
+                                let src_y = p.src.y as f32;
+                                let src_w = (if p.src.width == 0 { img.width } else { p.src.width }) as f32;
+                                let src_h = (if p.src.height == 0 { img.height } else { p.src.height }) as f32;
+
+                                let tile_w = src_w / total_cols;
+                                let tile_h = src_h / total_rows;
+
+                                let u0 = (src_x + decoded.col as f32 * tile_w) / img.width as f32;
+                                let u1 = (src_x + (decoded.col + 1) as f32 * tile_w) / img.width as f32;
+                                let v0 = (src_y + decoded.row as f32 * tile_h) / img.height as f32;
+                                let v1 = (src_y + (decoded.row + 1) as f32 * tile_h) / img.height as f32;
+
+                                let px = cell.point.column.0 as f32 * size_info.cell_width() + size_info.padding_x();
+                                let py = cell.point.line as f32 * size_info.cell_height() + size_info.padding_y();
+
+                                placeholder_quads.push(crate::renderer::images::ImageQuad {
+                                    x: px,
+                                    y: py,
+                                    width: size_info.cell_width(),
+                                    height: size_info.cell_height(),
+                                    uv: [u0, v0, u1, v1],
+                                    texture,
+                                });
                             }
-                        } else {
-                            0
-                        };
-                        (r, c)
-                    },
-                    (None, None) => {
-                        if let Some((last_line, last_grid_col, last_img, last_pl, last_r, last_c)) = last_placeholder {
-                            if last_line == cell.point.line && last_grid_col + 1 == cell.point.column.0 && last_img == image_id && last_pl == placement_id {
-                                (last_r, last_c + 1)
-                            } else {
-                                (0, 0)
-                            }
-                        } else {
-                            (0, 0)
-                        }
-                    }
-                };
-
-                last_placeholder = Some((cell.point.line, cell.point.column.0, image_id, placement_id, row, col));
-
-                if let Some((p, img)) = virtual_placements.iter().find(|(p, img)| {
-                    (placement_id == 0 || p.placement_id == placement_id)
-                        && (img.client_id == image_id || img.number == image_id || p.internal_id == image_id)
-                }) {
-                    if img.is_ready() {
-                        let key = if img.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
-                            || img.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
-                        {
-                            image::image_key(p.internal_id, img.generation ^ palette_hash)
-                        } else {
-                            image::image_key(p.internal_id, img.generation)
-                        };
-
-                        let texture = if let Some(tex) = self.image_cache.get(key) {
-                            tex
-                        } else {
-                            self.image_cache.upload(
-                                key,
-                                img.width,
-                                img.height,
-                                img.format,
-                                &img.pixels,
-                                Some(&palette),
-                            )
-                        };
-
-                        if texture != 0 {
-                            let total_cols = p.columns.max(1) as f32;
-                            let total_rows = p.rows.max(1) as f32;
-
-                            let src_x = p.src.x as f32;
-                            let src_y = p.src.y as f32;
-                            let src_w = (if p.src.width == 0 { img.width } else { p.src.width }) as f32;
-                            let src_h = (if p.src.height == 0 { img.height } else { p.src.height }) as f32;
-
-                            let tile_w = src_w / total_cols;
-                            let tile_h = src_h / total_rows;
-
-                            let u0 = (src_x + col as f32 * tile_w) / img.width as f32;
-                            let u1 = (src_x + (col + 1) as f32 * tile_w) / img.width as f32;
-                            let v0 = (src_y + row as f32 * tile_h) / img.height as f32;
-                            let v1 = (src_y + (row + 1) as f32 * tile_h) / img.height as f32;
-
-                            let px = cell.point.column.0 as f32 * size_info.cell_width() + size_info.padding_x();
-                            let py = cell.point.line as f32 * size_info.cell_height() + size_info.padding_y();
-
-                            placeholder_quads.push(crate::renderer::images::ImageQuad {
-                                x: px,
-                                y: py,
-                                width: size_info.cell_width(),
-                                height: size_info.cell_height(),
-                                uv: [u0, v0, u1, v1],
-                                texture,
-                            });
                         }
                     }
                 }

@@ -153,9 +153,9 @@ Legend: ✅ implemented · ⚠️ partial/deviation · ❌ missing
 
 ---
 
-## 4. Missing protocol features
+## 4. Protocol features — implemented and verified
 
-### 4.1 `f=8` / `f=16` indexed colour (0.50)
+### 4.1 `f=8` / `f=16` indexed colour (0.50) — **Implemented & Verified**
 
 **Spec.** One byte per pixel (`f=8`) or index + alpha (`f=16`). The palette is
 the SGR‑256 table; indices 248–254 map to default background, default foreground,
@@ -163,191 +163,157 @@ selection background/foreground, cursor colour, cursor text colour, and the
 hover‑URL colour. The image is re‑rendered when the palette changes. Animation
 and frame composition are unsupported for these formats.
 
-**Implementation.** `Format::parse` accepts only `24`, `32`, `100`
-(`alacritty_terminal/src/graphics/command.rs:170`). `f=8` is a parse error, and
-`apc_end` drops the whole command without a reply
-(`alacritty_terminal/src/graphics/mod.rs:446`).
+**Implementation.** `Format::Indexed` and `Format::IndexedAlpha` are parsed in
+`alacritty_terminal/src/graphics/command.rs`. Pixel data is stored in index format,
+palette colors are uploaded into OpenGL textures using the active palette in
+`alacritty/src/display/image.rs`, and texture cache keys hash the palette generation
+to invalidate textures automatically whenever the terminal palette updates.
+Animation and frame composition for indexed formats are strictly rejected with `EINVAL`.
 
-**Impact.** Clients probing indexed support get silence and fall back. Palette‑
-aware applications cannot use the feature. A client that sent `i=` and waits for
-an ack blocks until its timeout.
+**Verification:** Covered by integration test
+`indexed_color_formats_transmission_and_rejection` in `alacritty_terminal/tests/graphics.rs`.
 
-**Fix.** Add `Format::Indexed`/`IndexedAlpha`, decode to an index buffer, resolve
-palette colours at upload time, and invalidate textures when the palette
-changes. Reject animation/composition for these formats with `EINVAL`.
-
-### 4.2 `e` feature query (0.50)
+### 4.2 `e` feature query (0.50) — **Implemented & Verified**
 
 **Spec.** `a=q,i=31,e=T,U=1` replies with `e=T` plus every non‑default key from
 the query that is supported for that action, e.g. `i=31,e=T,C=1,U=1;OK`. Missing
 `e` means the action is unsupported. Keys with default values and `a/i/I/m/q` are
-not echoed.
+not echoed. Feature queries ignore any payload, respect quiet mode `q=1` (suppressing `OK`),
+and failure responses omit the `e=...` echo.
 
-**Implementation.** `e` is not in the key table
-(`alacritty_terminal/src/graphics/command.rs:34–65`), so the entire query is
-discarded. There is no `supported_keys_for_query` equivalent.
+**Implementation.** Implemented in `alacritty_terminal/src/graphics/mod.rs` via
+`format_feature_query_echo`. `validate()` ignores any payload when `command.feature_query.is_some()`.
+`success()` applies quiet suppression without bypass, and error responses omit the echo.
 
-**Impact.** Clients cannot discover animation, compose, placeholders, relative
-placements, or indexed support. They must guess or fall back. This is the
-mechanism the spec added specifically to avoid partial‑implementation ambiguity.
+**Verification:** Covered by integration tests
+`feature_query_echoes_supported_keys`,
+`feature_query_echoes_delete_selector_and_omits_unsupported_actions`, and
+`feature_query_with_payload_and_quiet_semantics` in `alacritty_terminal/tests/graphics.rs`.
 
-**Fix.** Accept `e` in `Command`, allow it only with `a=q`, and build the reply
-from the parsed keys using the same per‑action table as kitty
-(`supported_keys_for_query`). The reply must not disturb a chunked transfer in
-progress.
-
-### 4.3 `a=c` frame composition (0.22)
+### 4.3 `a=c` frame composition (0.22) — **Implemented & Verified**
 
 **Spec.** Copy a rectangle from frame `r` to frame `c`:
-
 ```
 a=c,i=1,r=7,c=9,w=23,h=27,X=4,Y=8,x=1,y=3
 ```
+`X/Y` is source offset, `x/y` destination offset, `C=1` overwrite (default alpha blend).
+When `w` or `h` are unspecified (0), the full image width and height are used.
+Missing frames ⇒ `ENOENT`; out‑of‑bounds ⇒ `EINVAL`; same frame with overlapping rectangles ⇒ `EINVAL`.
 
-`X/Y` is the source offset, `x/y` the destination offset, `C=1` overwrite
-(default alpha blend). Missing frames ⇒ `ENOENT`; out‑of‑bounds ⇒ `EINVAL`;
-same frame with overlapping rectangles ⇒ `EINVAL`.
+**Implementation.** Implemented in `alacritty_terminal/src/graphics/mod.rs:compose`.
+Defaults `w`/`h` to image dimensions, validates rectangle bounds, alpha-blends/overwrites
+in place, and updates texture generation.
 
-**Implementation.** `Action::Compose => Err(GraphicsError::Unsupported)`
-(`alacritty_terminal/src/graphics/mod.rs:690`), replied as `EUNSUPPORTED`.
+**Verification:** Covered by integration tests
+`frame_composition_composes_rectangles` and
+`frame_composition_default_rectangle_uses_full_dimensions` in `alacritty_terminal/tests/graphics.rs`.
 
-**Impact.** No cheap frame‑to‑frame updates. This also removes the best primitive
-for an X/VNC‑style display (see §9.5).
-
-**Fix.** Reuse `blend_patch` from `mod.rs:1787`; resolve both frames, validate
-rectangles, compose in place, and bump the generation only when the destination
-frame is the displayed one.
-
-### 4.4 Relative placements `P/Q/H/V` (0.31)
+### 4.4 Relative placements `P/Q/H/V` (0.31) — **Implemented & Verified**
 
 **Spec.** A placement positioned relative to a parent placement
 (`P=<image>,Q=<placement>`), offset by `H/V` cells. It moves with the parent;
 its lifetime is tied to the parent; chains of at least 8 are allowed. Errors:
 `ENOPARENT`, `ECYCLE`, `ETOODEEP`, and `EINVAL` when a virtual placement is made
-relative. The cursor must not move after a relative placement.
+relative. The cursor must not move after a relative placement. When text scrolls,
+relative placements move as a group with their parent. When a parent is pruned,
+all orphaned children are pruned transitively.
 
-**Implementation.** The four keys are parsed into `Command`
-(`command.rs:305–308`) and never read again. `Placement` has no parent fields and
-`place()` ignores them. A relative placement is created at the current cursor and
-acknowledged `OK`.
+**Implementation.** Implemented in `alacritty_terminal/src/graphics/placement.rs`
+and `mod.rs`. Tracks `parent` and `relative_offset`. Enforces depth limit, cycle
+detection, and cursor freeze. `PlacementStore::scroll` groups parents and children,
+and `prune_orphans()` transitively cascades deletions and scrollback pruning.
 
-**Impact.** Worse than rejecting: the client gets a wrong image position and no
-error. This breaks `image.nvim`/`kui.nvim`‑style layouts and any placeholder
-workflow that anchors real images to a placeholder.
+**Verification:** Covered by integration tests
+`relative_placements_anchoring_and_error_handling`,
+`cascading_relative_placements_delete_transitively`,
+`relative_child_pruned_when_parent_scrolls_out`, and
+`relative_placement_anchored_to_virtual_parent_succeeds`.
 
-**Fix.** Add `parent: Option<(u32 /*internal image*/, u32 /*placement id*/)>` and
-`offset: (i32, i32)` to `Placement`; resolve on put; walk the parent chain at
-draw time (or store the resolved anchor and update children when the parent
-moves). Enforce the error codes and depth limit.
-
-### 4.5 Unicode placeholders `U=1` / U+10EEEE (0.28)
+### 4.5 Unicode placeholders `U=1` / U+10EEEE (0.28) — **Implemented & Verified**
 
 **Spec.** `a=p,U=1,i=<id>,c=<cols>,r=<rows>` creates an invisible virtual
-placement. Printing `U+10EEEE` with the image id in the foreground colour (and
-row/column diacritics from `rowcolumn-diacritics.txt`, optional MSB diacritic,
-placement id in the underline colour) displays the image over those cells. The
-diacritics may be omitted and inherited from the cell to the left. Virtual
-placements are deleted only by `i/I/n/N/r/R`.
+placement. Printing `U+10EEEE` with the image id in the foreground colour (palette indexed
+`38;5;N` or truecolor `38;2;R;G;B`), optional MSB diacritic from `rowcolumn-diacritics.txt`,
+and placement id in underline colour (defaulting to 0 when omitted) displays the image
+tiled over those cells. Diacritics are mapped via the official 297-codepoint table and
+inherited left-to-right across rows. When a virtual placement is a parent, its anchor
+is dynamically derived from `min(col)` and `min(line)` of all placeholder cells referring to it.
+Virtual placements are immune to physical deletes (`a/A/c/C/p/P/q/Q/x/X/y/Y/z/Z`).
 
-**Implementation.** `U=1` sets `Placement::is_virtual`, and the renderer skips
-virtual placements (`alacritty/src/display/image.rs:71`). `U+10EEEE` is not
-special‑cased anywhere in the terminal, so it is drawn as a normal missing glyph.
+**Implementation.** Implemented in `alacritty/src/display/placeholder.rs`,
+`alacritty/src/display/content.rs` (retaining `raw_fg` and `raw_underline`),
+`alacritty/src/display/mod.rs`, and `alacritty_terminal/src/term/mod.rs:sync_virtual_placements`.
+The official 297-entry `ROWCOLUMN_DIACRITICS` constant powers `O(log N)` binary search.
+Virtual parent anchors dynamically resolve and update relative children.
 
-**Impact.** Placeholders show tofu and no image. This is the feature that lets
-images survive `tmux`, `vim`, `weechat`, and any host application that only moves
-text around.
-
-**Fix.** Resolve placeholder cells while building `RenderLines`/the render data:
-detect `U+10EEEE`, decode the diacritics, look up the virtual placement, and emit
-a renderable quad covering the placeholder cell grid; suppress the glyph itself.
-Also fix §5.4 so physical deletes leave virtual placements alone.
+**Verification:** Covered by unit tests in `alacritty/src/display/placeholder.rs`:
+- `rowcolumn_diacritic_indices` (asserting indices 0, 1, 2, 15, 255)
+- `decode_palette_indexed_foreground_and_default_underline` (`38;5;42` example from spec)
+- `decode_truecolor_foreground_and_indexed_underline`
+- `decode_third_diacritic_msb` (`33554474` example from spec)
+- `left_to_right_inheritance_2x3_matrix`
+and integration tests:
+- `relative_placement_anchored_to_virtual_parent_succeeds` (asserting dynamic anchor derivation)
+- `virtual_placements_are_flagged_and_pinned_to_their_cells`
+- `virtual_placements_survive_physical_selectors`
+- `virtual_placements_do_not_scroll_with_the_text`
 
 ---
 
-## 5. Conformance bugs
+## 5. Conformance bugs — resolved and verified
 
-### 5.1 `a=q` is not answered immediately — **verified**
+### 5.1 `a=q` is answered immediately — **Resolved & Verified**
 
-**Spec.** A query must be answered “immediately without processing other input”,
-so that this probe is unambiguous:
+**Spec.** A query must be answered immediately without waiting for deferred decodes,
+so that DA1 probes succeed reliably.
 
-```
-ESC _ G i=31,s=1,v=1,a=q,t=d,f=24;AAAA ESC \   ESC [ c
-```
+**Implementation.** Implemented in `alacritty_terminal/src/graphics/mod.rs:dispatch`.
+Feature queries bypass deferred queues and evaluate synchronously; image queries validate
+and respond immediately before processing subsequent terminal input.
 
-If DA1 arrives without the graphics reply, the client concludes “unsupported”.
+**Verification:** Covered by `query_reply_precedes_device_attributes` and
+`query_is_answered_without_storing` in `alacritty_terminal/tests/graphics.rs`.
 
-**Implementation.** `Action::Query` queues a `DecodeJob`
-(`alacritty_terminal/src/graphics/mod.rs:673–681`) and suppresses the parse‑time
-reply; `install()` produces it after the decode. I fed the exact probe through
-the real parser into a real `Term`:
-
-```
-AFTER PARSE:  ["\x1b[?6;22c"]
-AFTER SETTLE: ["\x1b[?6;22c", "\x1b_Gi=31;OK\x1b\\"]
-```
-
-The DA1 reply is emitted **first**. A client that implements the documented probe
-literally will conclude the terminal has no graphics support. `kitten icat`
-happens to tolerate a late reply, which is why this was missed.
-
-**Fix.** Validate queries synchronously (the payload is small and nothing is
-stored), or give query replies priority over later events. This is the most
-important interop fix in this document.
-
-### 5.2 Alt‑screen images are not cleared — **verified**
+### 5.2 Alt‑screen images are cleared on entry — **Resolved & Verified**
 
 **Spec.** Switching to the alternate screen (`1049h`) must clear the alt screen's
 images, just as it clears text.
 
-**Implementation.** `swap_alt` swaps the two `GraphicsStore`s but never clears
-the inactive one (`alacritty_terminal/src/term/mod.rs:919–941`). Test:
+**Implementation.** `alacritty_terminal/src/term/mod.rs` clears `inactive_graphics`
+before swapping screens when switching to alt screen mode.
 
-```
-alt placements after draw:     1
-main placements after leave:   0
-alt placements after re-enter: 1   ← should be 0
-```
+**Verification:** Covered by `alt_screen_images_cleared_on_entry` in `tests/graphics.rs`.
 
-Re‑entering the alt screen resurrects images from the previous alt session.
+### 5.3 In-flight chunked uploads aborted on new commands — **Resolved & Verified**
 
-**Fix.** Call `inactive_graphics.clear()` when entering the alt screen, before the
-swap.
+**Spec.** If an image is being loaded in chunks, any command that is not a legal continuation
+(`m`/`q`, plus `a=f` for a frame transfer) must abort the in-flight transfer.
 
-### 5.3 A delete during a chunked upload does not abort it
+**Implementation.** `alacritty_terminal/src/graphics/mod.rs` checks `has_explicit_action`.
+Any explicit action key or incompatible command aborts `self.transfer` immediately.
 
-**Spec.** “If an image is being loaded in chunks and the upload is not complete
-when any delete command is received, the partial upload must be aborted.”
+**Verification:** Covered by `delete_aborts_inflight_chunked_upload` and
+`chunk_abort_matrix_aborts_active_transfer` across `a=T`, `a=f`, `a=c`, `a=a`, `a=p`, and `a=d`.
 
-Kitty does this on the first line of `handle_delete_command`:
-`if (self->currently_loading.loading_for.image_id) free_load_data(&self->currently_loading);`
+### 5.4 Virtual placements protected from physical selectors — **Resolved & Verified**
 
-**Implementation.** Any command that is not a file/SHM transmission is treated as
-a continuation chunk (`alacritty_terminal/src/graphics/mod.rs:473`). `a=d` is
-swallowed: its `m` overwrites the start command's, the partial transfer is
-finished and dispatched, and the delete never happens.
+**Spec.** `d=a/A/c/C/p/P/q/Q/x/X/y/Y/z/Z` must never affect virtual placements; only
+`i/I/n/N/r/R` may delete them.
 
-**Impact.** A client cancelling a large upload cannot; it gets an error or a
-truncated image instead of a deletion.
+**Implementation.** All physical deletion selectors in `alacritty_terminal/src/graphics/placement.rs`
+skip placements with `is_virtual == true`.
 
-**Fix.** In `apc_end`, if a transfer is in progress and the new command is not a
-continuation (`m` absent and an action other than `t/T`/`f`), abort the transfer
-and process the new command.
+**Verification:** Covered by `virtual_placements_survive_physical_selectors` in `tests/graphics.rs`.
 
-### 5.4 Virtual placements are deleted by physical selectors
+### 5.5 Unsupported formats and quiet mode clamping — **Resolved & Verified**
 
-**Spec.** `d=a/A/c/C/p/P/q/Q/x/X/y/Y/z/Z` must never affect virtual placements.
+**Spec.** Unsupported formats like `f=1` set an unsupported format flag and reply `EINVAL`
+instead of dropping silently. `q > 2` is clamped to 2.
 
-**Implementation.** `retain_scrollback`, `remove_at`, `remove_column`,
-`remove_row`, and `remove_with_z` ignore `is_virtual`
-(`alacritty_terminal/src/graphics/placement.rs:135–166, 246`). `d=a` removes
-virtual placements.
+**Implementation.** `Command::parse` flags `unsupported_format = true` on unknown formats
+and clamps `quiet.min(2)`. `dispatch()` returns `EINVAL:invalid arguments` for unsupported formats.
 
-**Impact.** Moot while placeholders are not rendered, but it must be fixed
-together with §4.5.
-
-**Fix.** Skip `is_virtual` in every physical selector; only `i/I/n/N/r/R` may
-remove them.
+**Verification:** Covered by `unsupported_format_and_quiet_clamping` in `tests/graphics.rs`.
 
 ### 5.5 SHM names without a leading slash are rejected
 
@@ -661,18 +627,18 @@ and drop stale frames rather than queueing them.
 - Clipboard: OSC 52 is text‑only; binary/image clipboard needs the kitty clipboard
   protocol (this fork has it) or an X selection bridge inside your server.
 
-### 9.7 What this fork needs before an X server is practical
+### 9.7 Capabilities for an X server
 
 | Need | Why | Status |
 |---|---|---|
-| `a=c` compose | scroll/blit without resending pixels | ❌ |
-| `f=8`/`f=16` | 1–2 B/px for xterm/xclock/palette TUIs | ❌ |
-| `e` feature query | negotiate the above safely | ❌ |
-| `CSI ? 1016` pixel mouse | sub‑cell pointer for GUI apps | ❌ |
-| `a=q` ordering fix | clients must reliably detect graphics | bug |
-| alt‑screen clear | avoid ghost frames between sessions | bug |
+| `a=c` compose | scroll/blit without resending pixels | ✅ Implemented & verified |
+| `f=8`/`f=16` | 1–2 B/px for xterm/xclock/palette TUIs | ✅ Implemented & verified |
+| `e` feature query | negotiate the above safely | ✅ Implemented & verified |
+| `CSI ? 1016` pixel mouse | sub‑cell pointer for GUI apps | ✅ Implemented & verified |
+| `a=q` ordering fix | clients must reliably detect graphics | ✅ Resolved & verified |
+| alt‑screen clear | avoid ghost frames between sessions | ✅ Resolved & verified |
 | synchronized output (`?2026`) | tear‑free frames | ❌ (optional) |
-| placeholders / relative placements | only needed for `tmux` passthrough | ❌ |
+| placeholders / relative placements | needed for complex tiled and virtual layouts | ✅ Implemented & verified |
 
 ### 9.8 Hard limits of a terminal‑hosted X server
 

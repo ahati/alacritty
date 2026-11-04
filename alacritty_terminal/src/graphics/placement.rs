@@ -183,6 +183,55 @@ impl PlacementStore {
         })
     }
 
+    /// Find a placement mutably by internal image id and placement id. If placement_id is 0,
+    /// returns the first placement for internal_id.
+    pub fn find_mut(&mut self, internal_id: u32, placement_id: u32) -> Option<&mut Placement> {
+        self.placements.iter_mut().find(|p| {
+            p.internal_id == internal_id
+                && (placement_id == 0 || p.placement_id == placement_id)
+        })
+    }
+
+    /// Update the anchor of a virtual placement and cascade to its relative children.
+    pub fn update_virtual_anchor(&mut self, internal_id: u32, placement_id: u32, anchor: Point) {
+        if let Some(p) = self.find_mut(internal_id, placement_id) {
+            p.anchor = anchor;
+        }
+        self.update_children_for_parent(internal_id, placement_id, anchor);
+    }
+
+    /// Update positions of all children relative to a parent's new anchor.
+    pub fn update_children_for_parent(
+        &mut self,
+        parent_id: u32,
+        parent_placement_id: u32,
+        anchor: Point,
+    ) {
+        let mut affected = Vec::new();
+        for i in 0..self.placements.len() {
+            if let Some((pid, plid)) = self.placements[i].parent {
+                if pid == parent_id && (plid == parent_placement_id || plid == 0) {
+                    let child_anchor = Point::new(
+                        Line(anchor.line.0 + self.placements[i].relative_offset.1),
+                        Column(
+                            (anchor.column.0 as i32 + self.placements[i].relative_offset.0).max(0)
+                                as usize,
+                        ),
+                    );
+                    self.placements[i].anchor = child_anchor;
+                    affected.push((
+                        self.placements[i].internal_id,
+                        self.placements[i].placement_id,
+                        child_anchor,
+                    ));
+                }
+            }
+        }
+        for (cid, cplid, child_anchor) in affected {
+            self.update_children_for_parent(cid, cplid, child_anchor);
+        }
+    }
+
     /// Remove every placement of one image, and any relative children.
     pub fn remove_image(&mut self, internal_id: u32) {
         self.placements.retain(|placement| placement.internal_id != internal_id);
@@ -246,11 +295,18 @@ impl PlacementStore {
         // lines with it, exactly as `Selection::rotate` assumes.
         let carries_scrollback = region.start == Line(0);
 
+        let mut parent_deltas: Vec<((u32, u32), i32)> = Vec::new();
+
         self.placements.retain_mut(|placement| {
             // A virtual placement backs Unicode placeholder cells rather than
             // being anchored to the grid, so scrolling never moves it and only
             // an explicit delete or a reset removes it, as in the reference.
             if placement.is_virtual {
+                return true;
+            }
+
+            // Relative child placements follow their parent and do not scroll independently.
+            if placement.parent.is_some() {
                 return true;
             }
 
@@ -284,6 +340,7 @@ impl PlacementStore {
                     placement.src.y = placement.src.y.saturating_add(clip_src_y);
                     placement.src.height = placement.src.height.saturating_sub(clip_src_y);
                     placement.anchor.line = region.start;
+                    parent_deltas.push(((placement.internal_id, placement.placement_id), region.start.0 - line.0));
                     return true;
                 }
 
@@ -304,8 +361,13 @@ impl PlacementStore {
             }
 
             placement.anchor.line = new_line;
+            parent_deltas.push(((placement.internal_id, placement.placement_id), -delta));
             true
         });
+
+        for ((pid, plid), d_line) in parent_deltas {
+            self.shift_children(pid, plid, d_line, 0);
+        }
 
         self.prune_orphans();
     }
@@ -344,6 +406,7 @@ impl PlacementStore {
 
             start <= bottom && end > top
         });
+        self.prune_orphans();
     }
 
     /// Drop the placements that are on the screen, keeping the ones that live
@@ -357,6 +420,7 @@ impl PlacementStore {
             let end = Line(placement.anchor.line.0 + i32::from(placement.footprint.rows));
             end <= Line(0)
         });
+        self.prune_orphans();
     }
 
     /// Remove visible placements for `d=a/A`, leaving scrollback and virtual placements.

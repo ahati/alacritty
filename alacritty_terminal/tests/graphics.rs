@@ -12,6 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::index::Line;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
@@ -2395,4 +2396,140 @@ fn relative_placement_anchored_to_virtual_parent_succeeds() {
     assert!(!child.is_virtual);
     assert_eq!(child.parent, Some((parent_internal_id, 1)));
     assert_eq!(child.relative_offset, (2, 3));
+
+    // Print placeholder cell at line 4, col 10:
+    feed(&mut term, &mut parser, "\x1b[5;11H\x1b[38;5;80m\u{10EEEE}\u{0305}\u{0305}\x1b[39m".as_bytes());
+    term.sync_virtual_placements();
+
+    let all_placements = term.graphics().placements();
+    let child = all_placements.iter().find(|p| p.internal_id != parent_internal_id).unwrap();
+    assert_eq!(child.anchor.line.0, 4 + 3);
+    assert_eq!(child.anchor.column.0, 10 + 2);
+}
+
+#[test]
+fn frame_composition_default_rectangle_uses_full_dimensions() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Transmit base 2x2 image (id 1)
+    let four_pixels = BASE64.encode(&[255u8; 16]);
+    let cmd = format!("\x1b_Ga=T,f=32,s=2,v=2,i=1,q=2;{four_pixels}\x1b\\");
+    feed(&mut term, &mut parser, cmd.as_bytes());
+
+    // Add second frame (r=2)
+    let frame2 = format!("\x1b_Ga=f,i=1,s=2,v=2,r=2,q=2;{four_pixels}\x1b\\");
+    feed(&mut term, &mut parser, frame2.as_bytes());
+
+    recorder.events.lock().unwrap().clear();
+
+    // Compose with omitted w and h: a=c,i=1,r=2,c=1
+    // Spec: "If unspecified, the full image width and height are used."
+    let compose = b"\x1b_Ga=c,i=1,r=2,c=1\x1b\\";
+    feed(&mut term, &mut parser, compose);
+
+    assert_eq!(
+        recorder.pty_writes(),
+        vec!["\x1b_Gi=1;OK\x1b\\".to_owned()],
+        "frame composition with omitted w/h must default to full image dimensions and succeed"
+    );
+}
+
+#[test]
+fn feature_query_with_payload_and_quiet_semantics() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // 1. Feature query with payload must ignore payload and answer OK with supported keys
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=51,e=T,U=1;some_random_payload\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].contains(";OK"), "query must succeed ignoring payload: {:?}", writes[0]);
+    assert!(writes[0].contains("e=T"), "must echo supported feature: {:?}", writes[0]);
+
+    // 2. Feature query with q=1 must suppress the OK reply
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=52,e=T,U=1,q=1;ignored_payload\x1b\\");
+    assert!(recorder.pty_writes().is_empty(), "q=1 must suppress OK response even for feature query");
+
+    // 3. Erroring feature query (e.g. unknown format) must not echo e=... in failure response
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=53,f=1,e=T,U=1\x1b\\");
+    let err_writes = recorder.pty_writes();
+    assert_eq!(err_writes.len(), 1);
+    assert!(err_writes[0].contains("EINVAL"), "must reply EINVAL: {:?}", err_writes[0]);
+    assert!(!err_writes[0].contains("e="), "error response must omit e= echo: {:?}", err_writes[0]);
+}
+
+#[test]
+fn relative_child_pruned_when_parent_scrolls_out() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    let pixel_b64 = BASE64.encode(&[255, 0, 0, 255]);
+
+    // Create parent placement at line 0
+    feed(&mut term, &mut parser, b"\x1b[1;1H");
+    let parent_cmd = format!("\x1b_Ga=T,f=32,s=1,v=1,i=60,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, parent_cmd.as_bytes());
+
+    // Create child placement relative to parent (P=60, Q=1)
+    let child_cmd = format!("\x1b_Ga=T,f=32,s=1,v=1,i=61,p=1,P=60,Q=1,H=1,V=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, child_cmd.as_bytes());
+
+    assert_eq!(term.graphics().placements().len(), 2);
+
+    // Prune lines 0..2 above Line(10)
+    term.graphics_mut().prune(Line(10), Line(20));
+    assert_eq!(term.graphics().placements().len(), 0, "child must be pruned when parent is pruned");
+}
+
+#[test]
+fn chunk_abort_matrix_aborts_active_transfer() {
+    let pixel_b64 = BASE64.encode(&[255, 0, 0, 255]);
+
+    // Test matrix of commands that must abort an in-flight transfer
+    let abort_commands: &[(&str, &[u8])] = &[
+        ("a=T", b"\x1b_Ga=T,f=32,s=1,v=1,i=91;/////w==\x1b\\"),
+        ("a=f", b"\x1b_Ga=f,i=90,r=1;/////w==\x1b\\"),
+        ("a=c", b"\x1b_Ga=c,i=90,r=1,c=1\x1b\\"),
+        ("a=a", b"\x1b_Ga=a,i=90,s=3\x1b\\"),
+        ("a=p", b"\x1b_Ga=p,i=90\x1b\\"),
+        ("a=d", b"\x1b_Ga=d,d=i,i=90\x1b\\"),
+    ];
+
+    for (name, abort_cmd) in abort_commands {
+        let (mut term, _recorder) = terminal();
+        let mut parser = Processor::new();
+
+        // Start chunked transfer (m=1)
+        let chunk1 = format!("\x1b_Ga=t,f=32,s=1,v=1,i=90,m=1;{pixel_b64}\x1b\\");
+        feed(&mut term, &mut parser, chunk1.as_bytes());
+        assert!(term.graphics().has_pending_transfer(), "transfer must be pending before abort command ({})", name);
+
+        // Send abort command
+        feed(&mut term, &mut parser, abort_cmd);
+        assert!(!term.graphics().has_pending_transfer(), "transfer must be aborted by {}", name);
+    }
+}
+
+#[test]
+fn unsupported_format_and_quiet_clamping() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // 1. f=1 (unsupported format) with i=77 must reply EINVAL instead of silently dropping
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=t,f=1,i=77;data\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].contains("i=77"), "must echo image id: {:?}", writes[0]);
+    assert!(writes[0].contains("EINVAL"), "must report EINVAL for unsupported format: {:?}", writes[0]);
+
+    // 2. q=3 must be clamped to 2 (quiet mode 2 suppresses OK)
+    recorder.events.lock().unwrap().clear();
+    let pixel_b64 = BASE64.encode(&[255, 0, 0, 255]);
+    let cmd = format!("\x1b_Ga=T,f=32,s=1,v=1,i=78,q=3;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, cmd.as_bytes());
+    assert!(recorder.pty_writes().is_empty(), "q=3 clamped to 2 must suppress OK response");
 }
