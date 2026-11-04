@@ -53,6 +53,12 @@ impl RenderableImage {
     }
 }
 
+/// Generate a combined generation key for indexed images including the terminal palette hash.
+#[inline]
+pub fn indexed_image_generation(generation: u64, palette_hash: u64) -> u64 {
+    palette_hash.rotate_left(17) ^ generation.wrapping_mul(0x9E3779B97F4A7C15)
+}
+
 /// Key identifying a specific revision of an image in a texture cache.
 pub fn image_key(internal_id: u32, generation: u64) -> ImageKey {
     (u64::from(internal_id) << GENERATION_BITS) | (generation & GENERATION_MASK)
@@ -163,7 +169,7 @@ fn resolve(
     let key = if image.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
         || image.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
     {
-        image_key(placement.internal_id, image.generation ^ palette_hash)
+        image_key(placement.internal_id, indexed_image_generation(image.generation, palette_hash))
     } else {
         image_key(placement.internal_id, image.generation)
     };

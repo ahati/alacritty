@@ -726,6 +726,14 @@ impl GraphicsStore {
 
     /// Carry out a parsed command.
     fn dispatch(&mut self, command: &Command, data: Vec<u8>, cursor: Point) -> GraphicsUpdate {
+        // Feature queries evaluate immediately and echo supported keys without data source validation
+        if command.action == Action::Query && command.feature_query.is_some() {
+            if command.image_id != 0 && command.image_number != 0 {
+                return self.failure(command, GraphicsError::Invalid);
+            }
+            return self.success(command, false);
+        }
+
         if command.unsupported_format {
             return self.failure(command, GraphicsError::Invalid);
         }
@@ -1070,6 +1078,7 @@ impl GraphicsStore {
 
         let src_idx = (src_frame_num as usize).checked_sub(1).ok_or(GraphicsError::Invalid)?;
         let dst_idx = (dst_frame_num as usize).checked_sub(1).ok_or(GraphicsError::Invalid)?;
+        let dst_frame_index = u16::try_from(dst_idx).map_err(|_| GraphicsError::Invalid)?;
 
         let frames = image.frames();
         if src_idx >= frames.len() || dst_idx >= frames.len() {
@@ -1131,7 +1140,7 @@ impl GraphicsStore {
             channels,
         );
 
-        let changed = self.images.replace_frame(internal_id, dst_idx as u16, dst_pixels.into());
+        let changed = self.images.replace_frame(internal_id, dst_frame_index, dst_pixels.into());
         Ok(changed)
     }
 
@@ -1802,11 +1811,16 @@ impl GraphicsStore {
         let is_f = queried_action == Action::Frame;
         let is_a = queried_action == Action::Animate;
         let is_c = queried_action == Action::Compose;
+        let is_q = queried_action == Action::Query;
+        let is_trans_action = is_t || is_big_t || is_q || is_f;
 
         if let Some(del) = command.delete {
             if is_d {
                 let _ = write!(response, ",d={}", del as char);
             }
+        }
+        if command.placement_id != 0 && (is_p || is_big_t || is_d) {
+            let _ = write!(response, ",p={}", command.placement_id);
         }
         if command.cursor_movement == CursorMovement::Stay && (is_big_t || is_p || is_c) {
             response.push_str(",C=1");
@@ -1841,16 +1855,26 @@ impl GraphicsStore {
         if command.src_height != 0 && (is_big_t || is_p || is_f || is_c) {
             let _ = write!(response, ",h={}", command.src_height);
         }
-        if command.source_width != 0 && (is_t || is_big_t || is_f || is_a) {
+        if command.source_width != 0 && (is_trans_action || is_a) {
             let _ = write!(response, ",s={}", command.source_width);
         }
-        if command.source_height != 0 && (is_t || is_big_t || is_f || is_a) {
+        if command.source_height != 0 && (is_trans_action || is_a) {
             let _ = write!(response, ",v={}", command.source_height);
         }
-        if command.format != Format::Rgba && (is_t || is_big_t || is_f) {
-            let _ = write!(response, ",f={}", command.format.code());
+        if command.data_size != 0 && is_trans_action {
+            let _ = write!(response, ",S={}", command.data_size);
         }
-        if command.medium != Medium::Direct && (is_t || is_big_t || is_f) {
+        if command.data_offset != 0 && is_trans_action {
+            let _ = write!(response, ",O={}", command.data_offset);
+        }
+        if command.format != Format::Rgba {
+            if is_t || is_big_t || is_q {
+                let _ = write!(response, ",f={}", command.format.code());
+            } else if is_f && (command.format == Format::Rgb || command.format == Format::Png) {
+                let _ = write!(response, ",f={}", command.format.code());
+            }
+        }
+        if command.medium != Medium::Direct && is_trans_action {
             let _ = write!(response, ",t={}", match command.medium {
                 Medium::File => 'f',
                 Medium::TempFile => 't',
@@ -1858,10 +1882,10 @@ impl GraphicsStore {
                 Medium::Direct => 'd',
             });
         }
-        if command.compression.is_some() && (is_t || is_big_t || is_f) {
+        if command.compression.is_some() && is_trans_action {
             response.push_str(",o=z");
         }
-        if command.transient && (is_t || is_big_t) {
+        if command.transient && (is_t || is_big_t || is_q) {
             response.push_str(",N=1");
         }
         if command.parent_image_id != 0 && (is_big_t || is_p) {

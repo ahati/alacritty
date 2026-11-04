@@ -723,6 +723,10 @@ impl<T> Term<T> {
     /// Sync virtual placement anchors from the minimum line and column of their
     /// associated Unicode placeholder cells in the grid.
     pub fn sync_virtual_placements(&mut self) {
+        if !self.graphics.placements().iter().any(|p| p.is_virtual) {
+            return;
+        }
+
         let virt_keys: Vec<(u32, u32, u32, u32)> = self
             .graphics
             .placements()
@@ -749,7 +753,14 @@ impl<T> Term<T> {
                     Color::Spec(rgb) => {
                         (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
                     },
-                    Color::Named(named) => named as u8 as u32,
+                    Color::Named(named) => {
+                        let val = named as usize;
+                        if val < 256 {
+                            val as u32
+                        } else {
+                            0
+                        }
+                    },
                 };
                 let placement_id = match cell.underline_color() {
                     None => 0,
@@ -757,7 +768,14 @@ impl<T> Term<T> {
                     Some(Color::Spec(rgb)) => {
                         (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
                     },
-                    Some(Color::Named(named)) => named as u8 as u32,
+                    Some(Color::Named(named)) => {
+                        let val = named as usize;
+                        if val < 256 {
+                            val as u32
+                        } else {
+                            0
+                        }
+                    },
                 };
                 if let Some(zerowidth) = cell.zerowidth() {
                     if zerowidth.len() > 2 {
@@ -771,7 +789,7 @@ impl<T> Term<T> {
 
                 for &(int_id, pl_id, cid, num) in &virt_keys {
                     if (placement_id == 0 || pl_id == 0 || pl_id == placement_id)
-                        && (int_id == image_id || cid == image_id || num == image_id)
+                        && (cid == image_id || num == image_id)
                     {
                         let point = cell.point;
                         anchors

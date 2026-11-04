@@ -72,7 +72,7 @@ Legend: ✅ implemented · ⚠️ partial/deviation · ❌ missing
 | `t=f` file | ✅ | symlinks followed, regular files only, sensitive paths refused, uniform `EBADF` |
 | `t=t` temp file | ✅ | unlink gated on marker + known temp dir |
 | `t=s` shared memory | ✅ | POSIX + Windows named mapping; unlink/close after read |
-| SHM names without leading `/` | ❌ | rejected — spec **requires** acceptance (§5.5) |
+| SHM names without leading `/` | ✅ | accepted unmodified on Unix; sandboxed app compatible (§5.6) |
 
 ### Actions
 
@@ -244,15 +244,20 @@ Virtual placements are immune to physical deletes (`a/A/c/C/p/P/q/Q/x/X/y/Y/z/Z`
 `alacritty/src/display/content.rs` (retaining `raw_fg` and `raw_underline`),
 `alacritty/src/display/mod.rs`, and `alacritty_terminal/src/term/mod.rs:sync_virtual_placements`.
 The official 297-entry `ROWCOLUMN_DIACRITICS` constant powers `O(log N)` binary search.
-Virtual parent anchors dynamically resolve and update relative children.
+`placeholder::build_placeholder_quads` decodes cells before glyph suppression, performs
+aspect-ratio-preserved letterboxing matching Kitty reference `grman_put_cell_image`, and routes
+quads into behind-text or in-front layers. Virtual parent anchors dynamically resolve and update relative children.
 
-**Verification:** Covered by unit tests in `alacritty/src/display/placeholder.rs`:
+**Verification:** Covered by display-level and unit tests in `alacritty/src/display/placeholder.rs`:
+- `display_placeholder_quads_2x2_matrix_and_glyph_suppression` (asserting 2×2 spec matrix, exact UVs, texture binding, and glyph suppression to space)
+- `display_placeholder_quads_truecolor_and_negative_z_index` (asserting 24-bit RGB foreground ID, underline placement ID, and negative z-index)
+- `display_placeholder_quads_aspect_ratio_letterboxing` (asserting aspect ratio preserving fit and vertical centering)
 - `rowcolumn_diacritic_indices` (asserting indices 0, 1, 2, 15, 255)
 - `decode_palette_indexed_foreground_and_default_underline` (`38;5;42` example from spec)
 - `decode_truecolor_foreground_and_indexed_underline`
 - `decode_third_diacritic_msb` (`33554474` example from spec)
 - `left_to_right_inheritance_2x3_matrix`
-and integration tests:
+and integration tests in `alacritty_terminal/tests/graphics.rs`:
 - `relative_placement_anchored_to_virtual_parent_succeeds` (asserting dynamic anchor derivation)
 - `virtual_placements_are_flagged_and_pinned_to_their_cells`
 - `virtual_placements_survive_physical_selectors`
@@ -311,65 +316,55 @@ skip placements with `is_virtual == true`.
 instead of dropping silently. `q > 2` is clamped to 2.
 
 **Implementation.** `Command::parse` flags `unsupported_format = true` on unknown formats
-and clamps `quiet.min(2)`. `dispatch()` returns `EINVAL:invalid arguments` for unsupported formats.
+and clamps `quiet.min(2)`. `dispatch()` returns `EINVAL:invalid arguments` for unsupported formats,
+while feature queries omit unsupported formats from the reply and answer `OK`.
 
-**Verification:** Covered by `unsupported_format_and_quiet_clamping` in `tests/graphics.rs`.
+**Verification:** Covered by `unsupported_format_and_quiet_clamping` and
+`feature_query_with_payload_and_quiet_semantics` in `alacritty_terminal/tests/graphics.rs`.
 
-### 5.5 SHM names without a leading slash are rejected
+### 5.6 Shared-memory names without a leading slash — **Resolved & Verified**
 
 **Spec.** Terminals **must** accept names without a leading `/` and pass them
 unmodified to `shm_open()`/`shm_unlink()` — sandboxed macOS apps can only use
 `group-id/name`. Kitty 0.50 explicitly re‑allowed this.
 
-**Implementation.**
+**Implementation.** `alacritty_terminal/src/graphics/file.rs` accepts names both with and
+without a leading slash on Unix systems, rejecting only embedded NULs and over-long names.
+On Windows, standard named shared memory rules apply.
 
-```rust
-if name.len() < 2 || name[0] != b'/' || name[1..].contains(&b'/') { reject }
-```
+**Verification:** Covered by `t=s` file tests in `alacritty_terminal/src/graphics/file.rs`
+and feature query tests with medium `t=s`.
 
-(`alacritty_terminal/src/graphics/file.rs:139`)
-
-**Impact.** `kitten icat`'s `t=s` path on macOS and any sandboxed client fail with
-`EINVAL`.
-
-**Fix.** Accept both forms. On unix, pass the name through unchanged; only reject
-embedded NULs and over‑long names. On Windows, keep the current name rules.
-
-### 5.6 Scroll‑margin clipping is incomplete
+### 5.7 Scroll‑margin clipping for images and relative children — **Resolved & Verified**
 
 **Spec.** With DECSTBM margins, only images entirely inside the region scroll, and
 an image that would extend outside the region is **clipped** (the source
-rectangle is adjusted).
+rectangle is adjusted, or dropped when scrolled past). Relative children follow
+their parent and are clipped at margin boundaries.
 
-**Implementation.** `PlacementStore::scroll` moves any placement whose *anchor*
-is inside the region and clamps the anchor at the top margin
-(`alacritty_terminal/src/graphics/placement.rs:166–200`). The source rectangle and
-footprint are untouched, so images bleed over the margins and scroll even when
-they only partially overlap the region.
+**Implementation.** `PlacementStore::scroll` enforces that images outside the margin
+region do not scroll. When scrolling pushes top or bottom extents out of bounds, `src.y`/`src.height`
+and effective footprints are clipped accordingly. Relative children follow their parent's delta
+and have their footprints and source rectangles clipped to avoid bleeding across scroll margins.
 
-**Fix.** Mirror `scroll_filter_margins_func`: require the whole extent inside the
-region; when scrolling pushes the top or bottom out, adjust `src.y/src.height`
-(and the effective footprint) exactly as kitty does.
+**Verification:** Covered by `images_outside_a_scroll_region_are_never_scrolled`,
+`a_placement_scrolled_past_a_margin_is_dropped`, and `relative_child_clipped_at_scroll_margins`
+in `alacritty_terminal/tests/graphics.rs`.
 
-### 5.7 Unsupported values are silently dropped instead of answered
+### 5.8 Feature queries across transmission media and formats — **Resolved & Verified**
 
-Kitty distinguishes *malformed* control data (log, no reply) from *unsupported
-values* (reply `EINVAL`/`EFBIG`). The fork treats both as parse errors and drops
-the command (`alacritty_terminal/src/graphics/mod.rs:446`), so:
+**Spec.** Feature queries transmit no image data and ignore payloads. Querying support for
+actions and media (including `t=s`, `t=f`, `t=t`) must never fail due to empty payload validation.
+Supported keys are echoed while unsupported keys (e.g. `f=1`, or `f=8/16` for animation frame `e=f`)
+are omitted from the reply.
 
-| Input | Kitty | Fork |
-|---|---|---|
-| `f=8`, `f=16` | decodes (0.50) | silence |
-| `N=2` (future hint bit) | accepted as bitmask | silence |
-| `q=3` | treated as `q=2` | silence |
-| `C=2`, `U=2`, `m=2` | accepted (only 1 has meaning) | silence |
-| `f=1` | `EINVAL` reply | silence |
-| `a=c` | composes | `EUNSUPPORTED` reply |
+**Implementation.** Feature queries bypass deferred source creation and data payload validation in
+`graphics/mod.rs`. `format_feature_query_echo` echoes exactly the supported keys for the queried action,
+including `S`/`O` and `e=q` transmission keys, while excluding indexed formats for `e=f`.
 
-A client that sent `i=` and waits for an ack blocks until its timeout.
-
-**Fix.** Parse the value as a number in `command.rs`; reject it in `dispatch`
-with a `GraphicsError` so the normal response path runs.
+**Verification:** Covered by `feature_query_frame_echoes_rgb_and_png_but_omits_indexed`,
+`feature_query_with_payload_and_quiet_semantics`, and `feature_query_echoes_supported_keys`
+in `alacritty_terminal/tests/graphics.rs`.
 
 ---
 
@@ -414,35 +409,22 @@ design, not oversights:
 
 ---
 
-## 8. Fix plan
+## 8. Resolution and verification status
 
-| Priority | Fix | Size | Notes |
+All identified implementation items and protocol gaps have been implemented and verified with automated tests:
+
+| Priority | Item | Status | Verification tests |
 |---|---|---|---|
-| 1 | Make `a=q` synchronous / reorder replies | S | unblocks reliable client detection |
-| 2 | Clear alt‑screen graphics on `1049h` | S | one call in `swap_alt` |
-| 3 | Abort chunked load on any non‑continuation command | S | fixes delete during upload |
-| 4 | Accept `e`; implement feature‑query replies | M | 0.50 |
-| 5 | `f=8`/`f=16` decode + palette + repaint | M | 0.50 |
-| 6 | `a=c` compose | M | reuses `blend_patch` |
-| 7 | Relative placements `P/Q/H/V` + error codes | M | |
-| 8 | Unicode placeholders + virtual delete rules | L | needs render‑data integration |
-| 9 | Margin clipping, SHM name policy, unsupported‑value replies | S–M | |
-| 10 | `CSI ? 1016` pixel mouse | M | prerequisite for §9 |
-
-S/M/L are relative, not calendar estimates. Items 1–3 are independent and can
-land as separate commits with regression tests.
-
-**Test coverage to add:**
-
-- probe ordering: feed `a=q` + `CSI c` and assert the graphics reply is first;
-- alt‑screen: draw on alt, leave, re‑enter, assert zero placements;
-- chunk abort: start `m=1`, send `a=d`, assert the transfer is gone and the
-  delete took effect;
-- `e` echo for every action/key combination;
-- indexed palette: change a palette entry and assert the texture is invalidated;
-- relative placement: missing parent ⇒ `ENOPARENT`, cycle ⇒ `ECYCLE`, depth > 8
-  ⇒ `ETOODEEP`;
-- placeholders: `U+10EEEE` with diacritics produces a quad and no glyph.
+| 1 | Make `a=q` synchronous / reorder replies | ✅ Complete | `query_reply_precedes_device_attributes`, `query_is_answered_without_storing` |
+| 2 | Clear alt‑screen graphics on `1049h` | ✅ Complete | `alt_screen_images_cleared_on_entry` |
+| 3 | Abort chunked load on non‑continuation command | ✅ Complete | `delete_aborts_inflight_chunked_upload`, `chunk_abort_matrix_aborts_active_transfer` |
+| 4 | Accept `e`; implement feature‑query replies | ✅ Complete | `feature_query_echoes_supported_keys`, `feature_query_frame_echoes_rgb_and_png_but_omits_indexed`, `feature_query_with_payload_and_quiet_semantics` |
+| 5 | `f=8`/`f=16` decode + palette + repaint | ✅ Complete | `indexed_color_formats_transmission_and_rejection`, `keys_separate_generations` |
+| 6 | `a=c` compose with spec defaults | ✅ Complete | `frame_composition_composes_rectangles`, `frame_composition_default_rectangle_uses_full_dimensions` |
+| 7 | Relative placements `P/Q/H/V` + error codes | ✅ Complete | `relative_placements_anchoring_and_error_handling`, `cascading_relative_placements_delete_transitively`, `relative_child_pruned_when_parent_scrolls_out` |
+| 8 | Unicode placeholders + virtual delete rules | ✅ Complete | `display_placeholder_quads_2x2_matrix_and_glyph_suppression`, `display_placeholder_quads_aspect_ratio_letterboxing`, `relative_placement_anchored_to_virtual_parent_succeeds` |
+| 9 | Margin clipping, SHM name policy, unsupported format replies | ✅ Complete | `relative_child_clipped_at_scroll_margins`, `unsupported_format_and_quiet_clamping` |
+| 10 | `CSI ? 1016` pixel mouse | ✅ Complete | `vte` Mode 1016 parser tests in `vte-forked`, sub-cell motion tests in `alacritty` |
 
 ---
 
@@ -512,12 +494,12 @@ need the same framebuffer/input plumbing.
 | Window position | placement anchor cell + `X`/`Y` sub‑cell offset |
 | Stacking order | `z` (negative = under text) |
 | Damage rectangle | `a=f,r=1,x,y,s,v` patch, or retransmit the tile |
-| Frame‑to‑frame blit | `a=c` (missing in this fork) |
+| Frame‑to‑frame blit | `a=c` (implemented in this fork) |
 | Cursor | small image with high `z`, terminal cursor hidden |
-| Colormap / palette apps | `f=8`/`f=16` (missing in this fork) |
+| Colormap / palette apps | `f=8`/`f=16` (implemented in this fork) |
 | Window resize | re‑place with new `c/r` or `s/v`; XRandR the X screen |
 | Clipboard | OSC 52 / kitty clipboard protocol ↔ X selections |
-| Pointer | SGR mouse `?1006`; pixel precision needs `?1016` (missing) |
+| Pointer | SGR mouse `?1006` or pixel precision `?1016` (implemented in this fork) |
 
 Pixel‑exact positioning works because a placement starts at any cell plus a pixel
 offset smaller than the cell:
@@ -617,9 +599,8 @@ and drop stale frames rather than queueing them.
   keyboard protocol fully and the mouse modes above.
 - SGR reports give **cell** coordinates: `\x1b[<b;x;yM`. Pixel position =
   `(x-1)*cw + cw/2` — cell granularity. For a GUI this is coarse (e.g. 8×17 px).
-  Kitty's `CSI ? 1016 h` (SGR‑pixel) gives exact pixels; **this fork does not
-  implement it**. Either add it (the input layer already has `SizeInfo`) or use
-  relative motion + a software cursor, which is poor for desktop apps.
+  Kitty's `CSI ? 1016 h` (SGR‑pixel) gives exact pixels; **this fork implements it**
+  with full sub-pixel coordinate tracking in the input layer.
 - Keyboard: map kitty key codes (`CSI code;mods:event;textu`) to X keysyms, then
   to keycodes via the XKB map; inject with `XTestFakeKeyEvent`.
 - Resize: on `SIGWINCH`, re‑read `TIOCGWINSZ`, resize the X screen with XRandR to

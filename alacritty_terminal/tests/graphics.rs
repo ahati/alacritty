@@ -2356,12 +2356,11 @@ fn feature_query_echoes_delete_selector_and_omits_unsupported_actions() {
     );
     recorder.events.lock().unwrap().clear();
 
-    // Query an unsupported action e=x
+    // Query an invalid action e=x is malformed control data and must be dropped without reply
     feed(&mut term, &mut parser, b"\x1b_Ga=q,i=71,s=1,v=1,f=24,e=x;AAAA\x1b\\");
-    assert_eq!(
-        recorder.pty_writes(),
-        vec!["\x1b_Gi=71;OK\x1b\\".to_owned()],
-        "feature query for unsupported action must omit e in response"
+    assert!(
+        recorder.pty_writes().is_empty(),
+        "command with malformed action e=x must be dropped without reply"
     );
 }
 
@@ -2453,13 +2452,26 @@ fn feature_query_with_payload_and_quiet_semantics() {
     feed(&mut term, &mut parser, b"\x1b_Ga=q,i=52,e=T,U=1,q=1;ignored_payload\x1b\\");
     assert!(recorder.pty_writes().is_empty(), "q=1 must suppress OK response even for feature query");
 
-    // 3. Erroring feature query (e.g. unknown format) must not echo e=... in failure response
+    // 3. Feature query with unsupported format (f=1) succeeds with OK and supported keys, omitting f
     recorder.events.lock().unwrap().clear();
     feed(&mut term, &mut parser, b"\x1b_Ga=q,i=53,f=1,e=T,U=1\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=53,e=T,U=1;OK\x1b\\");
+    assert!(!writes[0].contains("f="), "unsupported format key f=1 must be omitted from echo");
+
+    // 4. Feature query with genuine error (both i and I specified) fails with EINVAL and omits e=...
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=54,I=54,e=T\x1b\\");
     let err_writes = recorder.pty_writes();
     assert_eq!(err_writes.len(), 1);
     assert!(err_writes[0].contains("EINVAL"), "must reply EINVAL: {:?}", err_writes[0]);
     assert!(!err_writes[0].contains("e="), "error response must omit e= echo: {:?}", err_writes[0]);
+
+    // 5. Malformed feature query action (e=x) fails command parsing with no response
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=55,e=x\x1b\\");
+    assert!(recorder.pty_writes().is_empty(), "malformed control data must not be answered");
 }
 
 #[test]
@@ -2532,4 +2544,96 @@ fn unsupported_format_and_quiet_clamping() {
     let cmd = format!("\x1b_Ga=T,f=32,s=1,v=1,i=78,q=3;{pixel_b64}\x1b\\");
     feed(&mut term, &mut parser, cmd.as_bytes());
     assert!(recorder.pty_writes().is_empty(), "q=3 clamped to 2 must suppress OK response");
+}
+
+#[test]
+fn feature_query_frame_echoes_rgb_and_png_but_omits_indexed() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // 1. e=f with f=8 (indexed) must omit f=8 because animation frames do not support indexed format
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=81,e=f,f=8\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=81,e=f;OK\x1b\\");
+
+    // 2. e=f with f=16 (indexed alpha) must also omit f=16
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=82,e=f,f=16\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=82,e=f;OK\x1b\\");
+
+    // 3. e=f with f=24 (RGB) must echo f=24
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=83,e=f,f=24\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=83,e=f,f=24;OK\x1b\\");
+
+    // 4. e=f with S and O keys echoes them (N is omitted for animation frames per errata)
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=84,e=f,S=100,O=10,N=1\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=84,e=f,S=100,O=10;OK\x1b\\");
+
+    // 5. e=q (query) supports indexed formats and transmission keys
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=85,e=q,f=8,s=10,v=20,t=f\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=85,e=q,s=10,v=20,f=8,t=f;OK\x1b\\");
+
+    // 6. G-1: Feature query with medium t=s (or t=f, t=t) does not attempt to read files and succeeds with OK
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=86,e=T,t=s\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=86,e=T,t=s;OK\x1b\\");
+
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=87,e=T,t=f\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=87,e=T,t=f;OK\x1b\\");
+}
+
+#[test]
+fn relative_child_clipped_at_scroll_margins() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    let pixel_b64 = BASE64.encode(&vec![255u8; 100 * 100 * 4]);
+
+    // Set DECSTBM margin lines 2 to 8
+    feed(&mut term, &mut parser, b"\x1b[2;8r");
+    feed(&mut term, &mut parser, b"\x1b[2;1H");
+
+    // Parent at line 1 (0-indexed line 1 = screen row 2) with 4 rows footprint
+    let parent_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=4,i=70,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, parent_cmd.as_bytes());
+
+    // Relative child placed with V=1 (relative line +1 = line 2) with 4 rows footprint
+    let child_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=4,i=71,p=1,P=70,Q=1,H=0,V=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, child_cmd.as_bytes());
+
+    let parent_internal_id = term.graphics().images().find(|(_, img)| img.client_id == 70).unwrap().0;
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 2);
+    let child_orig = placements.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))).unwrap();
+    assert_eq!(child_orig.anchor.line.0, 2);
+    assert_eq!(child_orig.footprint.rows, 4);
+
+    // Scroll up by 2 lines within margins (CSI 2 S)
+    feed(&mut term, &mut parser, b"\x1b[2S");
+
+    let placements_after = term.graphics().placements();
+    if let Some(child_after) = placements_after.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))) {
+        assert_eq!(child_after.anchor.line.0, 1);
+        assert_eq!(child_after.footprint.rows, 3);
+        assert!(child_after.src.y > 0, "child src.y must be clipped");
+    } else {
+        panic!("child should remain partially visible and clipped");
+    }
 }

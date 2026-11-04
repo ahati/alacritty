@@ -93,6 +93,31 @@ pub struct ImageData {
 }
 
 impl ImageData {
+    /// Construct a static image data instance.
+    pub fn new(
+        client_id: u32,
+        number: u32,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        pixels: Arc<[u8]>,
+    ) -> Self {
+        let charge = pixels.len();
+        Self {
+            client_id,
+            number,
+            width,
+            height,
+            format,
+            pixels,
+            generation: 1,
+            transient: false,
+            charge,
+            frames: Vec::new(),
+            animation: None,
+        }
+    }
+
     /// Whether the pixel data has been decoded yet.
     ///
     /// Decoding happens away from the terminal lock, so an image can be placed

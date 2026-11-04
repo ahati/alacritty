@@ -832,6 +832,7 @@ impl Display {
                 252 => cursor_bg,
                 253 => cursor_fg,
                 254 => url_color,
+                255 => foreground_color,
                 _ => content.color(i),
             };
             *pal_entry = alacritty_terminal::vte::ansi::Rgb { r: rgb.r, g: rgb.g, b: rgb.b };
@@ -879,7 +880,7 @@ impl Display {
                 if image.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
                     || image.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
                 {
-                    image::image_key(internal_id, image.generation ^ palette_hash)
+                    image::image_key(internal_id, image::indexed_image_generation(image.generation, palette_hash))
                 } else {
                     image::image_key(internal_id, image.generation)
                 }
@@ -939,75 +940,36 @@ impl Display {
         }
 
         // Process Unicode placeholder cells (U+10EEEE)
-        let mut placeholder_quads = Vec::new();
-        let mut last_placeholder = None;
-        for cell in &mut grid_cells {
-            if cell.character == '\u{10EEEE}' {
-                cell.character = ' ';
+        let (placeholder_behind, placeholder_front) = placeholder::build_placeholder_quads(
+            &mut grid_cells,
+            &virtual_placements,
+            &size_info,
+            |p, img| {
+                let key = if img.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
+                    || img.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
+                {
+                    image::image_key(
+                        p.internal_id,
+                        image::indexed_image_generation(img.generation, palette_hash),
+                    )
+                } else {
+                    image::image_key(p.internal_id, img.generation)
+                };
 
-                if let Some(decoded) = placeholder::decode_placeholder(cell, &mut last_placeholder) {
-                    if let Some((p, img)) = virtual_placements.iter().find(|(p, img)| {
-                        (decoded.placement_id == 0 || p.placement_id == decoded.placement_id)
-                            && (img.client_id == decoded.image_id
-                                || img.number == decoded.image_id
-                                || p.internal_id == decoded.image_id)
-                    }) {
-                        if img.is_ready() {
-                            let key = if img.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
-                                || img.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
-                            {
-                                image::image_key(p.internal_id, img.generation ^ palette_hash)
-                            } else {
-                                image::image_key(p.internal_id, img.generation)
-                            };
-
-                            let texture = if let Some(tex) = self.image_cache.get(key) {
-                                tex
-                            } else {
-                                self.image_cache.upload(
-                                    key,
-                                    img.width,
-                                    img.height,
-                                    img.format,
-                                    &img.pixels,
-                                    Some(&palette),
-                                )
-                            };
-
-                            if texture != 0 {
-                                let total_cols = p.columns.max(1) as f32;
-                                let total_rows = p.rows.max(1) as f32;
-
-                                let src_x = p.src.x as f32;
-                                let src_y = p.src.y as f32;
-                                let src_w = (if p.src.width == 0 { img.width } else { p.src.width }) as f32;
-                                let src_h = (if p.src.height == 0 { img.height } else { p.src.height }) as f32;
-
-                                let tile_w = src_w / total_cols;
-                                let tile_h = src_h / total_rows;
-
-                                let u0 = (src_x + decoded.col as f32 * tile_w) / img.width as f32;
-                                let u1 = (src_x + (decoded.col + 1) as f32 * tile_w) / img.width as f32;
-                                let v0 = (src_y + decoded.row as f32 * tile_h) / img.height as f32;
-                                let v1 = (src_y + (decoded.row + 1) as f32 * tile_h) / img.height as f32;
-
-                                let px = cell.point.column.0 as f32 * size_info.cell_width() + size_info.padding_x();
-                                let py = cell.point.line as f32 * size_info.cell_height() + size_info.padding_y();
-
-                                placeholder_quads.push(crate::renderer::images::ImageQuad {
-                                    x: px,
-                                    y: py,
-                                    width: size_info.cell_width(),
-                                    height: size_info.cell_height(),
-                                    uv: [u0, v0, u1, v1],
-                                    texture,
-                                });
-                            }
-                        }
-                    }
+                if let Some(tex) = self.image_cache.get(key) {
+                    tex
+                } else {
+                    self.image_cache.upload(
+                        key,
+                        img.width,
+                        img.height,
+                        img.format,
+                        &img.pixels,
+                        Some(&palette),
+                    )
                 }
-            }
-        }
+            },
+        );
 
         // Uploading left the image texture bound, which the text renderer does
         // not know about.
@@ -1018,9 +980,10 @@ impl Display {
         // discards those fragments.
         let (behind, in_front): (Vec<_>, Vec<_>) =
             images.iter().partition(|image| image.z_index < 0);
-        let behind_quads = image_quads(&behind, &self.image_cache);
+        let mut behind_quads = image_quads(&behind, &self.image_cache);
+        behind_quads.extend(placeholder_behind);
         let mut front_quads = image_quads(&in_front, &self.image_cache);
-        front_quads.extend(placeholder_quads);
+        front_quads.extend(placeholder_front);
 
         self.renderer.draw_images(&size_info, &behind_quads);
 

@@ -3,9 +3,15 @@
 //! Kitty specifies image display via `U+10EEEE` cells with combining
 //! diacritical marks indicating row, column, and high byte of image ID.
 
+use std::sync::Arc;
+
+use alacritty_terminal::graphics::image::ImageData;
+use alacritty_terminal::graphics::placement::Placement;
 use alacritty_terminal::vte::ansi::Color;
 
 use crate::display::content::RenderableCell;
+use crate::display::SizeInfo;
+use crate::renderer::images::ImageQuad;
 
 pub use alacritty_terminal::graphics::ROWCOLUMN_DIACRITICS;
 
@@ -53,7 +59,14 @@ pub fn decode_placeholder(
         Color::Spec(rgb) => {
             (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
         },
-        Color::Named(named) => named as u8 as u32,
+        Color::Named(named) => {
+            let val = named as usize;
+            if val < 256 {
+                val as u32
+            } else {
+                0
+            }
+        },
     };
 
     // Spec: Placement ID is specified using the underline color. If omitted, placement ID is 0.
@@ -63,7 +76,14 @@ pub fn decode_placeholder(
         Some(Color::Spec(rgb)) => {
             (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
         },
-        Some(Color::Named(named)) => named as u8 as u32,
+        Some(Color::Named(named)) => {
+            let val = named as usize;
+            if val < 256 {
+                val as u32
+            } else {
+                0
+            }
+        },
     };
 
     let mut d_row = None;
@@ -160,10 +180,147 @@ pub fn decode_placeholder(
     })
 }
 
+/// Construct textured quads for `U+10EEEE` Unicode placeholder cells, partitioned
+/// into behind-text quads (`z_index < 0`) and in-front-of-text quads (`z_index >= 0`).
+///
+/// Each placeholder cell is decoded to determine image ID, placement ID, and tile coordinates.
+/// Decoded cells have their character set to `' '` to suppress text glyph rendering.
+/// Placements are rendered preserving aspect ratio matching the Kitty 0.50 reference implementation.
+pub fn build_placeholder_quads<F>(
+    cells: &mut [RenderableCell],
+    virtual_placements: &[(Placement, Arc<ImageData>)],
+    size_info: &SizeInfo,
+    mut get_texture: F,
+) -> (Vec<ImageQuad>, Vec<ImageQuad>)
+where
+    F: FnMut(&Placement, &ImageData) -> u32,
+{
+    let mut behind_quads = Vec::new();
+    let mut front_quads = Vec::new();
+    let mut last_placeholder = None;
+
+    let cell_w = size_info.cell_width();
+    let cell_h = size_info.cell_height();
+    let pad_x = size_info.padding_x();
+    let pad_y = size_info.padding_y();
+
+    for cell in cells.iter_mut() {
+        if cell.character == '\u{10EEEE}' {
+            let decoded = decode_placeholder(cell, &mut last_placeholder);
+            cell.character = ' ';
+
+            let Some(decoded) = decoded else { continue };
+
+            let Some((p, img)) = virtual_placements.iter().find(|(p, img)| {
+                (decoded.placement_id == 0 || p.placement_id == decoded.placement_id)
+                    && (img.client_id == decoded.image_id || img.number == decoded.image_id)
+            }) else {
+                continue;
+            };
+
+            if !img.is_ready() {
+                continue;
+            }
+
+            let texture = get_texture(p, img);
+            if texture == 0 {
+                continue;
+            }
+
+            let total_cols = p.columns.max(1) as f32;
+            let total_rows = p.rows.max(1) as f32;
+
+            let box_w = total_cols * cell_w;
+            let box_h = total_rows * cell_h;
+
+            let src_x = p.src.x as f32;
+            let src_y = p.src.y as f32;
+            let src_w = (if p.src.width == 0 { img.width } else { p.src.width }) as f32;
+            let src_h = (if p.src.height == 0 { img.height } else { p.src.height }) as f32;
+
+            if src_w <= 0. || src_h <= 0. || box_w <= 0. || box_h <= 0. {
+                continue;
+            }
+
+            // Aspect ratio calculation matching Kitty reference implementation (grman_put_cell_image):
+            // Destination box size: box_w by box_h.
+            // Fit image preserving aspect ratio:
+            let (x_offset, y_offset, x_scale, y_scale) =
+                if src_w * box_h > src_h * box_w {
+                    // Fit to width, center vertically
+                    let scale = box_w / src_w.max(1.0);
+                    let y_off = (box_h - src_h * scale) / 2.0;
+                    (0.0, y_off, scale, scale)
+                } else {
+                    // Fit to height, center horizontally
+                    let scale = box_h / src_h.max(1.0);
+                    let x_off = (box_w - src_w * scale) / 2.0;
+                    (x_off, 0.0, scale, scale)
+                };
+
+            // Destination coordinates for this placeholder tile:
+            let x_dst = decoded.col as f32 * cell_w;
+            let y_dst = decoded.row as f32 * cell_h;
+            let w_dst = cell_w;
+            let h_dst = cell_h;
+
+            // Compute intersection between cell rectangle and image rectangle in box coordinates
+            let intersect_x0 = x_dst.max(x_offset);
+            let intersect_x1 = (x_dst + w_dst).min(x_offset + src_w * x_scale);
+            let intersect_y0 = y_dst.max(y_offset);
+            let intersect_y1 = (y_dst + h_dst).min(y_offset + src_h * y_scale);
+
+            if intersect_x0 >= intersect_x1 || intersect_y0 >= intersect_y1 {
+                // Cell is in the letterbox / pillarbox margin
+                continue;
+            }
+
+            // Map intersection to screen pixel coordinates, including placement pixel offsets X/Y
+            let cell_screen_x = cell.point.column.0 as f32 * cell_w + pad_x + p.offset_x as f32;
+            let cell_screen_y = cell.point.line as f32 * cell_h + pad_y + p.offset_y as f32;
+
+            let quad_x = cell_screen_x + (intersect_x0 - x_dst);
+            let quad_y = cell_screen_y + (intersect_y0 - y_dst);
+            let quad_w = intersect_x1 - intersect_x0;
+            let quad_h = intersect_y1 - intersect_y0;
+
+            // Map intersection to image source coordinates and UVs:
+            let s0 = src_x + (intersect_x0 - x_offset) / x_scale;
+            let s1 = src_x + (intersect_x1 - x_offset) / x_scale;
+            let t0 = src_y + (intersect_y0 - y_offset) / y_scale;
+            let t1 = src_y + (intersect_y1 - y_offset) / y_scale;
+
+            let img_w = img.width as f32;
+            let img_h = img.height as f32;
+            let u0 = s0 / img_w;
+            let u1 = s1 / img_w;
+            let v0 = t0 / img_h;
+            let v1 = t1 / img_h;
+
+            let quad = ImageQuad {
+                x: quad_x,
+                y: quad_y,
+                width: quad_w,
+                height: quad_h,
+                uv: [u0, v0, u1, v1],
+                texture,
+            };
+
+            if p.z_index < 0 {
+                behind_quads.push(quad);
+            } else {
+                front_quads.push(quad);
+            }
+        }
+    }
+
+    (behind_quads, front_quads)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::index::{Column, Point};
+    use alacritty_terminal::index::{Column, Line, Point};
     use alacritty_terminal::term::cell::Flags;
     use alacritty_terminal::vte::ansi::Rgb as VteRgb;
     use crate::display::color::Rgb;
@@ -293,5 +450,194 @@ mod tests {
         let c12 = make_placeholder_cell(1, 2, fg, None, None);
         let d12 = decode_placeholder(&c12, &mut last_state).unwrap();
         assert_eq!((d12.row, d12.col), (1, 2));
+    }
+
+    #[test]
+    fn display_placeholder_quads_2x2_matrix_and_glyph_suppression() {
+        let size_info = SizeInfo::new(100.0, 100.0, 10.0, 20.0, 0.0, 0.0, true);
+        let fg = Color::Indexed(42);
+
+        // 2x2 placeholder cells with \u{10EEEE}
+        let mut cells = vec![
+            make_placeholder_cell(0, 0, fg, None, Some(vec!['\u{0305}', '\u{0305}'])),
+            make_placeholder_cell(0, 1, fg, None, None),
+            make_placeholder_cell(1, 0, fg, None, Some(vec!['\u{030D}'])),
+            make_placeholder_cell(1, 1, fg, None, None),
+        ];
+
+        // Virtual placement backing the placeholder
+        let placement = Placement {
+            internal_id: 1,
+            placement_id: 0,
+            anchor: Point::new(Line(0), Column(0)),
+            footprint: alacritty_terminal::graphics::placement::CellFootprint { columns: 2, rows: 2 },
+            offset_x: 0,
+            offset_y: 0,
+            columns: 2,
+            rows: 2,
+            src: alacritty_terminal::graphics::placement::SourceRect { x: 0, y: 0, width: 20, height: 40 },
+            z_index: 0,
+            is_virtual: true,
+            parent: None,
+            relative_offset: (0, 0),
+        };
+
+        let image = Arc::new(alacritty_terminal::graphics::image::ImageData::new(
+            42,
+            0,
+            20,
+            40,
+            alacritty_terminal::graphics::image::PixelFormat::Rgba,
+            Arc::new([0u8; 20 * 40 * 4]),
+        ));
+
+        let virtual_placements = vec![(placement, image)];
+
+        let (behind, front) = build_placeholder_quads(
+            &mut cells,
+            &virtual_placements,
+            &size_info,
+            |_p, _img| 42,
+        );
+
+        // Glyphs must be suppressed to space
+        for cell in &cells {
+            assert_eq!(cell.character, ' ', "placeholder glyph must be suppressed to space");
+        }
+
+        assert!(behind.is_empty());
+        assert_eq!(front.len(), 4);
+
+        // Cell (0,0): top-left
+        assert_eq!((front[0].x, front[0].y, front[0].width, front[0].height), (0.0, 0.0, 10.0, 20.0));
+        assert_eq!(front[0].uv, [0.0, 0.0, 0.5, 0.5]);
+        assert_eq!(front[0].texture, 42);
+
+        // Cell (0,1): top-right
+        assert_eq!((front[1].x, front[1].y, front[1].width, front[1].height), (10.0, 0.0, 10.0, 20.0));
+        assert_eq!(front[1].uv, [0.5, 0.0, 1.0, 0.5]);
+
+        // Cell (1,0): bottom-left
+        assert_eq!((front[2].x, front[2].y, front[2].width, front[2].height), (0.0, 20.0, 10.0, 20.0));
+        assert_eq!(front[2].uv, [0.0, 0.5, 0.5, 1.0]);
+
+        // Cell (1,1): bottom-right
+        assert_eq!((front[3].x, front[3].y, front[3].width, front[3].height), (10.0, 20.0, 10.0, 20.0));
+        assert_eq!(front[3].uv, [0.5, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn display_placeholder_quads_truecolor_and_negative_z_index() {
+        let size_info = SizeInfo::new(100.0, 100.0, 10.0, 20.0, 0.0, 0.0, true);
+        let fg = Color::Spec(VteRgb { r: 10, g: 20, b: 30 });
+        let expected_image_id = (10 << 16) | (20 << 8) | 30;
+
+        let mut cells = vec![
+            make_placeholder_cell(2, 3, fg, Some(Color::Indexed(5)), Some(vec!['\u{0305}', '\u{0305}'])),
+        ];
+
+        let placement = Placement {
+            internal_id: 1,
+            placement_id: 5,
+            anchor: Point::new(Line(2), Column(3)),
+            footprint: alacritty_terminal::graphics::placement::CellFootprint { columns: 1, rows: 1 },
+            offset_x: 2,
+            offset_y: 4,
+            columns: 1,
+            rows: 1,
+            src: alacritty_terminal::graphics::placement::SourceRect { x: 0, y: 0, width: 10, height: 20 },
+            z_index: -1,
+            is_virtual: true,
+            parent: None,
+            relative_offset: (0, 0),
+        };
+
+        let image = Arc::new(alacritty_terminal::graphics::image::ImageData::new(
+            expected_image_id,
+            0,
+            10,
+            20,
+            alacritty_terminal::graphics::image::PixelFormat::Rgba,
+            Arc::new([0u8; 10 * 20 * 4]),
+        ));
+
+        let virtual_placements = vec![(placement, image)];
+
+        let (behind, front) = build_placeholder_quads(
+            &mut cells,
+            &virtual_placements,
+            &size_info,
+            |_p, _img| 99,
+        );
+
+        assert_eq!(cells[0].character, ' ');
+        assert_eq!(front.len(), 0);
+        assert_eq!(behind.len(), 1);
+        // Cell col 3 * 10 + offset_x 2 = 32. Line 2 * 20 + offset_y 4 = 44.
+        assert_eq!((behind[0].x, behind[0].y, behind[0].width, behind[0].height), (32.0, 44.0, 10.0, 20.0));
+        assert_eq!(behind[0].uv, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(behind[0].texture, 99);
+    }
+
+    #[test]
+    fn display_placeholder_quads_aspect_ratio_letterboxing() {
+        let size_info = SizeInfo::new(100.0, 100.0, 10.0, 20.0, 0.0, 0.0, true);
+        let fg = Color::Indexed(42);
+
+        // 2x2 placeholder cells (box is 20px wide by 40px high)
+        // Image is 20x20 square, so it fits to width and centers vertically:
+        // centered in 40px box means y_offset = (40 - 20) / 2 = 10px.
+        // Image spans y in [10, 30].
+        let mut cells = vec![
+            make_placeholder_cell(0, 0, fg, None, Some(vec!['\u{0305}', '\u{0305}'])),
+            make_placeholder_cell(1, 0, fg, None, Some(vec!['\u{030D}'])),
+        ];
+
+        let placement = Placement {
+            internal_id: 1,
+            placement_id: 0,
+            anchor: Point::new(Line(0), Column(0)),
+            footprint: alacritty_terminal::graphics::placement::CellFootprint { columns: 2, rows: 2 },
+            offset_x: 0,
+            offset_y: 0,
+            columns: 2,
+            rows: 2,
+            src: alacritty_terminal::graphics::placement::SourceRect { x: 0, y: 0, width: 20, height: 20 },
+            z_index: 0,
+            is_virtual: true,
+            parent: None,
+            relative_offset: (0, 0),
+        };
+
+        let image = Arc::new(alacritty_terminal::graphics::image::ImageData::new(
+            42,
+            0,
+            20,
+            20,
+            alacritty_terminal::graphics::image::PixelFormat::Rgba,
+            Arc::new([0u8; 20 * 20 * 4]),
+        ));
+
+        let (behind, front) = build_placeholder_quads(
+            &mut cells,
+            &[(placement, image)],
+            &size_info,
+            |_p, _img| 1,
+        );
+
+        assert!(behind.is_empty());
+        assert_eq!(front.len(), 2);
+
+        // Row 0 covers y in [0, 20]. The image spans y in [10, 30].
+        // Intersection is y in [10, 20]: quad y = 10, height = 10.
+        // Source y in [0, 10]: v0 = 0.0, v1 = 0.5.
+        assert_eq!((front[0].x, front[0].y, front[0].width, front[0].height), (0.0, 10.0, 10.0, 10.0));
+        assert_eq!(front[0].uv, [0.0, 0.0, 0.5, 0.5]);
+
+        // Row 1 covers y in [20, 40]. The image spans y in [10, 30].
+        // Intersection is y in [20, 30]: quad y = 20, height = 10.
+        // Source y in [10, 20]: v0 = 0.5, v1 = 1.0.
+        assert_eq!((front[1].x, front[1].y, front[1].width, front[1].height), (0.0, 20.0, 10.0, 10.0));
+        assert_eq!(front[1].uv, [0.0, 0.5, 0.5, 1.0]);
     }
 }
