@@ -723,19 +723,19 @@ impl<T> Term<T> {
     /// Sync virtual placement anchors from the minimum line and column of their
     /// associated Unicode placeholder cells in the grid.
     pub fn sync_virtual_placements(&mut self) {
-        if !self.graphics.placements().iter().any(|p| p.is_virtual) {
+        if !self.graphics.has_virtual_placements() {
             return;
         }
 
-        let virt_keys: Vec<(u32, u32, u32, u32)> = self
+        let virt_keys: Vec<(u32, u32, u32)> = self
             .graphics
             .placements()
             .iter()
             .filter(|p| p.is_virtual)
             .map(|p| {
                 let img = self.graphics.image(p.internal_id);
-                let (cid, num) = img.map_or((0, 0), |i| (i.client_id, i.number));
-                (p.internal_id, p.placement_id, cid, num)
+                let cid = img.map_or(0, |i| i.client_id);
+                (p.internal_id, p.placement_id, cid)
             })
             .collect();
 
@@ -787,9 +787,9 @@ impl<T> Term<T> {
                     }
                 }
 
-                for &(int_id, pl_id, cid, num) in &virt_keys {
+                for &(int_id, pl_id, cid) in &virt_keys {
                     if (placement_id == 0 || pl_id == 0 || pl_id == placement_id)
-                        && (cid == image_id || num == image_id)
+                        && cid == image_id
                     {
                         let point = cell.point;
                         anchors

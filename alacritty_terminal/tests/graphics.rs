@@ -2356,11 +2356,12 @@ fn feature_query_echoes_delete_selector_and_omits_unsupported_actions() {
     );
     recorder.events.lock().unwrap().clear();
 
-    // Query an invalid action e=x is malformed control data and must be dropped without reply
+    // Query an invalid action e=x replies OK with e omitted per Kitty lenient parser
     feed(&mut term, &mut parser, b"\x1b_Ga=q,i=71,s=1,v=1,f=24,e=x;AAAA\x1b\\");
-    assert!(
-        recorder.pty_writes().is_empty(),
-        "command with malformed action e=x must be dropped without reply"
+    assert_eq!(
+        recorder.pty_writes(),
+        vec!["\x1b_Gi=71;OK\x1b\\".to_owned()],
+        "feature query for unsupported action must omit e in response"
     );
 }
 
@@ -2468,10 +2469,10 @@ fn feature_query_with_payload_and_quiet_semantics() {
     assert!(err_writes[0].contains("EINVAL"), "must reply EINVAL: {:?}", err_writes[0]);
     assert!(!err_writes[0].contains("e="), "error response must omit e= echo: {:?}", err_writes[0]);
 
-    // 5. Malformed feature query action (e=x) fails command parsing with no response
+    // 5. Unrecognized feature query action (e=x) replies OK with e omitted per Kitty lenient parser
     recorder.events.lock().unwrap().clear();
     feed(&mut term, &mut parser, b"\x1b_Ga=q,i=55,e=x\x1b\\");
-    assert!(recorder.pty_writes().is_empty(), "malformed control data must not be answered");
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=55;OK\x1b\\".to_owned()]);
 }
 
 #[test]
@@ -2606,7 +2607,7 @@ fn relative_child_clipped_at_scroll_margins() {
     let mut parser = Processor::new();
     let pixel_b64 = BASE64.encode(&vec![255u8; 100 * 100 * 4]);
 
-    // Set DECSTBM margin lines 2 to 8
+    // Set DECSTBM margin lines 2 to 8 (0-indexed lines 1 to 7)
     feed(&mut term, &mut parser, b"\x1b[2;8r");
     feed(&mut term, &mut parser, b"\x1b[2;1H");
 
@@ -2626,14 +2627,79 @@ fn relative_child_clipped_at_scroll_margins() {
     assert_eq!(child_orig.footprint.rows, 4);
 
     // Scroll up by 2 lines within margins (CSI 2 S)
+    // Parent at line 1 is top-clipped: line 1 - 2 = -1 < region.start (1) => clamped to line 1.
+    // Parent actual movement is region.start - line = 1 - 1 = 0 lines.
+    // Child follows parent movement (delta = 0), remaining at line 2 (parent 1 + V 1 = 2).
     feed(&mut term, &mut parser, b"\x1b[2S");
 
     let placements_after = term.graphics().placements();
-    if let Some(child_after) = placements_after.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))) {
-        assert_eq!(child_after.anchor.line.0, 1);
-        assert_eq!(child_after.footprint.rows, 3);
-        assert!(child_after.src.y > 0, "child src.y must be clipped");
-    } else {
-        panic!("child should remain partially visible and clipped");
-    }
+    let child_after = placements_after
+        .iter()
+        .find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1)))
+        .expect("child should remain positioned relative to parent");
+    assert_eq!(child_after.anchor.line.0, 2, "child position derives from parent-relative movement");
+    assert_eq!(child_after.footprint.rows, 4, "child remains intact within scroll margins");
+}
+
+#[test]
+fn relative_child_follows_moving_parent_within_scroll_margins() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    let pixel_b64 = BASE64.encode(&vec![255u8; 100 * 100 * 4]);
+
+    // Set DECSTBM margin lines 2 to 8 (0-indexed lines 1 to 7)
+    feed(&mut term, &mut parser, b"\x1b[2;8r");
+    feed(&mut term, &mut parser, b"\x1b[4;1H");
+
+    // Parent at line 3 with 2 rows footprint
+    let parent_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=2,i=70,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, parent_cmd.as_bytes());
+
+    // Relative child placed with V=1 (relative line +1 = line 4)
+    let child_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=2,i=71,p=1,P=70,Q=1,H=0,V=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, child_cmd.as_bytes());
+
+    let parent_internal_id = term.graphics().images().find(|(_, img)| img.client_id == 70).unwrap().0;
+
+    // Scroll up by 1 line within margins: parent moves from line 3 to line 2 (movement = -1)
+    feed(&mut term, &mut parser, b"\x1b[1S");
+
+    let placements = term.graphics().placements();
+    let parent = placements.iter().find(|p| p.placement_id == 1 && p.internal_id == parent_internal_id).unwrap();
+    assert_eq!(parent.anchor.line.0, 2);
+
+    let child = placements.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))).unwrap();
+    assert_eq!(child.anchor.line.0, 3, "child must follow parent movement (4 - 1 = 3)");
+}
+
+#[test]
+fn relative_child_with_q0_follows_named_parent_placement() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    let pixel_b64 = BASE64.encode(&vec![255u8; 100 * 100 * 4]);
+
+    // Parent image 60 placed with p=1 at line 3
+    feed(&mut term, &mut parser, b"\x1b[4;1H");
+    let parent_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=2,i=60,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, parent_cmd.as_bytes());
+
+    // Relative child placed with P=60, Q=0, V=2 (matches first placement p=1 of image 60)
+    let child_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=2,i=61,p=1,P=60,Q=0,H=0,V=2;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, child_cmd.as_bytes());
+
+    let parent_internal_id = term.graphics().images().find(|(_, img)| img.client_id == 60).unwrap().0;
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 2);
+    let child = placements.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))).expect("child must link to resolved parent placement");
+    assert_eq!(child.anchor.line.0, 5);
+
+    // Scroll up by 1 line (CSI 1 S)
+    feed(&mut term, &mut parser, b"\x1b[1S");
+
+    let placements_after = term.graphics().placements();
+    let parent_after = placements_after.iter().find(|p| p.placement_id == 1 && p.internal_id == parent_internal_id).unwrap();
+    assert_eq!(parent_after.anchor.line.0, 2);
+
+    let child_after = placements_after.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))).expect("child must remain");
+    assert_eq!(child_after.anchor.line.0, 4, "child with Q=0 must follow named parent movement (5 - 1 = 4)");
 }

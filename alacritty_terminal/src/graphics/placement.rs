@@ -340,7 +340,7 @@ impl PlacementStore {
                     placement.src.y = placement.src.y.saturating_add(clip_src_y);
                     placement.src.height = placement.src.height.saturating_sub(clip_src_y);
                     placement.anchor.line = region.start;
-                    parent_deltas.push(((placement.internal_id, placement.placement_id), -delta));
+                    parent_deltas.push(((placement.internal_id, placement.placement_id), region.start.0 - line.0));
                     return true;
                 }
 
@@ -367,50 +367,6 @@ impl PlacementStore {
 
         for ((pid, plid), d_line) in parent_deltas {
             self.shift_children(pid, plid, d_line, 0);
-        }
-
-        if !carries_scrollback {
-            self.placements.retain_mut(|placement| {
-                if placement.parent.is_none() || placement.is_virtual {
-                    return true;
-                }
-                let line = placement.anchor.line;
-                let bottom_line = Line(line.0 + i32::from(placement.footprint.rows));
-                if bottom_line <= region.start || line >= region.end {
-                    return false;
-                }
-                if line < region.start {
-                    let clipped_rows = (region.start.0 - line.0) as u16;
-                    if clipped_rows >= placement.footprint.rows {
-                        return false;
-                    }
-                    let total_rows = placement.footprint.rows.max(1);
-                    placement.footprint.rows = placement.footprint.rows.saturating_sub(clipped_rows);
-                    if placement.rows > 0 {
-                        placement.rows = placement.rows.saturating_sub(clipped_rows);
-                    }
-                    let frac = clipped_rows as f32 / total_rows as f32;
-                    let clip_src_y = (placement.src.height as f32 * frac).round() as u32;
-                    placement.src.y = placement.src.y.saturating_add(clip_src_y);
-                    placement.src.height = placement.src.height.saturating_sub(clip_src_y);
-                    placement.anchor.line = region.start;
-                }
-                if bottom_line > region.end {
-                    let clipped_rows = (bottom_line.0 - region.end.0) as u16;
-                    if clipped_rows >= placement.footprint.rows {
-                        return false;
-                    }
-                    let total_rows = placement.footprint.rows.max(1);
-                    placement.footprint.rows = placement.footprint.rows.saturating_sub(clipped_rows);
-                    if placement.rows > 0 {
-                        placement.rows = placement.rows.saturating_sub(clipped_rows);
-                    }
-                    let frac = clipped_rows as f32 / total_rows as f32;
-                    let clip_src_y = (placement.src.height as f32 * frac).round() as u32;
-                    placement.src.height = placement.src.height.saturating_sub(clip_src_y);
-                }
-                true
-            });
         }
 
         self.prune_orphans();
@@ -481,6 +437,12 @@ impl PlacementStore {
     /// Remove every placement.
     pub fn clear(&mut self) {
         self.placements.clear();
+    }
+
+    /// Whether any virtual placement is currently stored.
+    #[inline]
+    pub fn has_virtual(&self) -> bool {
+        self.placements.iter().any(|p| p.is_virtual)
     }
 
     /// Placements ordered back to front, matching the protocol's tie-breaking

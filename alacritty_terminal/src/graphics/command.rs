@@ -341,6 +341,7 @@ pub struct Command {
     pub parent_offset_x: i32,
     pub parent_offset_y: i32,
     pub feature_query: Option<Action>,
+    pub has_feature_query: bool,
     pub unsupported_format: bool,
     pub has_explicit_action: bool,
 }
@@ -448,7 +449,10 @@ impl Command {
             KEY_PARENT_PLACEMENT => self.parent_placement_id = unsigned(value)?,
             KEY_PARENT_OFFSET_X => self.parent_offset_x = signed(value)?,
             KEY_PARENT_OFFSET_Y => self.parent_offset_y = signed(value)?,
-            KEY_FEATURE_QUERY => self.feature_query = Some(Action::parse(flag(value)?)?),
+            KEY_FEATURE_QUERY => {
+                self.has_feature_query = true;
+                self.feature_query = Action::parse(flag(value)?).ok();
+            },
             KEY_QUIET => {
                 let quiet = unsigned(value)?;
                 self.quiet = quiet.min(QUIET_MAX) as u8;

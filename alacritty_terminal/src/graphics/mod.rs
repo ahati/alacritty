@@ -418,6 +418,12 @@ impl GraphicsStore {
         self.placements.sorted()
     }
 
+    /// Whether any virtual placement is currently stored.
+    #[inline]
+    pub fn has_virtual_placements(&self) -> bool {
+        self.placements.has_virtual()
+    }
+
     /// Update the anchor of a virtual placement and its relative children.
     pub fn update_virtual_parent_anchor(&mut self, internal_id: u32, placement_id: u32, anchor: Point) {
         self.placements.update_virtual_anchor(internal_id, placement_id, anchor);
@@ -527,7 +533,7 @@ impl GraphicsStore {
 
         // A query is evaluated immediately without interrupting an in-flight transfer.
         if command.action == Action::Query {
-            if command.feature_query.is_some() {
+            if command.has_feature_query {
                 self.chars.clear();
                 return self.dispatch(&command, Vec::new(), cursor);
             }
@@ -727,7 +733,7 @@ impl GraphicsStore {
     /// Carry out a parsed command.
     fn dispatch(&mut self, command: &Command, data: Vec<u8>, cursor: Point) -> GraphicsUpdate {
         // Feature queries evaluate immediately and echo supported keys without data source validation
-        if command.action == Action::Query && command.feature_query.is_some() {
+        if command.action == Action::Query && command.has_feature_query {
             if command.image_id != 0 && command.image_number != 0 {
                 return self.failure(command, GraphicsError::Invalid);
             }
@@ -1078,6 +1084,9 @@ impl GraphicsStore {
 
         let src_idx = (src_frame_num as usize).checked_sub(1).ok_or(GraphicsError::Invalid)?;
         let dst_idx = (dst_frame_num as usize).checked_sub(1).ok_or(GraphicsError::Invalid)?;
+        // The Kitty protocol specifies 32-bit frame numbers. Alacritty indexes frames with u16
+        // (supporting up to 65,535 animation frames per image). Destination frame numbers exceeding
+        // u16::MAX are rejected with GraphicsError::Invalid.
         let dst_frame_index = u16::try_from(dst_idx).map_err(|_| GraphicsError::Invalid)?;
 
         let frames = image.frames();
@@ -1378,7 +1387,7 @@ impl GraphicsStore {
 
     /// Validate image data synchronously without storing it (`a=q`).
     fn validate(&mut self, command: &Command, source: Source) -> Result<(), GraphicsError> {
-        if command.feature_query.is_some() {
+        if command.has_feature_query {
             return Ok(());
         }
 
@@ -1516,7 +1525,7 @@ impl GraphicsStore {
             let anchor_col =
                 crate::index::Column((parent_p.anchor.column.0 as i32 + command.parent_offset_x).max(0) as usize);
             (
-                Some((parent_internal, command.parent_placement_id)),
+                Some((parent_internal, parent_p.placement_id)),
                 Point::new(anchor_line, anchor_col),
             )
         } else {
@@ -2135,7 +2144,7 @@ fn decode_payload(
 /// The reference makes both checks before it reads a file medium's file, so
 /// the checks belong here rather than after a decode.
 fn check_dimensions(command: &Command) -> Result<(), GraphicsError> {
-    if command.feature_query.is_some() {
+    if command.has_feature_query {
         return Ok(());
     }
 
