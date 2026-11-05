@@ -54,6 +54,48 @@ const BASE64_GROUP: usize = 4;
 /// Padding character used to complete a truncated final base64 group.
 const BASE64_PAD: u8 = b'=';
 
+/// Official 297-entry table of combining diacritics used for row and column indexing in Unicode placeholders.
+pub const ROWCOLUMN_DIACRITICS: [u32; 297] = [
+    0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F,
+    0x0346, 0x034A, 0x034B, 0x034C, 0x0350, 0x0351, 0x0352, 0x0357,
+    0x035B, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369,
+    0x036A, 0x036B, 0x036C, 0x036D, 0x036E, 0x036F, 0x0483, 0x0484,
+    0x0485, 0x0486, 0x0487, 0x0592, 0x0593, 0x0594, 0x0595, 0x0597,
+    0x0598, 0x0599, 0x059C, 0x059D, 0x059E, 0x059F, 0x05A0, 0x05A1,
+    0x05A8, 0x05A9, 0x05AB, 0x05AC, 0x05AF, 0x05C4, 0x0610, 0x0611,
+    0x0612, 0x0613, 0x0614, 0x0615, 0x0616, 0x0617, 0x0657, 0x0658,
+    0x0659, 0x065A, 0x065B, 0x065D, 0x065E, 0x06D6, 0x06D7, 0x06D8,
+    0x06D9, 0x06DA, 0x06DB, 0x06DC, 0x06DF, 0x06E0, 0x06E1, 0x06E2,
+    0x06E4, 0x06E7, 0x06E8, 0x06EB, 0x06EC, 0x0730, 0x0732, 0x0733,
+    0x0735, 0x0736, 0x073A, 0x073D, 0x073F, 0x0740, 0x0741, 0x0743,
+    0x0745, 0x0747, 0x0749, 0x074A, 0x07EB, 0x07EC, 0x07ED, 0x07EE,
+    0x07EF, 0x07F0, 0x07F1, 0x07F3, 0x0816, 0x0817, 0x0818, 0x0819,
+    0x081B, 0x081C, 0x081D, 0x081E, 0x081F, 0x0820, 0x0821, 0x0822,
+    0x0823, 0x0825, 0x0826, 0x0827, 0x0829, 0x082A, 0x082B, 0x082C,
+    0x082D, 0x0951, 0x0953, 0x0954, 0x0F82, 0x0F83, 0x0F86, 0x0F87,
+    0x135D, 0x135E, 0x135F, 0x17DD, 0x193A, 0x1A17, 0x1A75, 0x1A76,
+    0x1A77, 0x1A78, 0x1A79, 0x1A7A, 0x1A7B, 0x1A7C, 0x1B6B, 0x1B6D,
+    0x1B6E, 0x1B6F, 0x1B70, 0x1B71, 0x1B72, 0x1B73, 0x1CD0, 0x1CD1,
+    0x1CD2, 0x1CDA, 0x1CDB, 0x1CE0, 0x1DC0, 0x1DC1, 0x1DC3, 0x1DC4,
+    0x1DC5, 0x1DC6, 0x1DC7, 0x1DC8, 0x1DC9, 0x1DCB, 0x1DCC, 0x1DD1,
+    0x1DD2, 0x1DD3, 0x1DD4, 0x1DD5, 0x1DD6, 0x1DD7, 0x1DD8, 0x1DD9,
+    0x1DDA, 0x1DDB, 0x1DDC, 0x1DDD, 0x1DDE, 0x1DDF, 0x1DE0, 0x1DE1,
+    0x1DE2, 0x1DE3, 0x1DE4, 0x1DE5, 0x1DE6, 0x1DFE, 0x20D0, 0x20D1,
+    0x20D4, 0x20D5, 0x20D6, 0x20D7, 0x20DB, 0x20DC, 0x20E1, 0x20E7,
+    0x20E9, 0x20F0, 0x2CEF, 0x2CF0, 0x2CF1, 0x2DE0, 0x2DE1, 0x2DE2,
+    0x2DE3, 0x2DE4, 0x2DE5, 0x2DE6, 0x2DE7, 0x2DE8, 0x2DE9, 0x2DEA,
+    0x2DEB, 0x2DEC, 0x2DED, 0x2DEE, 0x2DEF, 0x2DF0, 0x2DF1, 0x2DF2,
+    0x2DF3, 0x2DF4, 0x2DF5, 0x2DF6, 0x2DF7, 0x2DF8, 0x2DF9, 0x2DFA,
+    0x2DFB, 0x2DFC, 0x2DFD, 0x2DFE, 0x2DFF, 0xA66F, 0xA67C, 0xA67D,
+    0xA6F0, 0xA6F1, 0xA8E0, 0xA8E1, 0xA8E2, 0xA8E3, 0xA8E4, 0xA8E5,
+    0xA8E6, 0xA8E7, 0xA8E8, 0xA8E9, 0xA8EA, 0xA8EB, 0xA8EC, 0xA8ED,
+    0xA8EE, 0xA8EF, 0xA8F0, 0xA8F1, 0xAAB0, 0xAAB2, 0xAAB3, 0xAAB7,
+    0xAAB8, 0xAABE, 0xAABF, 0xAAC1, 0xFE20, 0xFE21, 0xFE22, 0xFE23,
+    0xFE24, 0xFE25, 0xFE26, 0x10A0F, 0x10A38, 0x1D185, 0x1D186, 0x1D187,
+    0x1D188, 0x1D189, 0x1D1AA, 0x1D1AB, 0x1D1AC, 0x1D1AD, 0x1D242, 0x1D243,
+    0x1D244,
+];
+
 /// Default maximum image width and height, in pixels.
 pub const DEFAULT_MAX_IMAGE_DIMENSION: u32 = 10_000;
 
@@ -152,6 +194,10 @@ pub enum GraphicsError {
     Unsupported,
     /// A referenced parent image does not exist.
     NoParent,
+    /// A relative placement introduces a cycle in the parent chain.
+    Cycle,
+    /// A relative placement chain exceeds the maximum depth of 8.
+    TooDeep,
     /// An animation frame was named that the image does not have.
     FrameMissing(u32),
     /// An animation frame is larger than the image it belongs to.
@@ -177,6 +223,8 @@ impl GraphicsError {
             Self::InflationSize => "EINVAL",
             Self::Unsupported => "EUNSUPPORTED",
             Self::NoParent => "ENOPARENT",
+            Self::Cycle => "ECYCLE",
+            Self::TooDeep => "ETOODEEP",
             Self::FrameMissing(_) => "EINVAL",
             Self::FrameTooLarge => "EINVAL",
         }
@@ -200,6 +248,8 @@ impl GraphicsError {
             Self::InflationSize => "Image data size post inflation does not match expected size",
             Self::Unsupported => "unsupported command",
             Self::NoParent => "parent image not found",
+            Self::Cycle => "cycle in placement parent chain",
+            Self::TooDeep => "relative placement chain too deep",
             Self::FrameMissing(_frame) => "no frame with that number",
             Self::FrameTooLarge => "frame larger than image",
         }
@@ -368,6 +418,23 @@ impl GraphicsStore {
         self.placements.sorted()
     }
 
+    /// View placements without sorting or allocating.
+    #[inline]
+    pub fn raw_placements(&self) -> &[Placement] {
+        self.placements.as_slice()
+    }
+
+    /// Whether any virtual placement is currently stored.
+    #[inline]
+    pub fn has_virtual_placements(&self) -> bool {
+        self.placements.has_virtual()
+    }
+
+    /// Update the anchor of a virtual placement and its relative children.
+    pub fn update_virtual_parent_anchor(&mut self, internal_id: u32, placement_id: u32, anchor: Point) {
+        self.placements.update_virtual_anchor(internal_id, placement_id, anchor);
+    }
+
     /// Look up image data by internal identifier.
     pub fn image(&self, internal_id: u32) -> Option<&Arc<ImageData>> {
         self.images.get(internal_id)
@@ -470,6 +537,42 @@ impl GraphicsStore {
             };
         }
 
+        // A query is evaluated immediately without interrupting an in-flight transfer.
+        if command.action == Action::Query {
+            if command.has_feature_query {
+                self.chars.clear();
+                return self.dispatch(&command, Vec::new(), cursor);
+            }
+
+            let mut query_transfer = Transfer::new(command);
+            query_transfer.chars = mem::take(&mut self.chars);
+            let command = query_transfer.command.clone();
+
+            return match query_transfer.finish() {
+                Ok(payload) => self.dispatch(&command, payload, cursor),
+                Err(error) => self.failure(&command, error),
+            };
+        }
+
+        if let Some(existing) = self.transfer.as_ref() {
+            let is_continuation = match existing.command.action {
+                Action::Frame => {
+                    (!command.has_explicit_action || command.action == Action::Frame)
+                        && command.delete.is_none()
+                        && (command.image_id == 0 || command.image_id == existing.command.image_id)
+                },
+                _ => {
+                    !command.has_explicit_action
+                        && command.delete.is_none()
+                        && (command.image_id == 0 || command.image_id == existing.command.image_id)
+                },
+            };
+
+            if !is_continuation {
+                self.transfer = None;
+            }
+        }
+
         let mut transfer = match self.transfer.take() {
             Some(mut transfer) => {
                 // A continuation chunk carries only `m` and `q`. A chunk that
@@ -539,6 +642,11 @@ impl GraphicsStore {
         }
     }
 
+    /// Whether an in-flight chunked transfer is pending.
+    pub fn has_pending_transfer(&self) -> bool {
+        self.transfer.is_some()
+    }
+
     /// Remove every image and placement.
     pub fn clear(&mut self) {
         self.images.clear();
@@ -601,11 +709,15 @@ impl GraphicsStore {
             Ok(decoded) => {
                 // A query stores nothing, so it can never change the screen. For a
                 // transmission, the image may have been evicted or deleted while
-                // the decode ran; its pixels are then dropped and the
-                // transmission counts as having changed nothing, exactly as an
-                // eviction does.
+                // the decode ran; its pixels are then dropped and no success reply
+                // is sent for an image that no longer exists.
                 let changed = match internal_id {
-                    Some(internal_id) => self.images.complete(internal_id, decoded),
+                    Some(internal_id) => {
+                        if !self.images.complete(internal_id, decoded) {
+                            return self.failure(&command, GraphicsError::NotFound);
+                        }
+                        true
+                    },
                     None => false,
                 };
 
@@ -626,6 +738,18 @@ impl GraphicsStore {
 
     /// Carry out a parsed command.
     fn dispatch(&mut self, command: &Command, data: Vec<u8>, cursor: Point) -> GraphicsUpdate {
+        // Feature queries evaluate immediately and echo supported keys without data source validation
+        if command.action == Action::Query && command.has_feature_query {
+            if command.image_id != 0 && command.image_number != 0 {
+                return self.failure(command, GraphicsError::Invalid);
+            }
+            return self.success(command, false);
+        }
+
+        if command.unsupported_format {
+            return self.failure(command, GraphicsError::Invalid);
+        }
+
         // The identifier and the number are two different addressing schemes,
         // and the reference rejects a command that mixes them.
         if command.image_id != 0 && command.image_number != 0 {
@@ -638,13 +762,13 @@ impl GraphicsStore {
         // is well formed, as the reference does.
         let source = match command.medium {
             Medium::Direct => Source::Inline(data),
-            Medium::File | Medium::TempFile if command.action.is_deferred() => {
+            Medium::File | Medium::TempFile if command.action.is_deferred() || command.action == Action::Query => {
                 match file::FileSource::new(command, &data) {
                     Ok(source) => Source::File(source),
                     Err(error) => return self.failure(command, error),
                 }
             },
-            Medium::SharedMemory if command.action.is_deferred() => {
+            Medium::SharedMemory if command.action.is_deferred() || command.action == Action::Query => {
                 match file::SharedMemorySource::new(command, &data) {
                     Ok(source) => Source::SharedMemory(source),
                     Err(error) => return self.failure(command, error),
@@ -658,8 +782,13 @@ impl GraphicsStore {
             Action::TransmitAndDisplay => match self.transmit(command, source, cursor) {
                 // A file medium cannot be reserved until its file has been read,
                 // so its placement is added once the decode has landed.
-                Ok(Some(internal_id)) => {
-                    self.place(command, internal_id, cursor).map(|advance| (true, advance))
+                Ok(Some(internal_id)) => match self.place(command, internal_id, cursor) {
+                    Ok(advance) => Ok((true, advance)),
+                    Err(error) => {
+                        self.jobs.retain(|job| job.internal_id != Some(internal_id));
+                        self.images.remove(internal_id);
+                        Err(error)
+                    },
                 },
                 Ok(None) => Ok((true, None)),
                 Err(error) => Err(error),
@@ -687,7 +816,7 @@ impl GraphicsStore {
             Action::Frame => self.transmit_frame(command, source).map(|()| (false, None)),
             // An animation control replies for itself: success stays silent.
             Action::Animate => return self.animate(command),
-            Action::Compose => Err(GraphicsError::Unsupported),
+            Action::Compose => self.compose(command).map(|changed| (changed, None)),
         };
 
         match outcome {
@@ -867,6 +996,16 @@ impl GraphicsStore {
             return Err(GraphicsError::Invalid);
         }
 
+        if command.format == Format::Indexed || command.format == Format::IndexedAlpha {
+            return Err(GraphicsError::Invalid);
+        }
+
+        if let Some(img) = self.images.get(internal_id) {
+            if img.format == image::PixelFormat::Indexed || img.format == image::PixelFormat::IndexedAlpha {
+                return Err(GraphicsError::Invalid);
+            }
+        }
+
         check_dimensions(command)?;
 
         // A raw patch must name its own size, and it has to sit inside the
@@ -921,6 +1060,103 @@ impl GraphicsStore {
         });
 
         Ok(())
+    }
+
+    /// Compose a rectangle from one frame onto another (`a=c`).
+    fn compose(&mut self, command: &Command) -> Result<bool, GraphicsError> {
+        let Some(internal_id) = self.images.resolve(command.image_id, command.image_number) else {
+            return Err(GraphicsError::NotFound);
+        };
+
+        let Some(image) = self.images.get(internal_id) else {
+            return Err(GraphicsError::NotFound);
+        };
+
+        if !image.is_ready() {
+            return Err(GraphicsError::Invalid);
+        }
+
+        if image.format == image::PixelFormat::Indexed || image.format == image::PixelFormat::IndexedAlpha {
+            return Err(GraphicsError::Invalid);
+        }
+
+        let width = image.width;
+        let height = image.height;
+        let channels = image.format.channels();
+
+        // 1-based frame numbers: r is source, c is destination (default 1)
+        let src_frame_num = if command.rows == 0 { 1 } else { command.rows };
+        let dst_frame_num = if command.columns == 0 { 1 } else { command.columns };
+
+        let src_idx = (src_frame_num as usize).checked_sub(1).ok_or(GraphicsError::Invalid)?;
+        let dst_idx = (dst_frame_num as usize).checked_sub(1).ok_or(GraphicsError::Invalid)?;
+        // The Kitty protocol specifies 32-bit frame numbers. Alacritty indexes frames with u16
+        // (supporting up to 65,535 animation frames per image). Destination frame numbers exceeding
+        // u16::MAX are rejected with GraphicsError::Invalid.
+        let dst_frame_index = u16::try_from(dst_idx).map_err(|_| GraphicsError::Invalid)?;
+
+        let frames = image.frames();
+        if src_idx >= frames.len() || dst_idx >= frames.len() {
+            return Err(GraphicsError::NotFound);
+        }
+
+        let w = if command.src_width == 0 { width } else { command.src_width };
+        let h = if command.src_height == 0 { height } else { command.src_height };
+        if w == 0 || h == 0 {
+            return Err(GraphicsError::Invalid);
+        }
+
+        let src_x = command.cell_offset_x;
+        let src_y = command.cell_offset_y;
+        let dst_x = command.src_x;
+        let dst_y = command.src_y;
+
+        if src_x.saturating_add(w) > width || src_y.saturating_add(h) > height {
+            return Err(GraphicsError::Invalid);
+        }
+        if dst_x.saturating_add(w) > width || dst_y.saturating_add(h) > height {
+            return Err(GraphicsError::Invalid);
+        }
+
+        // On same frame, overlapping rectangles are invalid
+        if src_idx == dst_idx {
+            let x_overlap = src_x < dst_x + w && src_x + w > dst_x;
+            let y_overlap = src_y < dst_y + h && src_y + h > dst_y;
+            if x_overlap && y_overlap {
+                return Err(GraphicsError::Invalid);
+            }
+        }
+
+        let blend = if command.cursor_movement == CursorMovement::Stay {
+            FrameBlend::Overwrite
+        } else {
+            FrameBlend::Alpha
+        };
+
+        // Extract source patch
+        let mut patch = Vec::with_capacity((w as usize) * (h as usize) * channels);
+        let src_pixels = &frames[src_idx].pixels;
+        for row in 0..h {
+            let y = (src_y + row) as usize;
+            let start = (y * (width as usize) + src_x as usize) * channels;
+            let end = start + (w as usize) * channels;
+            patch.extend_from_slice(&src_pixels[start..end]);
+        }
+
+        // Blit patch onto destination frame
+        let mut dst_pixels = frames[dst_idx].pixels.to_vec();
+        blend_patch(
+            &mut dst_pixels,
+            (width, height),
+            &patch,
+            (w, h),
+            (channels, dst_x, dst_y),
+            blend,
+            channels,
+        );
+
+        let changed = self.images.replace_frame(internal_id, dst_frame_index, dst_pixels.into());
+        Ok(changed)
     }
 
     /// Control an animation (`a=a`).
@@ -1155,20 +1391,27 @@ impl GraphicsStore {
         Some(response)
     }
 
-    /// Queue a validation of image data that is not stored (`a=q`).
+    /// Validate image data synchronously without storing it (`a=q`).
     fn validate(&mut self, command: &Command, source: Source) -> Result<(), GraphicsError> {
+        if command.action == Action::Query && command.has_feature_query {
+            return Ok(());
+        }
+
         check_dimensions(command)?;
 
-        self.jobs.push(DecodeJob {
-            internal_id: None,
-            command: command.clone(),
-            source,
-            limit: decompression_limit(command, &self.config),
-            max_dimension: self.config.max_image_dimension,
-            allow_network_paths: self.config.allow_network_paths,
-            pending: None,
-            frame: None,
-        });
+        let max_to_read = max_read_size(command);
+        let limit = decompression_limit(command, &self.config);
+        let max_dimension = self.config.max_image_dimension;
+
+        let data = match source {
+            Source::Inline(data) => data,
+            Source::SharedMemory(source) => file::read_shm(&source, max_to_read)?,
+            Source::File(file) => file::read(&file, max_to_read, self.config.allow_network_paths)?,
+        };
+
+        if !data.is_empty() || command.source_width > 0 || command.source_height > 0 {
+            decode_payload(command, data, limit, max_dimension)?;
+        }
 
         Ok(())
     }
@@ -1246,10 +1489,59 @@ impl GraphicsStore {
         };
 
         let footprint = resolve_footprint(command, source, self.cell_size);
+
+        let (parent, anchor) = if command.parent_image_id != 0 {
+            if command.virtual_placement {
+                return Err(GraphicsError::Invalid);
+            }
+            let parent_internal = self
+                .images
+                .resolve(command.parent_image_id, 0)
+                .or_else(|| self.images.resolve(0, command.parent_image_id))
+                .ok_or(GraphicsError::NoParent)?;
+
+            let parent_p = self
+                .placements
+                .find(parent_internal, command.parent_placement_id)
+                .ok_or(GraphicsError::NoParent)?;
+
+            let this_id = (internal_id, command.placement_id);
+            if (parent_p.internal_id, parent_p.placement_id) == this_id {
+                return Err(GraphicsError::Cycle);
+            }
+
+            let mut depth = 1;
+            let mut curr = parent_p.parent;
+            while let Some((pid, plid)) = curr {
+                depth += 1;
+                if depth > 8 {
+                    return Err(GraphicsError::TooDeep);
+                }
+                if (pid, plid) == this_id {
+                    return Err(GraphicsError::Cycle);
+                }
+                if let Some(next_p) = self.placements.find(pid, plid) {
+                    curr = next_p.parent;
+                } else {
+                    break;
+                }
+            }
+
+            let anchor_line = Line(parent_p.anchor.line.0 + command.parent_offset_y);
+            let anchor_col =
+                crate::index::Column((parent_p.anchor.column.0 as i32 + command.parent_offset_x).max(0) as usize);
+            (
+                Some((parent_internal, parent_p.placement_id)),
+                Point::new(anchor_line, anchor_col),
+            )
+        } else {
+            (None, cursor)
+        };
+
         let placement = Placement {
             internal_id,
             placement_id: command.placement_id,
-            anchor: cursor,
+            anchor,
             footprint,
             offset_x: clamp_to_u16(command.cell_offset_x),
             offset_y: clamp_to_u16(command.cell_offset_y),
@@ -1260,9 +1552,14 @@ impl GraphicsStore {
             src: source,
             z_index: command.z_index,
             is_virtual: command.virtual_placement,
+            parent,
+            relative_offset: (command.parent_offset_x, command.parent_offset_y),
         };
 
-        let advance = if command.cursor_movement == CursorMovement::Move && !placement.is_virtual {
+        let advance = if command.parent_image_id == 0
+            && command.cursor_movement == CursorMovement::Move
+            && !placement.is_virtual
+        {
             Some(placement.footprint)
         } else {
             None
@@ -1294,7 +1591,7 @@ impl GraphicsStore {
 
         match selector.to_ascii_lowercase() {
             // Everything on the screen; scrollback placements survive.
-            b'a' => self.placements.retain_scrollback(),
+            b'a' => self.placements.delete_all_visible(),
             // Everything belonging to one image, optionally one placement.
             b'i' | b'n' => match internal {
                 Some(internal_id) => {
@@ -1396,7 +1693,7 @@ impl GraphicsStore {
         let matching: Vec<(u32, u32)> = self
             .placements
             .iter()
-            .filter(|placement| placement.z_index == z_index && placement.contains(point))
+            .filter(|placement| !placement.is_virtual && placement.z_index == z_index && placement.contains(point))
             .map(|placement| (placement.internal_id, placement.placement_id))
             .collect();
 
@@ -1456,11 +1753,12 @@ impl GraphicsStore {
 
     /// Build a successful response.
     fn success(&self, command: &Command, changed: bool) -> GraphicsUpdate {
-        GraphicsUpdate {
-            response: if command.suppresses_ok() { None } else { self.response(command, "OK") },
-            changed,
-            cursor_advance: None,
-        }
+        let response = if command.suppresses_ok() {
+            None
+        } else {
+            self.response(command, "OK")
+        };
+        GraphicsUpdate { response, changed, cursor_advance: None }
     }
 
     /// Build a failure response.
@@ -1495,12 +1793,126 @@ impl GraphicsStore {
         }
         if command.placement_id != 0 {
             let _ = write!(response, "{separator}p={}", command.placement_id);
+            separator = ",";
         }
+
+        if command.action == Action::Query && body == "OK" {
+            if let Some(queried_action) = command.feature_query {
+                self.format_feature_query_echo(&mut response, &mut separator, command, queried_action);
+            }
+        }
+
         response.push(';');
         response.push_str(body);
         response.push_str("\x1b\\");
 
         Some(response)
+    }
+
+    fn format_feature_query_echo(
+        &self,
+        response: &mut String,
+        separator: &mut &str,
+        command: &Command,
+        queried_action: Action,
+    ) {
+        let _ = write!(response, "{separator}e={}", queried_action.as_char());
+        *separator = ",";
+
+        let is_t = queried_action == Action::Transmit;
+        let is_big_t = queried_action == Action::TransmitAndDisplay;
+        let is_p = queried_action == Action::Put;
+        let is_d = queried_action == Action::Delete;
+        let is_f = queried_action == Action::Frame;
+        let is_a = queried_action == Action::Animate;
+        let is_c = queried_action == Action::Compose;
+        let is_q = queried_action == Action::Query;
+        let is_trans_action = is_t || is_big_t || is_q || is_f;
+
+        if let Some(del) = command.delete {
+            if is_d {
+                let _ = write!(response, ",d={}", del as char);
+            }
+        }
+        if command.placement_id != 0 && (is_p || is_big_t || is_d) {
+            let _ = write!(response, ",p={}", command.placement_id);
+        }
+        if command.cursor_movement == CursorMovement::Stay && (is_big_t || is_p || is_c) {
+            response.push_str(",C=1");
+        }
+        if command.virtual_placement && (is_big_t || is_p) {
+            response.push_str(",U=1");
+        }
+        if command.columns != 0 && (is_big_t || is_p || is_f || is_c || is_a) {
+            let _ = write!(response, ",c={}", command.columns);
+        }
+        if command.rows != 0 && (is_big_t || is_p || is_f || is_a || is_c) {
+            let _ = write!(response, ",r={}", command.rows);
+        }
+        if command.z_index != 0 && (is_big_t || is_p || is_d || is_f || is_a) {
+            let _ = write!(response, ",z={}", command.z_index);
+        }
+        if command.cell_offset_x != 0 && (is_big_t || is_p || is_f || is_c) {
+            let _ = write!(response, ",X={}", command.cell_offset_x);
+        }
+        if command.cell_offset_y != 0 && (is_big_t || is_p || is_f || is_c) {
+            let _ = write!(response, ",Y={}", command.cell_offset_y);
+        }
+        if command.src_x != 0 && (is_big_t || is_p || is_d || is_f || is_c) {
+            let _ = write!(response, ",x={}", command.src_x);
+        }
+        if command.src_y != 0 && (is_big_t || is_p || is_d || is_f || is_c) {
+            let _ = write!(response, ",y={}", command.src_y);
+        }
+        if command.src_width != 0 && (is_big_t || is_p || is_f || is_c) {
+            let _ = write!(response, ",w={}", command.src_width);
+        }
+        if command.src_height != 0 && (is_big_t || is_p || is_f || is_c) {
+            let _ = write!(response, ",h={}", command.src_height);
+        }
+        if command.source_width != 0 && (is_trans_action || is_a) {
+            let _ = write!(response, ",s={}", command.source_width);
+        }
+        if command.source_height != 0 && (is_trans_action || is_a) {
+            let _ = write!(response, ",v={}", command.source_height);
+        }
+        if command.data_size != 0 && is_trans_action {
+            let _ = write!(response, ",S={}", command.data_size);
+        }
+        if command.data_offset != 0 && is_trans_action {
+            let _ = write!(response, ",O={}", command.data_offset);
+        }
+        if command.format != Format::Rgba
+            && (is_t || is_big_t || is_q || (is_f && (command.format == Format::Rgb || command.format == Format::Png)))
+        {
+            let _ = write!(response, ",f={}", command.format.code());
+        }
+        if command.medium != Medium::Direct && is_trans_action {
+            let _ = write!(response, ",t={}", match command.medium {
+                Medium::File => 'f',
+                Medium::TempFile => 't',
+                Medium::SharedMemory => 's',
+                Medium::Direct => 'd',
+            });
+        }
+        if command.compression.is_some() && is_trans_action {
+            response.push_str(",o=z");
+        }
+        if command.transient && (is_t || is_big_t || is_q) {
+            response.push_str(",N=1");
+        }
+        if command.parent_image_id != 0 && (is_big_t || is_p) {
+            let _ = write!(response, ",P={}", command.parent_image_id);
+        }
+        if command.parent_placement_id != 0 && (is_big_t || is_p) {
+            let _ = write!(response, ",Q={}", command.parent_placement_id);
+        }
+        if command.parent_offset_x != 0 && (is_big_t || is_p) {
+            let _ = write!(response, ",H={}", command.parent_offset_x);
+        }
+        if command.parent_offset_y != 0 && (is_big_t || is_p) {
+            let _ = write!(response, ",V={}", command.parent_offset_y);
+        }
     }
 }
 
@@ -1736,6 +2148,10 @@ fn decode_payload(
 /// The reference makes both checks before it reads a file medium's file, so
 /// the checks belong here rather than after a decode.
 fn check_dimensions(command: &Command) -> Result<(), GraphicsError> {
+    if command.action == Action::Query && command.has_feature_query {
+        return Ok(());
+    }
+
     if command.format != Format::Png && (command.source_width == 0 || command.source_height == 0) {
         return Err(GraphicsError::ZeroDimensions);
     }

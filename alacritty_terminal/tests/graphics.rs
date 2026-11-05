@@ -12,6 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::index::Line;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
@@ -697,7 +698,6 @@ fn images_outside_a_scroll_region_are_never_scrolled() {
 }
 
 #[test]
-#[ignore = "divergence: the fork pins an image to the top margin, kitty clips it and drops it"]
 fn a_placement_scrolled_past_a_margin_is_dropped() {
     let (mut term, recorder) = terminal();
     let mut parser = Processor::new();
@@ -1962,4 +1962,744 @@ fn compressed_file_data_inflating_short_is_its_own_error() {
         ],
     );
     assert!(!file.exists(), "a marked temporary file is removed once opened");
+}
+
+#[test]
+fn query_reply_precedes_device_attributes() {
+    use alacritty_terminal::vte::ansi::StdSyncHandler;
+
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::<StdSyncHandler>::new();
+
+    // Send probe: query followed immediately by primary device attributes (CSI c).
+    parser.advance(&mut term, b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c");
+
+    // The graphics reply MUST arrive before the DA1 reply!
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 2, "expected both graphics reply and DA1 reply");
+    assert_eq!(writes[0], "\x1b_Gi=31;OK\x1b\\");
+    assert_eq!(writes[1], "\x1b[?6;22c");
+}
+
+#[test]
+fn alt_screen_images_cleared_on_entry() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Enter alt screen
+    feed(&mut term, &mut parser, b"\x1b[?1049h");
+    feed(&mut term, &mut parser, b"\x1b_Gf=32,s=1,v=1,a=T,i=7;/////w==\x1b\\");
+    assert_eq!(term.graphics().placements().len(), 1, "image placed in alt screen");
+
+    // Leave alt screen
+    feed(&mut term, &mut parser, b"\x1b[?1049l");
+    assert_eq!(term.graphics().placements().len(), 0, "no placements on main screen");
+
+    // Re-enter alt screen: MUST be cleared!
+    feed(&mut term, &mut parser, b"\x1b[?1049h");
+    assert_eq!(term.graphics().placements().len(), 0, "alt screen images must be cleared on entry");
+}
+
+#[test]
+fn delete_aborts_inflight_chunked_upload() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Start chunked upload
+    feed(&mut term, &mut parser, b"\x1b_Gm=1,f=32,s=1,v=1,a=t,i=88;////\x1b\\");
+    assert!(term.graphics().has_pending_transfer(), "transfer should be pending");
+
+    // Send delete command: MUST abort in-flight transfer
+    feed(&mut term, &mut parser, b"\x1b_Ga=d,d=a\x1b\\");
+    assert!(!term.graphics().has_pending_transfer(), "delete must abort in-flight transfer");
+}
+
+#[test]
+fn virtual_placements_survive_physical_selectors() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+    term.set_cell_size(10, 20);
+
+    // Create virtual placement U=1
+    put(&mut term, &mut parser, &recorder, 42, 20, 20, ",U=1,c=4,r=2");
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    // Physical deletion d=a MUST NOT delete virtual placement
+    feed(&mut term, &mut parser, b"\x1b_Ga=d,d=a\x1b\\");
+    assert_eq!(term.graphics().placements().len(), 1, "virtual placement survived d=a");
+
+    // Physical deletion at cursor d=c MUST NOT delete virtual placement
+    feed(&mut term, &mut parser, b"\x1b_Ga=d,d=c\x1b\\");
+    assert_eq!(term.graphics().placements().len(), 1, "virtual placement survived d=c");
+
+    // Targeted deletion by id d=i MUST delete virtual placement
+    feed(&mut term, &mut parser, b"\x1b_Ga=d,d=i,i=42\x1b\\");
+    assert_eq!(term.graphics().placements().len(), 0, "virtual placement deleted by d=i");
+}
+
+#[test]
+fn feature_query_echoes_supported_keys() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Query feature support for action T with virtual placement U=1
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=31,e=T,U=1\x1b\\");
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=31,e=T,U=1;OK\x1b\\".to_owned()]);
+
+    // Query feature support for action c (compose) with U=1 (which is NOT supported for compose)
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=32,e=c,U=1,C=1\x1b\\");
+    assert_eq!(
+        recorder.pty_writes(),
+        vec![
+            "\x1b_Gi=31,e=T,U=1;OK\x1b\\".to_owned(),
+            "\x1b_Gi=32,e=c,C=1;OK\x1b\\".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn frame_composition_composes_rectangles() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Transmit a 2x2 image (frame 1) with white pixels
+    feed(&mut term, &mut parser, b"\x1b_Gf=32,s=2,v=2,a=T,i=50;/////////////////////w==\x1b\\");
+
+    // Add frame 2 with black pixels
+    feed(&mut term, &mut parser, b"\x1b_Ga=f,i=50,r=2,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+
+    // Compose a 1x1 rect from frame 2 onto frame 1 at (0, 0)
+    feed(&mut term, &mut parser, b"\x1b_Ga=c,i=50,r=2,c=1,w=1,h=1,X=0,Y=0,x=0,y=0,C=1\x1b\\");
+
+    assert_eq!(
+        recorder.pty_writes(),
+        vec![
+            "\x1b_Gi=50;OK\x1b\\".to_owned(),
+            "\x1b_Gi=50,r=2;OK\x1b\\".to_owned(),
+            "\x1b_Gi=50;OK\x1b\\".to_owned()
+        ]
+    );
+
+    // Out of bounds compose must fail with EINVAL
+    feed(&mut term, &mut parser, b"\x1b_Ga=c,i=50,r=2,c=1,w=5,h=5,X=0,Y=0,x=0,y=0\x1b\\");
+    assert_eq!(
+        recorder.pty_writes().last().unwrap(),
+        "\x1b_Gi=50;EINVAL:invalid arguments\x1b\\"
+    );
+}
+
+#[test]
+fn relative_placements_anchoring_and_error_handling() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Position cursor at row 6, col 11 (Line 5, Column 10)
+    feed(&mut term, &mut parser, b"\x1b[6;11H");
+
+    // 1. Transmit and display parent image (id 100, placement 1)
+    feed(&mut term, &mut parser, b"\x1b_Gf=32,s=1,v=1,a=T,i=100,p=1;/////w==\x1b\\");
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].anchor.line.0, 5);
+    assert_eq!(placements[0].anchor.column.0, 10);
+
+    // Save cursor position after parent placement
+    let cursor_before_child = term.grid().cursor.point;
+
+    // 2. Transmit and display child image relative to parent (id 101, placement 2, P=100, Q=1, H=2, V=3)
+    feed(&mut term, &mut parser, b"\x1b_Gf=32,s=1,v=1,a=T,i=101,p=2,P=100,Q=1,H=2,V=3;/////w==\x1b\\");
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 2);
+    let child = placements.iter().find(|p| p.internal_id == 2).unwrap();
+    assert_eq!(child.anchor.line.0, 5 + 3);
+    assert_eq!(child.anchor.column.0, 10 + 2);
+    assert_eq!(child.parent, Some((1, 1)));
+    assert_eq!(child.relative_offset, (2, 3));
+
+    // Cursor must NOT have moved for a relative placement
+    assert_eq!(term.grid().cursor.point, cursor_before_child);
+
+    // 3. ENOPARENT: reference non-existent parent image
+    feed(&mut term, &mut parser, b"\x1b_Gf=32,s=1,v=1,a=T,i=102,P=999,Q=1;/////w==\x1b\\");
+    assert!(recorder.pty_writes().last().unwrap().contains("ENOPARENT"));
+
+    // 4. EINVAL: relative virtual placement is forbidden
+    feed(&mut term, &mut parser, b"\x1b_Gf=32,s=1,v=1,a=T,i=103,P=100,Q=1,U=1;/////w==\x1b\\");
+    assert!(recorder.pty_writes().last().unwrap().contains("EINVAL"));
+
+    // 5. ECYCLE: cycle in parent chain (making parent 100 child of 101)
+    feed(&mut term, &mut parser, b"\x1b_Ga=p,i=100,p=1,P=101,Q=2\x1b\\");
+    assert!(recorder.pty_writes().last().unwrap().contains("ECYCLE"));
+
+    // 6. ETOODEEP: chain depth > 8
+    // Create chain of placements: 200..208
+    for i in 200..=208u32 {
+        feed(&mut term, &mut parser, format!("\x1b_Gf=32,s=1,v=1,a=t,i={i};/////w==\x1b\\").as_bytes());
+    }
+    // Place root: 200
+    feed(&mut term, &mut parser, b"\x1b_Ga=p,i=200,p=1\x1b\\");
+    // Place 201..207 (chain depths 1 to 7)
+    for i in 201..=207u32 {
+        let parent = i - 1;
+        feed(&mut term, &mut parser, format!("\x1b_Ga=p,i={i},p=1,P={parent},Q=1\x1b\\").as_bytes());
+        assert!(recorder.pty_writes().last().unwrap().contains("OK"));
+    }
+    // 208 depth 8 -> OK
+    feed(&mut term, &mut parser, b"\x1b_Ga=p,i=208,p=1,P=207,Q=1\x1b\\");
+    assert!(recorder.pty_writes().last().unwrap().contains("OK"));
+
+    // 209 depth 9 -> ETOODEEP
+    feed(&mut term, &mut parser, b"\x1b_Gf=32,s=1,v=1,a=t,i=209;/////w==\x1b\\");
+    feed(&mut term, &mut parser, b"\x1b_Ga=p,i=209,p=1,P=208,Q=1\x1b\\");
+    assert!(recorder.pty_writes().last().unwrap().contains("ETOODEEP"));
+
+    // 7. Cascading delete: deleting parent removes child
+    feed(&mut term, &mut parser, b"\x1b_Ga=d,d=i,i=100\x1b\\");
+    let placements = term.graphics().placements();
+    assert!(placements.iter().all(|p| p.internal_id != 1 && p.internal_id != 2));
+}
+
+#[test]
+fn indexed_color_formats_transmission_and_rejection() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // 1. Transmit f=8 (indexed 1 byte per pixel) 2x2 image = 4 bytes: [0, 1, 2, 3] -> base64 "AAECAw=="
+    feed(&mut term, &mut parser, b"\x1b_Gf=8,s=2,v=2,a=T,i=300;AAECAw==\x1b\\");
+    assert_eq!(recorder.pty_writes().last().unwrap(), "\x1b_Gi=300;OK\x1b\\");
+    assert_eq!(term.graphics().placements().len(), 1);
+
+    // 2. Transmit f=16 (indexed+alpha 2 bytes per pixel) 2x2 image = 8 bytes -> base64 "AAECAwQFBgc="
+    feed(&mut term, &mut parser, b"\x1b_Gf=16,s=2,v=2,a=T,i=301;AAECAwQFBgc=\x1b\\");
+    assert_eq!(recorder.pty_writes().last().unwrap(), "\x1b_Gi=301;OK\x1b\\");
+    assert_eq!(term.graphics().placements().len(), 2);
+
+    // 3. Animation frame on indexed image must fail with EINVAL
+    feed(&mut term, &mut parser, b"\x1b_Ga=f,i=300,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    assert_eq!(recorder.pty_writes().last().unwrap(), "\x1b_Gi=300;EINVAL:invalid arguments\x1b\\");
+
+    // 4. Frame composition on indexed image must fail with EINVAL
+    feed(&mut term, &mut parser, b"\x1b_Ga=c,i=300,r=1,c=1,w=1,h=1,X=0,Y=0,x=0,y=0\x1b\\");
+    assert_eq!(recorder.pty_writes().last().unwrap(), "\x1b_Gi=300;EINVAL:invalid arguments\x1b\\");
+}
+
+#[test]
+#[cfg(unix)]
+fn xkitty_end_to_end_integration() {
+    use std::path::Path;
+    use std::os::unix::io::{FromRawFd, AsRawFd};
+    use std::io::Read;
+    use alacritty_terminal::term::TermMode;
+
+    if !Path::new("/usr/local/bin/Xkitty").exists() {
+        return;
+    }
+
+    let pty = rustix_openpty::openpty(None, None).expect("failed to openpty");
+    let slave_fd = pty.user.as_raw_fd();
+
+    let mut child = unsafe {
+        std::process::Command::new("/usr/local/bin/Xkitty")
+            .args([":98", "-screen", "100x100", "-noreset", "-kitty-transfer", "d"])
+            .stdin(std::process::Stdio::from_raw_fd(libc::dup(slave_fd)))
+            .stdout(std::process::Stdio::from_raw_fd(libc::dup(slave_fd)))
+            .stderr(std::process::Stdio::from_raw_fd(libc::dup(slave_fd)))
+            .spawn()
+            .expect("failed to spawn Xkitty")
+    };
+
+    drop(pty.user);
+
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+
+    let controller_fd = pty.controller.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(controller_fd, libc::F_GETFL, 0);
+        libc::fcntl(controller_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut master = unsafe { std::fs::File::from_raw_fd(controller_fd) };
+    std::mem::forget(pty.controller);
+
+    let start = std::time::Instant::now();
+    let mut received_apc = false;
+    let mut buf = [0u8; 4096];
+
+    while start.elapsed() < std::time::Duration::from_secs(3) {
+        match master.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                feed(&mut term, &mut parser, &buf[..n]);
+                if buf[..n].windows(3).any(|w| w == b"\x1b_G") {
+                    received_apc = true;
+                    break;
+                }
+            },
+            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(received_apc, "expected to receive Kitty graphics APC sequence from Xkitty");
+    // Verify that Xkitty put terminal into alt screen and SGR-pixel mouse mode!
+    assert!(term.mode().contains(TermMode::ALT_SCREEN), "Xkitty must enter alt screen");
+    assert!(term.mode().contains(TermMode::SGR_PIXEL_MOUSE), "Xkitty must enable SGR pixel mouse mode");
+    assert!(!term.mode().contains(TermMode::SHOW_CURSOR), "Xkitty hides the cursor");
+
+    // Process any deferred decode jobs produced by APC
+    let jobs = term.take_graphics_jobs();
+    for job in jobs {
+        let res = job.decode();
+        term.install_graphics(res);
+    }
+
+    // Verify placement in alt screen
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 1, "Xkitty screen image should be placed");
+    assert_eq!(placements[0].src.width, 100);
+    assert_eq!(placements[0].src.height, 100);
+}
+
+#[test]
+fn bel_terminated_apc_commands_execute_properly() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Query terminated by BEL (\x07) instead of ST (\x1b\)
+    let payload = b"\x1b_Gi=40,s=1,v=1,a=q,t=d,f=24;AAAA\x07";
+    feed(&mut term, &mut parser, payload);
+
+    assert_eq!(
+        recorder.pty_writes(),
+        vec!["\x1b_Gi=40;OK\x1b\\".to_owned()],
+        "BEL-terminated APC command must be processed and answered"
+    );
+}
+
+#[test]
+fn cascading_relative_placements_delete_transitively() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
+
+    // Transmit and display root placement A (image 50, placement 1)
+    let a = format!("\x1b_Ga=T,f=32,s=1,v=1,i=50,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, a.as_bytes());
+    recorder.events.lock().unwrap().clear();
+
+    // Transmit and display child placement B (image 51, placement 1) relative to A (P=50, Q=1)
+    let b = format!("\x1b_Ga=T,f=32,s=1,v=1,i=51,p=1,P=50,Q=1,H=1,V=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, b.as_bytes());
+    recorder.events.lock().unwrap().clear();
+
+    // Transmit and display grandchild placement C (image 52, placement 1) relative to B (P=51, Q=1)
+    let c = format!("\x1b_Ga=T,f=32,s=1,v=1,i=52,p=1,P=51,Q=1,H=1,V=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, c.as_bytes());
+    recorder.events.lock().unwrap().clear();
+
+    assert_eq!(term.graphics().placements().len(), 3, "A, B, and C must all be placed");
+
+    // Delete root placement A by image ID (d=i, i=50)
+    feed(&mut term, &mut parser, b"\x1b_Ga=d,d=i,i=50\x1b\\");
+
+    // Both direct child B and transitive child C must be pruned
+    assert_eq!(
+        term.graphics().placements().len(),
+        0,
+        "deleting parent A must cascade transitively to delete child B and grandchild C"
+    );
+}
+
+#[test]
+fn query_does_not_abort_inflight_chunked_upload() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    let half1 = BASE64.encode([255, 0, 0, 255]);
+    let half2 = BASE64.encode([0, 255, 0, 255]);
+
+    // Send chunk 1 with m=1
+    let chunk1 = format!("\x1b_Ga=T,f=32,s=1,v=2,i=60,m=1;{half1}\x1b\\");
+    feed(&mut term, &mut parser, chunk1.as_bytes());
+    assert!(term.graphics().has_pending_transfer(), "transfer must be in-flight");
+
+    // Interleave a query command
+    let query = b"\x1b_Gi=61,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+    feed(&mut term, &mut parser, query);
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=61;OK\x1b\\".to_owned()]);
+    recorder.events.lock().unwrap().clear();
+
+    // Transfer must still be active!
+    assert!(term.graphics().has_pending_transfer(), "query must not have aborted in-flight transfer");
+
+    // Send chunk 2 with m=0 to complete transfer
+    let chunk2 = format!("\x1b_Gm=0;{half2}\x1b\\");
+    feed(&mut term, &mut parser, chunk2.as_bytes());
+
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=60;OK\x1b\\".to_owned()]);
+    assert_eq!(term.graphics().placements().len(), 1, "image 60 must be placed");
+}
+
+#[test]
+fn feature_query_echoes_delete_selector_and_omits_unsupported_actions() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Query delete action with delete selector d=i
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=70,e=d,d=i\x1b\\");
+    assert_eq!(
+        recorder.pty_writes(),
+        vec!["\x1b_Gi=70,e=d,d=i;OK\x1b\\".to_owned()],
+        "feature query for delete must echo supported selector d=i"
+    );
+    recorder.events.lock().unwrap().clear();
+
+    // Query an invalid action e=x replies OK with e omitted per Kitty lenient parser
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=71,s=1,v=1,f=24,e=x;AAAA\x1b\\");
+    assert_eq!(
+        recorder.pty_writes(),
+        vec!["\x1b_Gi=71;OK\x1b\\".to_owned()],
+        "feature query for unsupported action must omit e in response"
+    );
+}
+
+#[test]
+fn relative_placement_anchored_to_virtual_parent_succeeds() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
+
+    // Create virtual placement (image 80, placement 1, U=1)
+    let virt = format!("\x1b_Ga=T,f=32,s=1,v=1,i=80,p=1,U=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, virt.as_bytes());
+    recorder.events.lock().unwrap().clear();
+
+    let parent_internal_id = term.graphics().placements()[0].internal_id;
+    assert!(term.graphics().placements()[0].is_virtual, "must be a virtual placement");
+
+    // Place a real image anchored relative to the virtual placement (P=80, Q=1)
+    let rel = format!("\x1b_Ga=T,f=32,s=1,v=1,i=81,p=1,P=80,Q=1,H=2,V=3;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, rel.as_bytes());
+
+    assert_eq!(
+        recorder.pty_writes(),
+        vec!["\x1b_Gi=81,p=1;OK\x1b\\".to_owned()],
+        "relative placement targeting virtual parent must succeed"
+    );
+
+    let all_placements = term.graphics().placements();
+    assert_eq!(all_placements.len(), 2);
+    let child = all_placements.iter().find(|p| p.internal_id != parent_internal_id).unwrap();
+    assert!(!child.is_virtual);
+    assert_eq!(child.parent, Some((parent_internal_id, 1)));
+    assert_eq!(child.relative_offset, (2, 3));
+
+    // Print placeholder cell at line 4, col 10:
+    feed(&mut term, &mut parser, "\x1b[5;11H\x1b[38;5;80m\u{10EEEE}\u{0305}\u{0305}\x1b[39m".as_bytes());
+    term.sync_virtual_placements();
+
+    let all_placements = term.graphics().placements();
+    let child = all_placements.iter().find(|p| p.internal_id != parent_internal_id).unwrap();
+    assert_eq!(child.anchor.line.0, 4 + 3);
+    assert_eq!(child.anchor.column.0, 10 + 2);
+}
+
+#[test]
+fn frame_composition_default_rectangle_uses_full_dimensions() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Transmit base 2x2 image (id 1)
+    let four_pixels = BASE64.encode([255u8; 16]);
+    let cmd = format!("\x1b_Ga=T,f=32,s=2,v=2,i=1,q=2;{four_pixels}\x1b\\");
+    feed(&mut term, &mut parser, cmd.as_bytes());
+
+    // Add second frame (r=2)
+    let frame2 = format!("\x1b_Ga=f,i=1,s=2,v=2,r=2,q=2;{four_pixels}\x1b\\");
+    feed(&mut term, &mut parser, frame2.as_bytes());
+
+    recorder.events.lock().unwrap().clear();
+
+    // Compose with omitted w and h: a=c,i=1,r=2,c=1
+    // Spec: "If unspecified, the full image width and height are used."
+    let compose = b"\x1b_Ga=c,i=1,r=2,c=1\x1b\\";
+    feed(&mut term, &mut parser, compose);
+
+    assert_eq!(
+        recorder.pty_writes(),
+        vec!["\x1b_Gi=1;OK\x1b\\".to_owned()],
+        "frame composition with omitted w/h must default to full image dimensions and succeed"
+    );
+}
+
+#[test]
+fn feature_query_with_payload_and_quiet_semantics() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // 1. Feature query with payload must ignore payload and answer OK with supported keys
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=51,e=T,U=1;some_random_payload\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].contains(";OK"), "query must succeed ignoring payload: {:?}", writes[0]);
+    assert!(writes[0].contains("e=T"), "must echo supported feature: {:?}", writes[0]);
+
+    // 2. Feature query with q=1 must suppress the OK reply
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=52,e=T,U=1,q=1;ignored_payload\x1b\\");
+    assert!(recorder.pty_writes().is_empty(), "q=1 must suppress OK response even for feature query");
+
+    // 3. Feature query with unsupported format (f=1) succeeds with OK and supported keys, omitting f
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=53,f=1,e=T,U=1\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=53,e=T,U=1;OK\x1b\\");
+    assert!(!writes[0].contains("f="), "unsupported format key f=1 must be omitted from echo");
+
+    // 4. Feature query with genuine error (both i and I specified) fails with EINVAL and omits e=...
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=54,I=54,e=T\x1b\\");
+    let err_writes = recorder.pty_writes();
+    assert_eq!(err_writes.len(), 1);
+    assert!(err_writes[0].contains("EINVAL"), "must reply EINVAL: {:?}", err_writes[0]);
+    assert!(!err_writes[0].contains("e="), "error response must omit e= echo: {:?}", err_writes[0]);
+
+    // 5. Unrecognized feature query action (e=x) replies OK with e omitted per Kitty lenient parser
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=55,e=x\x1b\\");
+    assert_eq!(recorder.pty_writes(), vec!["\x1b_Gi=55;OK\x1b\\".to_owned()]);
+}
+
+#[test]
+fn relative_child_pruned_when_parent_scrolls_out() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
+
+    // Create parent placement at line 0
+    feed(&mut term, &mut parser, b"\x1b[1;1H");
+    let parent_cmd = format!("\x1b_Ga=T,f=32,s=1,v=1,i=60,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, parent_cmd.as_bytes());
+
+    // Create child placement relative to parent (P=60, Q=1)
+    let child_cmd = format!("\x1b_Ga=T,f=32,s=1,v=1,i=61,p=1,P=60,Q=1,H=1,V=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, child_cmd.as_bytes());
+
+    assert_eq!(term.graphics().placements().len(), 2);
+
+    // Prune lines 0..2 above Line(10)
+    term.graphics_mut().prune(Line(10), Line(20));
+    assert_eq!(term.graphics().placements().len(), 0, "child must be pruned when parent is pruned");
+}
+
+#[test]
+fn chunk_abort_matrix_aborts_active_transfer() {
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
+
+    // Test matrix of commands that must abort an in-flight transfer
+    let abort_commands: &[(&str, &[u8])] = &[
+        ("a=T", b"\x1b_Ga=T,f=32,s=1,v=1,i=91;/////w==\x1b\\"),
+        ("a=f", b"\x1b_Ga=f,i=90,r=1;/////w==\x1b\\"),
+        ("a=c", b"\x1b_Ga=c,i=90,r=1,c=1\x1b\\"),
+        ("a=a", b"\x1b_Ga=a,i=90,s=3\x1b\\"),
+        ("a=p", b"\x1b_Ga=p,i=90\x1b\\"),
+        ("a=d", b"\x1b_Ga=d,d=i,i=90\x1b\\"),
+    ];
+
+    for (name, abort_cmd) in abort_commands {
+        let (mut term, _recorder) = terminal();
+        let mut parser = Processor::new();
+
+        // Start chunked transfer (m=1)
+        let chunk1 = format!("\x1b_Ga=t,f=32,s=1,v=1,i=90,m=1;{pixel_b64}\x1b\\");
+        feed(&mut term, &mut parser, chunk1.as_bytes());
+        assert!(term.graphics().has_pending_transfer(), "transfer must be pending before abort command ({})", name);
+
+        // Send abort command
+        feed(&mut term, &mut parser, abort_cmd);
+        assert!(!term.graphics().has_pending_transfer(), "transfer must be aborted by {}", name);
+    }
+}
+
+#[test]
+fn unsupported_format_and_quiet_clamping() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // 1. f=1 (unsupported format) with i=77 must reply EINVAL instead of silently dropping
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=t,f=1,i=77;data\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].contains("i=77"), "must echo image id: {:?}", writes[0]);
+    assert!(writes[0].contains("EINVAL"), "must report EINVAL for unsupported format: {:?}", writes[0]);
+
+    // 2. q=3 must be clamped to 2 (quiet mode 2 suppresses OK)
+    recorder.events.lock().unwrap().clear();
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
+    let cmd = format!("\x1b_Ga=T,f=32,s=1,v=1,i=78,q=3;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, cmd.as_bytes());
+    assert!(recorder.pty_writes().is_empty(), "q=3 clamped to 2 must suppress OK response");
+}
+
+#[test]
+fn feature_query_frame_echoes_rgb_and_png_but_omits_indexed() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // 1. e=f with f=8 (indexed) must omit f=8 because animation frames do not support indexed format
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=81,e=f,f=8\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=81,e=f;OK\x1b\\");
+
+    // 2. e=f with f=16 (indexed alpha) must also omit f=16
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=82,e=f,f=16\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=82,e=f;OK\x1b\\");
+
+    // 3. e=f with f=24 (RGB) must echo f=24
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=83,e=f,f=24\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=83,e=f,f=24;OK\x1b\\");
+
+    // 4. e=f with S and O keys echoes them (N is omitted for animation frames per errata)
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=84,e=f,S=100,O=10,N=1\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=84,e=f,S=100,O=10;OK\x1b\\");
+
+    // 5. e=q (query) supports indexed formats and transmission keys
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=85,e=q,f=8,s=10,v=20,t=f\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=85,e=q,s=10,v=20,f=8,t=f;OK\x1b\\");
+
+    // 6. G-1: Feature query with medium t=s (or t=f, t=t) does not attempt to read files and succeeds with OK
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=86,e=T,t=s\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=86,e=T,t=s;OK\x1b\\");
+
+    recorder.events.lock().unwrap().clear();
+    feed(&mut term, &mut parser, b"\x1b_Ga=q,i=87,e=T,t=f\x1b\\");
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=87,e=T,t=f;OK\x1b\\");
+}
+
+#[test]
+fn relative_child_persists_across_parent_top_clip_scroll() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    let pixel_b64 = BASE64.encode(vec![255u8; 100 * 100 * 4]);
+
+    // Set DECSTBM margin lines 2 to 8 (0-indexed lines 1 to 7)
+    feed(&mut term, &mut parser, b"\x1b[2;8r");
+    feed(&mut term, &mut parser, b"\x1b[2;1H");
+
+    // Parent at line 1 (0-indexed line 1 = screen row 2) with 4 rows footprint
+    let parent_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=4,i=70,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, parent_cmd.as_bytes());
+
+    // Relative child placed with V=1 (relative line +1 = line 2) with 4 rows footprint
+    let child_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=4,i=71,p=1,P=70,Q=1,H=0,V=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, child_cmd.as_bytes());
+
+    let parent_internal_id = term.graphics().images().find(|(_, img)| img.client_id == 70).unwrap().0;
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 2);
+    let child_orig = placements.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))).unwrap();
+    assert_eq!(child_orig.anchor.line.0, 2);
+    assert_eq!(child_orig.footprint.rows, 4);
+
+    // Scroll up by 2 lines within margins (CSI 2 S)
+    // Parent at line 1 is top-clipped: line 1 - 2 = -1 < region.start (1) => clamped to line 1.
+    // Parent actual movement is region.start - line = 1 - 1 = 0 lines.
+    // Child follows parent movement (delta = 0), remaining at line 2 (parent 1 + V 1 = 2).
+    feed(&mut term, &mut parser, b"\x1b[2S");
+
+    let placements_after = term.graphics().placements();
+    let child_after = placements_after
+        .iter()
+        .find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1)))
+        .expect("child should remain positioned relative to parent");
+    assert_eq!(child_after.anchor.line.0, 2, "child position derives from parent-relative movement");
+    assert_eq!(child_after.footprint.rows, 4, "child remains intact within scroll margins");
+}
+
+#[test]
+fn relative_child_follows_moving_parent_within_scroll_margins() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    let pixel_b64 = BASE64.encode(vec![255u8; 100 * 100 * 4]);
+
+    // Set DECSTBM margin lines 2 to 8 (0-indexed lines 1 to 7)
+    feed(&mut term, &mut parser, b"\x1b[2;8r");
+    feed(&mut term, &mut parser, b"\x1b[4;1H");
+
+    // Parent at line 3 with 2 rows footprint
+    let parent_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=2,i=70,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, parent_cmd.as_bytes());
+
+    // Relative child placed with V=1 (relative line +1 = line 4)
+    let child_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=2,i=71,p=1,P=70,Q=1,H=0,V=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, child_cmd.as_bytes());
+
+    let parent_internal_id = term.graphics().images().find(|(_, img)| img.client_id == 70).unwrap().0;
+
+    // Scroll up by 1 line within margins: parent moves from line 3 to line 2 (movement = -1)
+    feed(&mut term, &mut parser, b"\x1b[1S");
+
+    let placements = term.graphics().placements();
+    let parent = placements.iter().find(|p| p.placement_id == 1 && p.internal_id == parent_internal_id).unwrap();
+    assert_eq!(parent.anchor.line.0, 2);
+
+    let child = placements.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))).unwrap();
+    assert_eq!(child.anchor.line.0, 3, "child must follow parent movement (4 - 1 = 3)");
+}
+
+#[test]
+fn relative_child_with_q0_follows_named_parent_placement() {
+    let (mut term, _recorder) = terminal();
+    let mut parser = Processor::new();
+    let pixel_b64 = BASE64.encode(vec![255u8; 100 * 100 * 4]);
+
+    // Parent image 60 placed with p=1 at line 3
+    feed(&mut term, &mut parser, b"\x1b[4;1H");
+    let parent_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=2,i=60,p=1;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, parent_cmd.as_bytes());
+
+    // Relative child placed with P=60, Q=0, V=2 (matches first placement p=1 of image 60)
+    let child_cmd = format!("\x1b_Ga=T,f=32,s=100,v=100,c=2,r=2,i=61,p=1,P=60,Q=0,H=0,V=2;{pixel_b64}\x1b\\");
+    feed(&mut term, &mut parser, child_cmd.as_bytes());
+
+    let parent_internal_id = term.graphics().images().find(|(_, img)| img.client_id == 60).unwrap().0;
+    let placements = term.graphics().placements();
+    assert_eq!(placements.len(), 2);
+    let child = placements.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))).expect("child must link to resolved parent placement");
+    assert_eq!(child.anchor.line.0, 5);
+
+    // Scroll up by 1 line (CSI 1 S)
+    feed(&mut term, &mut parser, b"\x1b[1S");
+
+    let placements_after = term.graphics().placements();
+    let parent_after = placements_after.iter().find(|p| p.placement_id == 1 && p.internal_id == parent_internal_id).unwrap();
+    assert_eq!(parent_after.anchor.line.0, 2);
+
+    let child_after = placements_after.iter().find(|p| p.placement_id == 1 && p.parent == Some((parent_internal_id, 1))).expect("child must remain");
+    assert_eq!(child_after.anchor.line.0, 4, "child with Q=0 must follow named parent movement (5 - 1 = 4)");
 }

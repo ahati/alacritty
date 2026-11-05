@@ -85,6 +85,7 @@ bitflags! {
         /// Paste events announce the clipboard's MIME types (kitty clipboard
         /// protocol's private mode 5522).
         const PASTE_EVENTS            = 1 << 23;
+        const SGR_PIXEL_MOUSE         = 1 << 24;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -713,6 +714,120 @@ impl<T> Term<T> {
         &self.graphics
     }
 
+    /// Mutable access to Kitty graphics displayed on the active screen.
+    #[inline]
+    pub fn graphics_mut(&mut self) -> &mut GraphicsStore {
+        &mut self.graphics
+    }
+
+    /// Sync virtual placement anchors from the minimum line and column of their
+    /// associated Unicode placeholder cells in the grid.
+    pub fn sync_virtual_placements(&mut self) {
+        if !self.graphics.has_virtual_placements() {
+            return;
+        }
+
+        let mut virt_keys_stack = arrayvec::ArrayVec::<(u32, u32, u32), 64>::new();
+        let mut virt_keys_heap = Vec::new();
+        for p in self.graphics.raw_placements().iter().filter(|p| p.is_virtual) {
+            let cid = self.graphics.image(p.internal_id).map_or(0, |i| i.client_id);
+            if virt_keys_heap.is_empty() {
+                if virt_keys_stack.try_push((p.internal_id, p.placement_id, cid)).is_err() {
+                    virt_keys_heap.extend(virt_keys_stack.drain(..));
+                    virt_keys_heap.push((p.internal_id, p.placement_id, cid));
+                }
+            } else {
+                virt_keys_heap.push((p.internal_id, p.placement_id, cid));
+            }
+        }
+
+        let virt_keys: &[(u32, u32, u32)] = if virt_keys_heap.is_empty() {
+            &virt_keys_stack
+        } else {
+            &virt_keys_heap
+        };
+
+        if virt_keys.is_empty() {
+            return;
+        }
+
+        let mut anchors = arrayvec::ArrayVec::<((u32, u32), (Line, Column)), 64>::new();
+        let mut anchors_overflow = std::collections::HashMap::new();
+
+        for cell in self.grid.display_iter() {
+            if cell.c == '\u{10EEEE}' {
+                let mut image_id = match cell.fg {
+                    Color::Indexed(idx) => u32::from(idx),
+                    Color::Spec(rgb) => {
+                        (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
+                    },
+                    Color::Named(named) => {
+                        let val = named as usize;
+                        if val < 256 {
+                            val as u32
+                        } else {
+                            0
+                        }
+                    },
+                };
+                let placement_id = match cell.underline_color() {
+                    None => 0,
+                    Some(Color::Indexed(idx)) => u32::from(idx),
+                    Some(Color::Spec(rgb)) => {
+                        (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
+                    },
+                    Some(Color::Named(named)) => {
+                        let val = named as usize;
+                        if val < 256 {
+                            val as u32
+                        } else {
+                            0
+                        }
+                    },
+                };
+                if let Some(zerowidth) = cell.zerowidth() {
+                    if zerowidth.len() > 2 {
+                        if let Ok(idx) = crate::graphics::ROWCOLUMN_DIACRITICS
+                            .binary_search(&(zerowidth[2] as u32))
+                        {
+                            image_id |= (idx as u32 & 0xFF) << 24;
+                        }
+                    }
+                }
+
+                for &(int_id, pl_id, cid) in virt_keys {
+                    if (placement_id == 0 || pl_id == 0 || pl_id == placement_id)
+                        && cid == image_id
+                    {
+                        let point = cell.point;
+                        if let Some(entry) = anchors.iter_mut().find(|e| e.0 == (int_id, pl_id)) {
+                            entry.1 .0 = std::cmp::min(entry.1 .0, point.line);
+                            entry.1 .1 = std::cmp::min(entry.1 .1, point.column);
+                        } else if anchors
+                            .try_push(((int_id, pl_id), (point.line, point.column)))
+                            .is_err()
+                        {
+                            anchors_overflow
+                                .entry((int_id, pl_id))
+                                .and_modify(|p: &mut (Line, Column)| {
+                                    p.0 = std::cmp::min(p.0, point.line);
+                                    p.1 = std::cmp::min(p.1, point.column);
+                                })
+                                .or_insert((point.line, point.column));
+                        }
+                    }
+                }
+            }
+        }
+
+        for ((int_id, pl_id), (line, col)) in anchors {
+            self.graphics.update_virtual_parent_anchor(int_id, pl_id, Point::new(line, col));
+        }
+        for ((int_id, pl_id), (line, col)) in anchors_overflow {
+            self.graphics.update_virtual_parent_anchor(int_id, pl_id, Point::new(line, col));
+        }
+    }
+
     /// Take the image decodes queued by the parser.
     ///
     /// Decoding is proportional to the image rather than to the command that
@@ -926,6 +1041,9 @@ impl<T> Term<T> {
 
             // Reset alternate screen contents.
             self.inactive_grid.reset_region(..);
+
+            // Reset alternate screen graphics.
+            self.inactive_graphics.clear();
         }
 
         mem::swap(&mut self.keyboard_mode_stack, &mut self.inactive_keyboard_mode_stack);
@@ -2245,11 +2363,15 @@ impl<T: EventListener> Handler for Term<T> {
             NamedPrivateMode::BracketedPaste => self.mode.insert(TermMode::BRACKETED_PASTE),
             // Mouse encodings are mutually exclusive.
             NamedPrivateMode::SgrMouse => {
-                self.mode.remove(TermMode::UTF8_MOUSE);
+                self.mode.remove(TermMode::UTF8_MOUSE | TermMode::SGR_PIXEL_MOUSE);
                 self.mode.insert(TermMode::SGR_MOUSE);
             },
+            NamedPrivateMode::SgrPixelMouse => {
+                self.mode.remove(TermMode::UTF8_MOUSE | TermMode::SGR_MOUSE);
+                self.mode.insert(TermMode::SGR_PIXEL_MOUSE);
+            },
             NamedPrivateMode::Utf8Mouse => {
-                self.mode.remove(TermMode::SGR_MOUSE);
+                self.mode.remove(TermMode::SGR_MOUSE | TermMode::SGR_PIXEL_MOUSE);
                 self.mode.insert(TermMode::UTF8_MOUSE);
             },
             NamedPrivateMode::AlternateScroll => self.mode.insert(TermMode::ALTERNATE_SCROLL),
@@ -2307,6 +2429,7 @@ impl<T: EventListener> Handler for Term<T> {
             NamedPrivateMode::ReportFocusInOut => self.mode.remove(TermMode::FOCUS_IN_OUT),
             NamedPrivateMode::BracketedPaste => self.mode.remove(TermMode::BRACKETED_PASTE),
             NamedPrivateMode::SgrMouse => self.mode.remove(TermMode::SGR_MOUSE),
+            NamedPrivateMode::SgrPixelMouse => self.mode.remove(TermMode::SGR_PIXEL_MOUSE),
             NamedPrivateMode::Utf8Mouse => self.mode.remove(TermMode::UTF8_MOUSE),
             NamedPrivateMode::AlternateScroll => self.mode.remove(TermMode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.remove(TermMode::LINE_WRAP),
@@ -2348,6 +2471,7 @@ impl<T: EventListener> Handler for Term<T> {
                 },
                 NamedPrivateMode::Utf8Mouse => self.mode.contains(TermMode::UTF8_MOUSE).into(),
                 NamedPrivateMode::SgrMouse => self.mode.contains(TermMode::SGR_MOUSE).into(),
+                NamedPrivateMode::SgrPixelMouse => self.mode.contains(TermMode::SGR_PIXEL_MOUSE).into(),
                 NamedPrivateMode::AlternateScroll => {
                     self.mode.contains(TermMode::ALTERNATE_SCROLL).into()
                 },
@@ -3583,5 +3707,29 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    #[test]
+    fn sgr_pixel_mouse_mode_handling() {
+        let size = TermSize::new(100, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+
+        term.set_private_mode(NamedPrivateMode::SgrPixelMouse.into());
+        assert!(term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+        assert!(!term.mode().contains(TermMode::SGR_MOUSE));
+        assert!(!term.mode().contains(TermMode::UTF8_MOUSE));
+
+        term.set_private_mode(NamedPrivateMode::SgrMouse.into());
+        assert!(term.mode().contains(TermMode::SGR_MOUSE));
+        assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+
+        term.set_private_mode(NamedPrivateMode::SgrPixelMouse.into());
+        assert!(term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
+        assert!(!term.mode().contains(TermMode::SGR_MOUSE));
+
+        term.unset_private_mode(NamedPrivateMode::SgrPixelMouse.into());
+        assert!(!term.mode().contains(TermMode::SGR_PIXEL_MOUSE));
     }
 }

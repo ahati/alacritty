@@ -2,6 +2,7 @@ use std::mem;
 
 use alacritty_terminal::index::{Column, Point};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::vte::ansi::Color;
 
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
@@ -72,6 +73,8 @@ impl TextRun {
             bg_alpha: self.bg_alpha,
             underline: self.underline,
             flags: self.flags,
+            raw_fg: Color::Spec(*self.fg),
+            raw_underline: None,
         }
     }
 
@@ -288,6 +291,8 @@ mod tests {
             fg,
             bg: Rgb::default(),
             underline: fg,
+            raw_fg: Color::Spec(*fg),
+            raw_underline: None,
         }
     }
 

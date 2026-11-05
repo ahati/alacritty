@@ -459,6 +459,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let display_offset = self.ctx.terminal().grid().display_offset();
         let old_point = self.ctx.mouse().point(&size_info, display_offset);
+        let old_x = self.ctx.mouse().x;
+        let old_y = self.ctx.mouse().y;
 
         let x = x.clamp(0, size_info.width() as i32 - 1) as usize;
         let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
@@ -470,11 +472,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let point = self.ctx.mouse().point(&size_info, display_offset);
         let cell_changed = old_point != point;
+        let pixel_changed = (old_x, old_y) != (x, y);
+        let is_pixel_mouse = self.ctx.terminal().mode().contains(TermMode::SGR_PIXEL_MOUSE);
 
-        // If the mouse hasn't changed cells, do nothing.
-        if !cell_changed
+        // If the mouse hasn't changed cells (or pixels in pixel mouse mode), do nothing.
+        if (!is_pixel_mouse
+            && !cell_changed
             && self.ctx.mouse().cell_side == cell_side
-            && self.ctx.mouse().inside_text_area == inside_text_area
+            && self.ctx.mouse().inside_text_area == inside_text_area)
+            || (is_pixel_mouse && !pixel_changed)
         {
             return;
         }
@@ -496,7 +502,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             && (self.ctx.modifiers().state().shift_key() || !self.ctx.mouse_mode())
         {
             self.ctx.update_selection(point, cell_side);
-        } else if cell_changed
+        } else if (cell_changed || (is_pixel_mouse && pixel_changed))
             && self.ctx.terminal().mode().intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG)
         {
             if lmb_pressed {
@@ -556,7 +562,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         // Report mouse events.
-        if self.ctx.terminal().mode().contains(TermMode::SGR_MOUSE) {
+        if self.ctx.terminal().mode().intersects(TermMode::SGR_MOUSE | TermMode::SGR_PIXEL_MOUSE) {
             self.sgr_mouse_report(point, button + mods, state);
         } else if let ElementState::Released = state {
             self.normal_mouse_report(point, 3 + mods);
@@ -605,7 +611,17 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             ElementState::Released => 'm',
         };
 
-        let msg = format!("\x1b[<{};{};{}{}", button, point.column + 1, point.line + 1, c);
+        let mode = self.ctx.terminal().mode();
+        let msg = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+            let size = self.ctx.size_info();
+            let mouse = self.ctx.mouse();
+            let px = mouse.x.saturating_sub(size.padding_x() as usize).saturating_add(1);
+            let py = mouse.y.saturating_sub(size.padding_y() as usize).saturating_add(1);
+            format!("\x1b[<{button};{px};{py}{c}")
+        } else {
+            format!("\x1b[<{};{};{}{}", button, point.column + 1, point.line + 1, c)
+        };
+
         self.ctx.write_to_pty(msg.into_bytes());
     }
 

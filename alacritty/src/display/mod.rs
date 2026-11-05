@@ -7,6 +7,7 @@ use std::fmt::{self, Formatter};
 use std::mem::{self, ManuallyDrop};
 use std::num::NonZeroU32;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glutin::config::GetGlConfig;
@@ -44,7 +45,7 @@ use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
-use crate::display::color::{List, Rgb};
+use crate::display::color::{CellRgb, List, Rgb};
 use crate::display::content::{RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
@@ -66,6 +67,7 @@ pub mod content;
 pub mod cursor;
 pub mod hint;
 pub mod image;
+pub mod placeholder;
 pub mod window;
 
 mod bell;
@@ -809,6 +811,40 @@ impl Display {
         let selection_range = content.selection_range();
         let foreground_color = content.color(NamedColor::Foreground as usize);
         let background_color = content.color(NamedColor::Background as usize);
+
+        // Build palette for indexed images.
+        let mut palette = [alacritty_terminal::vte::ansi::Rgb::default(); 256];
+        let sel_bg = config.colors.selection.background.color(foreground_color, background_color);
+        let sel_fg = config.colors.selection.foreground.color(foreground_color, background_color);
+        let cursor_bg = config.colors.cursor.background.color(foreground_color, background_color);
+        let cursor_fg = config.colors.cursor.foreground.color(foreground_color, background_color);
+        let url_color = match config.colors.hints.end.foreground {
+            CellRgb::Rgb(rgb) => rgb,
+            _ => content.color(alacritty_terminal::vte::ansi::NamedColor::BrightBlue as usize),
+        };
+
+        for (i, pal_entry) in palette.iter_mut().enumerate() {
+            let rgb = match i {
+                248 => background_color,
+                249 => foreground_color,
+                250 => sel_bg,
+                251 => sel_fg,
+                252 => cursor_bg,
+                253 => cursor_fg,
+                254 => url_color,
+                255 => foreground_color,
+                _ => content.color(i),
+            };
+            *pal_entry = alacritty_terminal::vte::ansi::Rgb { r: rgb.r, g: rgb.g, b: rgb.b };
+        }
+
+        let palette_hash = palette.iter().fold(0u64, |acc, c| {
+            acc.wrapping_mul(31)
+                .wrapping_add(c.r as u64)
+                .wrapping_add((c.g as u64) << 8)
+                .wrapping_add((c.b as u64) << 16)
+        });
+
         let display_offset = content.display_offset();
         let cursor = content.cursor();
 
@@ -830,17 +866,36 @@ impl Display {
             },
         }
         terminal.reset_damage();
+        terminal.sync_virtual_placements();
 
         // Collect graphics before the terminal lock is dropped.
-        let images = image::collect(terminal.graphics(), &size_info, display_offset);
+        let images = image::collect(terminal.graphics(), &size_info, display_offset, palette_hash);
 
         // Textures are retained for every image the terminal still holds, not
         // just the visible ones, so that scrolling does not re-upload them.
         let live: HashSet<ImageKey> = terminal
             .graphics()
             .images()
-            .map(|(internal_id, image)| image::image_key(internal_id, image.generation))
+            .map(|(internal_id, image)| {
+                if image.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
+                    || image.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
+                {
+                    image::image_key(internal_id, image::indexed_image_generation(image.generation, palette_hash))
+                } else {
+                    image::image_key(internal_id, image.generation)
+                }
+            })
             .collect();
+
+        // Extract virtual placements for Unicode placeholders.
+        let mut virtual_placements = Vec::new();
+        for p in terminal.graphics().placements() {
+            if p.is_virtual {
+                if let Some(img) = terminal.graphics().image(p.internal_id) {
+                    virtual_placements.push((p.clone(), Arc::clone(img)));
+                }
+            }
+        }
 
         // Drop terminal as early as possible to free lock.
         drop(terminal);
@@ -879,9 +934,42 @@ impl Display {
                     image.image.height,
                     image.image.format,
                     &image.image.pixels,
+                    Some(&palette),
                 );
             }
         }
+
+        // Process Unicode placeholder cells (U+10EEEE)
+        let (placeholder_behind, placeholder_front) = placeholder::build_placeholder_quads(
+            &mut grid_cells,
+            &virtual_placements,
+            &size_info,
+            |p, img| {
+                let key = if img.format == alacritty_terminal::graphics::image::PixelFormat::Indexed
+                    || img.format == alacritty_terminal::graphics::image::PixelFormat::IndexedAlpha
+                {
+                    image::image_key(
+                        p.internal_id,
+                        image::indexed_image_generation(img.generation, palette_hash),
+                    )
+                } else {
+                    image::image_key(p.internal_id, img.generation)
+                };
+
+                if let Some(tex) = self.image_cache.get(key) {
+                    tex
+                } else {
+                    self.image_cache.upload(
+                        key,
+                        img.width,
+                        img.height,
+                        img.format,
+                        &img.pixels,
+                        Some(&palette),
+                    )
+                }
+            },
+        );
 
         // Uploading left the image texture bound, which the text renderer does
         // not know about.
@@ -892,8 +980,10 @@ impl Display {
         // discards those fragments.
         let (behind, in_front): (Vec<_>, Vec<_>) =
             images.iter().partition(|image| image.z_index < 0);
-        let behind_quads = image_quads(&behind, &self.image_cache);
-        let front_quads = image_quads(&in_front, &self.image_cache);
+        let mut behind_quads = image_quads(&behind, &self.image_cache);
+        behind_quads.extend(placeholder_behind);
+        let mut front_quads = image_quads(&in_front, &self.image_cache);
+        front_quads.extend(placeholder_front);
 
         self.renderer.draw_images(&size_info, &behind_quads);
 

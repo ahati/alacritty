@@ -52,7 +52,7 @@ const VERTICES_PER_QUAD: usize = 6;
 fn gl_format(format: PixelFormat) -> GLenum {
     match format {
         PixelFormat::Rgb => gl::RGB,
-        PixelFormat::Rgba => gl::RGBA,
+        PixelFormat::Rgba | PixelFormat::Indexed | PixelFormat::IndexedAlpha => gl::RGBA,
     }
 }
 
@@ -136,6 +136,7 @@ impl ImageTextureCache {
         height: u32,
         format: PixelFormat,
         pixels: &[u8],
+        palette: Option<&[alacritty_terminal::vte::ansi::Rgb; 256]>,
     ) -> GLuint {
         if width == 0 || height == 0 {
             debug_assert!(width > 0 && height > 0, "cannot upload an empty image");
@@ -157,6 +158,45 @@ impl ImageTextureCache {
             debug_assert!(false, "image dimensions exceed GL_MAX_TEXTURE_SIZE");
             return 0;
         }
+
+        let rgba_buf: Option<Vec<u8>> = match format {
+            PixelFormat::Indexed => {
+                let mut buf = Vec::with_capacity((width * height * 4) as usize);
+                for &idx in pixels {
+                    let (r, g, b) = match palette {
+                        Some(pal) => (pal[idx as usize].r, pal[idx as usize].g, pal[idx as usize].b),
+                        None => (idx, idx, idx),
+                    };
+                    buf.push(r);
+                    buf.push(g);
+                    buf.push(b);
+                    buf.push(255);
+                }
+                Some(buf)
+            },
+            PixelFormat::IndexedAlpha => {
+                let mut buf = Vec::with_capacity((width * height * 4) as usize);
+                for chunk in pixels.chunks_exact(2) {
+                    let idx = chunk[0];
+                    let a = chunk[1];
+                    let (r, g, b) = match palette {
+                        Some(pal) => (pal[idx as usize].r, pal[idx as usize].g, pal[idx as usize].b),
+                        None => (idx, idx, idx),
+                    };
+                    buf.push(r);
+                    buf.push(g);
+                    buf.push(b);
+                    buf.push(a);
+                }
+                Some(buf)
+            },
+            _ => None,
+        };
+
+        let upload_ptr = match &rgba_buf {
+            Some(buf) => buf.as_ptr() as *const _,
+            None => pixels.as_ptr() as *const _,
+        };
 
         // Reuse the existing texture object, so re-uploading an image doesn't churn texture ids.
         let texture = match self.textures.get(&key) {
@@ -183,7 +223,7 @@ impl ImageTextureCache {
                 0,
                 gl_format(format),
                 gl::UNSIGNED_BYTE,
-                pixels.as_ptr() as *const _,
+                upload_ptr,
             );
 
             // Images are sampled with linear filtering, without any mipmaps.

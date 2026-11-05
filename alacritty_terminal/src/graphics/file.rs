@@ -136,6 +136,11 @@ impl SharedMemorySource {
 
         let end = payload.iter().position(|byte| *byte == 0).unwrap_or(payload.len());
         let name = &payload[..end];
+        if name.is_empty() {
+            return Err(GraphicsError::FileUnreadable);
+        }
+
+        #[cfg(windows)]
         if name.len() < 2 || name[0] != b'/' || name[1..].contains(&b'/') {
             log::debug!(
                 "Refusing to read graphics image from shared memory name {}",

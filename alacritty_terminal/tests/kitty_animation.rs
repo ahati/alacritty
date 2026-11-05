@@ -231,3 +231,39 @@ fn rejected_frames_are_answered() {
         ]
     );
 }
+
+#[test]
+fn chunked_frame_transmission_with_legal_continuation() {
+    let (mut term, recorder) = terminal();
+    let mut parser = Processor::new();
+
+    // Base image 2x1
+    let base = format!("\x1b_Ga=t,i=7,f=32,s=2,v=1;{}\x1b\\", payload(&[255, 0, 0, 255, 255, 0, 0, 255]));
+    feed(&mut term, &mut parser, base.as_bytes());
+    recorder.events.lock().unwrap().clear();
+
+    // 2x1 frame = 8 bytes. Split into two 4-byte chunks.
+    let full_pixels = [0u8, 255, 0, 255, 0, 0, 255, 255];
+    let b64 = BASE64.encode(full_pixels);
+    let chunk1 = &b64[..4];
+    let chunk2 = &b64[4..];
+
+    // First chunk carries a=f, i=7, s=2, v=1, m=1
+    let cmd1 = format!("\x1b_Ga=f,i=7,f=32,s=2,v=1,m=1;{chunk1}\x1b\\");
+    feed(&mut term, &mut parser, cmd1.as_bytes());
+    assert!(term.graphics().has_pending_transfer(), "frame transfer must be pending after chunk 1");
+    assert!(recorder.pty_writes().is_empty(), "intermediate chunk must not reply");
+
+    // Second chunk carries m=0
+    let cmd2 = format!("\x1b_Gm=0;{chunk2}\x1b\\");
+    feed(&mut term, &mut parser, cmd2.as_bytes());
+    assert!(!term.graphics().has_pending_transfer(), "transfer must complete after final chunk");
+
+    let writes = recorder.pty_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0], "\x1b_Gi=7,r=2;OK\x1b\\");
+
+    // Frame was added (root frame + added frame = 2 frames)
+    let image = term.graphics().image(1).unwrap();
+    assert_eq!(image.frames().len(), 2);
+}
