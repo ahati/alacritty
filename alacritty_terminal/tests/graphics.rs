@@ -2282,7 +2282,7 @@ fn cascading_relative_placements_delete_transitively() {
     let (mut term, recorder) = terminal();
     let mut parser = Processor::new();
 
-    let pixel_b64 = BASE64.encode(&[255, 0, 0, 255]);
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
 
     // Transmit and display root placement A (image 50, placement 1)
     let a = format!("\x1b_Ga=T,f=32,s=1,v=1,i=50,p=1;{pixel_b64}\x1b\\");
@@ -2317,8 +2317,8 @@ fn query_does_not_abort_inflight_chunked_upload() {
     let (mut term, recorder) = terminal();
     let mut parser = Processor::new();
 
-    let half1 = BASE64.encode(&[255, 0, 0, 255]);
-    let half2 = BASE64.encode(&[0, 255, 0, 255]);
+    let half1 = BASE64.encode([255, 0, 0, 255]);
+    let half2 = BASE64.encode([0, 255, 0, 255]);
 
     // Send chunk 1 with m=1
     let chunk1 = format!("\x1b_Ga=T,f=32,s=1,v=2,i=60,m=1;{half1}\x1b\\");
@@ -2370,7 +2370,7 @@ fn relative_placement_anchored_to_virtual_parent_succeeds() {
     let (mut term, recorder) = terminal();
     let mut parser = Processor::new();
 
-    let pixel_b64 = BASE64.encode(&[255, 0, 0, 255]);
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
 
     // Create virtual placement (image 80, placement 1, U=1)
     let virt = format!("\x1b_Ga=T,f=32,s=1,v=1,i=80,p=1,U=1;{pixel_b64}\x1b\\");
@@ -2413,7 +2413,7 @@ fn frame_composition_default_rectangle_uses_full_dimensions() {
     let mut parser = Processor::new();
 
     // Transmit base 2x2 image (id 1)
-    let four_pixels = BASE64.encode(&[255u8; 16]);
+    let four_pixels = BASE64.encode([255u8; 16]);
     let cmd = format!("\x1b_Ga=T,f=32,s=2,v=2,i=1,q=2;{four_pixels}\x1b\\");
     feed(&mut term, &mut parser, cmd.as_bytes());
 
@@ -2479,7 +2479,7 @@ fn feature_query_with_payload_and_quiet_semantics() {
 fn relative_child_pruned_when_parent_scrolls_out() {
     let (mut term, _recorder) = terminal();
     let mut parser = Processor::new();
-    let pixel_b64 = BASE64.encode(&[255, 0, 0, 255]);
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
 
     // Create parent placement at line 0
     feed(&mut term, &mut parser, b"\x1b[1;1H");
@@ -2499,7 +2499,7 @@ fn relative_child_pruned_when_parent_scrolls_out() {
 
 #[test]
 fn chunk_abort_matrix_aborts_active_transfer() {
-    let pixel_b64 = BASE64.encode(&[255, 0, 0, 255]);
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
 
     // Test matrix of commands that must abort an in-flight transfer
     let abort_commands: &[(&str, &[u8])] = &[
@@ -2541,7 +2541,7 @@ fn unsupported_format_and_quiet_clamping() {
 
     // 2. q=3 must be clamped to 2 (quiet mode 2 suppresses OK)
     recorder.events.lock().unwrap().clear();
-    let pixel_b64 = BASE64.encode(&[255, 0, 0, 255]);
+    let pixel_b64 = BASE64.encode([255, 0, 0, 255]);
     let cmd = format!("\x1b_Ga=T,f=32,s=1,v=1,i=78,q=3;{pixel_b64}\x1b\\");
     feed(&mut term, &mut parser, cmd.as_bytes());
     assert!(recorder.pty_writes().is_empty(), "q=3 clamped to 2 must suppress OK response");
@@ -2605,7 +2605,7 @@ fn feature_query_frame_echoes_rgb_and_png_but_omits_indexed() {
 fn relative_child_persists_across_parent_top_clip_scroll() {
     let (mut term, _recorder) = terminal();
     let mut parser = Processor::new();
-    let pixel_b64 = BASE64.encode(&vec![255u8; 100 * 100 * 4]);
+    let pixel_b64 = BASE64.encode(vec![255u8; 100 * 100 * 4]);
 
     // Set DECSTBM margin lines 2 to 8 (0-indexed lines 1 to 7)
     feed(&mut term, &mut parser, b"\x1b[2;8r");
@@ -2645,7 +2645,7 @@ fn relative_child_persists_across_parent_top_clip_scroll() {
 fn relative_child_follows_moving_parent_within_scroll_margins() {
     let (mut term, _recorder) = terminal();
     let mut parser = Processor::new();
-    let pixel_b64 = BASE64.encode(&vec![255u8; 100 * 100 * 4]);
+    let pixel_b64 = BASE64.encode(vec![255u8; 100 * 100 * 4]);
 
     // Set DECSTBM margin lines 2 to 8 (0-indexed lines 1 to 7)
     feed(&mut term, &mut parser, b"\x1b[2;8r");
@@ -2676,7 +2676,7 @@ fn relative_child_follows_moving_parent_within_scroll_margins() {
 fn relative_child_with_q0_follows_named_parent_placement() {
     let (mut term, _recorder) = terminal();
     let mut parser = Processor::new();
-    let pixel_b64 = BASE64.encode(&vec![255u8; 100 * 100 * 4]);
+    let pixel_b64 = BASE64.encode(vec![255u8; 100 * 100 * 4]);
 
     // Parent image 60 placed with p=1 at line 3
     feed(&mut term, &mut parser, b"\x1b[4;1H");

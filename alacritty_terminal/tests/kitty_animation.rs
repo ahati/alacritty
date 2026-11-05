@@ -244,7 +244,7 @@ fn chunked_frame_transmission_with_legal_continuation() {
 
     // 2x1 frame = 8 bytes. Split into two 4-byte chunks.
     let full_pixels = [0u8, 255, 0, 255, 0, 0, 255, 255];
-    let b64 = BASE64.encode(&full_pixels);
+    let b64 = BASE64.encode(full_pixels);
     let chunk1 = &b64[..4];
     let chunk2 = &b64[4..];
 
