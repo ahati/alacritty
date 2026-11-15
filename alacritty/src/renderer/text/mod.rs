@@ -173,17 +173,19 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
         let text = run.text();
         let shaped = glyph_cache.shape_run(&text, font_key, self);
 
-        // Map every shaped glyph to the column of its cluster. Ligatures cover
-        // the columns of all their characters, while the additional glyphs of
-        // expanded clusters render inside the cluster's first cell.
+        // Map every shaped glyph to the column of its group. A ligature covers
+        // the columns of all its characters; the glyphs of a substituted group
+        // keep their shaped pen offset so they are not all painted in the
+        // group's first cell. Groups are anchored to their first cell, so text
+        // after a ligature keeps its grid position.
         let start_column = run.span.0.0;
         let mut columns: Vec<Vec<Glyph>> = vec![Vec::new(); run.num_columns()];
 
         let mut char_index = 0usize;
         let mut chars = text.char_indices().peekable();
-        for glyph in shaped {
+        for shaped_glyph in shaped {
             while let Some((offset, _)) = chars.peek() {
-                if *offset < glyph.cluster {
+                if *offset < shaped_glyph.cluster {
                     chars.next();
                     char_index += 1;
                 } else {
@@ -195,7 +197,13 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
             if column.0 < start_column || column.0 > run.span.1.0 {
                 continue;
             }
-            columns[column.0 - start_column].push(glyph.glyph);
+
+            let mut glyph = shaped_glyph.glyph;
+            glyph.left = (i32::from(glyph.left) + shaped_glyph.x_offset)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            glyph.top = (i32::from(glyph.top) + shaped_glyph.y_offset)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            columns[column.0 - start_column].push(glyph);
         }
 
         // Spaces cover the cells consumed by ligatures, so that their
@@ -216,7 +224,8 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
             let glyph = glyphs.next().unwrap_or(space);
             self.add_render_item(&cell, &glyph, size_info);
 
-            // Additional glyphs of expanded clusters render in the same cell.
+            // Additional glyphs of expanded clusters carry a pen offset in
+            // their left bearing, which places them across the cluster.
             for glyph in glyphs {
                 self.add_render_item(&cell, &glyph, size_info);
             }

@@ -57,8 +57,39 @@ pub enum ShapedGlyphSpec {
 pub struct ShapedGlyph {
     pub glyph: Glyph,
 
-    /// UTF-8 byte offset of the cluster this glyph belongs to.
+    /// UTF-8 byte offset of the cluster this glyph is anchored to.
+    ///
+    /// This is the glyph's own cluster, except for glyphs of an expanded
+    /// cluster, which share the cluster where that cluster started.
     pub cluster: usize,
+
+    /// Offset of this glyph from the start of its anchored cell, in pixels.
+    ///
+    /// A substitution can expand a ligature into several glyphs, where the
+    /// earlier glyphs only carry advances to position the following ones.
+    /// Monaspace's `...`, for example, is two empty advance-width glyphs
+    /// followed by the glyph that draws the dots. Without these offsets all
+    /// glyphs of the cluster would be painted in its first cell.
+    pub x_offset: i32,
+    pub y_offset: i32,
+}
+
+/// A glyph produced by shaping, before it is rasterized.
+#[derive(Copy, Clone, Debug)]
+struct ShapedGlyphInfo {
+    /// Glyph to rasterize.
+    spec: ShapedGlyphSpec,
+
+    /// UTF-8 byte offset of the cluster this glyph belongs to.
+    cluster: usize,
+
+    /// Offset from the pen position, in font units.
+    x_offset: i32,
+    y_offset: i32,
+
+    /// Advance after drawing this glyph, in font units.
+    x_advance: i32,
+    y_advance: i32,
 }
 
 /// The maximum number of shaped runs kept around.
@@ -115,7 +146,7 @@ pub struct GlyphCache {
     shaped_fonts: HashMap<FontKey, Option<harfrust::Font>>,
 
     /// Cache of shaped runs, keyed by font and text.
-    shaped_runs: HashMap<(FontKey, String), Vec<(ShapedGlyphSpec, usize)>>,
+    shaped_runs: HashMap<(FontKey, String), Vec<ShapedGlyphInfo>>,
 
     /// Cache of glyphs rasterized by their index, keyed by font, size and
     /// glyph index.
@@ -378,19 +409,32 @@ impl GlyphCache {
 
     /// Shape `text` in `font_key` and load all of its glyphs.
     ///
-    /// The returned glyphs are ordered like the characters of the shaped text,
-    /// with their cluster identifying the position of the character they were
-    /// derived from.
+    /// The returned glyphs are ordered like the characters of the shaped text.
+    /// Their cluster is the grid cell the glyph is anchored to; glyphs of an
+    /// expanded cluster share the cluster where that cluster started.
     pub fn shape_run<L: LoadGlyph + ?Sized>(
         &mut self,
         text: &str,
         font_key: FontKey,
         loader: &mut L,
     ) -> Vec<ShapedGlyph> {
-        self.shape_text(text, font_key)
+        let shaped = self.shape_text(text, font_key);
+
+        // Shaping works in font units; convert them to the pixels the glyphs
+        // are rasterized at. Without a loaded font every advance is zero, so
+        // the fallback scale does not matter.
+        let scale = self
+            .shaped_fonts
+            .get(&font_key)
+            .and_then(Option::as_ref)
+            .map_or(1., |font| self.font_size.as_px() / f32::from(font.units_per_em()));
+        let placements = Self::glyph_placements(&shaped, scale);
+
+        shaped
             .into_iter()
-            .map(|(spec, cluster)| {
-                let glyph = match spec {
+            .zip(placements)
+            .map(|(shaped, (cluster, x_offset, y_offset))| {
+                let glyph = match shaped.spec {
                     ShapedGlyphSpec::GlyphIndex(index) => self.get_shaped(index, font_key, loader),
                     ShapedGlyphSpec::Char(c) => {
                         let glyph_key = GlyphKey { font_key, size: self.font_size, character: c };
@@ -398,9 +442,51 @@ impl GlyphCache {
                     },
                 };
 
-                ShapedGlyph { cluster, glyph }
+                ShapedGlyph { glyph, cluster, x_offset, y_offset }
             })
             .collect()
+    }
+
+    /// Placement of shaped glyphs relative to the grid.
+    ///
+    /// The shaped pen is tracked independently from the grid cell a glyph is
+    /// drawn in. When shaping moves into a new cluster, that cluster's cell
+    /// becomes the anchor and the pen at that point is the cell origin.
+    /// Glyphs that keep the same cluster (like Monaspace's spacer glyphs)
+    /// share the anchor and keep accumulating the pen, which places the
+    /// visible glyph of the ligature across the cells the cluster covers.
+    ///
+    /// A glyph whose cluster was already passed is not re-anchored. This is
+    /// the same heuristic Ghostty uses for glyphs that mark a ligature whose
+    /// first codepoint was consumed by the substitution.
+    fn glyph_placements(shaped: &[ShapedGlyphInfo], scale: f32) -> Vec<(usize, i32, i32)> {
+        let mut placements = Vec::with_capacity(shaped.len());
+        let mut pen_x = 0i64;
+        let mut pen_y = 0i64;
+        let mut max_cluster = 0usize;
+        let mut anchor = shaped.first().map_or(0, |glyph| glyph.cluster);
+        let mut anchor_pen = 0i64;
+
+        for glyph in shaped {
+            if glyph.cluster > max_cluster {
+                anchor = glyph.cluster;
+                anchor_pen = pen_x;
+            }
+
+            let x = pen_x - anchor_pen + i64::from(glyph.x_offset);
+            let y = pen_y + i64::from(glyph.y_offset);
+            placements.push((
+                anchor,
+                (x as f32 * scale).round() as i32,
+                (y as f32 * scale).round() as i32,
+            ));
+
+            pen_x += i64::from(glyph.x_advance);
+            pen_y += i64::from(glyph.y_advance);
+            max_cluster = max_cluster.max(glyph.cluster);
+        }
+
+        placements
     }
 
     /// Get a glyph rasterized by its index within `font_key`.
@@ -431,7 +517,7 @@ impl GlyphCache {
     }
 
     /// Shape `text`, using a cache for runs shaped before.
-    fn shape_text(&mut self, text: &str, font_key: FontKey) -> Vec<(ShapedGlyphSpec, usize)> {
+    fn shape_text(&mut self, text: &str, font_key: FontKey) -> Vec<ShapedGlyphInfo> {
         // Without ligatures there is no need for shaping at all.
         if !self.ligatures {
             return Self::shape_char_by_char(text);
@@ -455,11 +541,7 @@ impl GlyphCache {
     }
 
     /// Shape `text` with harfrust.
-    fn shape_with_harfrust(
-        &mut self,
-        text: &str,
-        font_key: FontKey,
-    ) -> Vec<(ShapedGlyphSpec, usize)> {
+    fn shape_with_harfrust(&mut self, text: &str, font_key: FontKey) -> Vec<ShapedGlyphInfo> {
         // Load the font for shaping, if possible.
         if let Entry::Vacant(entry) = self.shaped_fonts.entry(font_key) {
             let font = Self::load_shaped_font(&mut self.rasterizer, font_key);
@@ -492,13 +574,15 @@ impl GlyphCache {
             return Self::shape_char_by_char(text);
         }
 
-        // The infos are collected so the closure below can use `self` while
-        // iterating over the shaped buffer.
+        // The infos and positions are collected so the closure below can use
+        // `self` while iterating over the shaped buffer.
         let infos = buffer.glyph_infos().to_vec();
+        let positions = buffer.glyph_positions().to_vec();
         infos
             .iter()
+            .zip(&positions)
             .enumerate()
-            .map(|(index, info)| {
+            .map(|(index, (info, position))| {
                 let cluster = info.cluster as usize;
 
                 // A cluster extends up to the next glyph's cluster; the last
@@ -523,7 +607,14 @@ impl GlyphCache {
                     ShapedGlyphSpec::GlyphIndex(info.glyph_id)
                 };
 
-                (spec, cluster)
+                ShapedGlyphInfo {
+                    spec,
+                    cluster,
+                    x_offset: position.x_offset,
+                    y_offset: position.y_offset,
+                    x_advance: position.x_advance,
+                    y_advance: position.y_advance,
+                }
             })
             .collect()
     }
@@ -556,8 +647,17 @@ impl GlyphCache {
     }
 
     /// "Shape" `text` by mapping every character to its own glyph.
-    fn shape_char_by_char(text: &str) -> Vec<(ShapedGlyphSpec, usize)> {
-        text.char_indices().map(|(offset, c)| (ShapedGlyphSpec::Char(c), offset)).collect()
+    fn shape_char_by_char(text: &str) -> Vec<ShapedGlyphInfo> {
+        text.char_indices()
+            .map(|(cluster, c)| ShapedGlyphInfo {
+                spec: ShapedGlyphSpec::Char(c),
+                cluster,
+                x_offset: 0,
+                y_offset: 0,
+                x_advance: 0,
+                y_advance: 0,
+            })
+            .collect()
     }
 
     /// The OpenType features used during shaping.
@@ -574,7 +674,7 @@ impl GlyphCache {
 mod tests {
     use crossfont::{Rasterize, Rasterizer};
 
-    use super::{Glyph, GlyphCache, LoadGlyph, RasterizedGlyph, ShapedGlyphSpec};
+    use super::{Glyph, GlyphCache, LoadGlyph, RasterizedGlyph, ShapedGlyphInfo, ShapedGlyphSpec};
     use crate::config::font::Font;
 
     struct TestLoader;
@@ -661,8 +761,8 @@ mod tests {
         // Every box drawing glyph is routed through the built-in font, whether
         // the run was shaped (glyph indices) or mapped char-by-char.
         assert_eq!(shaped.len(), 3);
-        assert!(shaped.iter().all(|(spec, _)| matches!(
-            spec,
+        assert!(shaped.iter().all(|glyph| matches!(
+            glyph.spec,
             ShapedGlyphSpec::Char('\u{2500}' | '\u{2502}' | '\u{2571}')
         )));
 
@@ -672,8 +772,8 @@ mod tests {
         // character resolves through the built-in font.
         if cfg!(embed_fonts) && !cfg!(any(target_os = "macos", target_os = "windows")) {
             let shaped = glyph_cache.shape_text("\u{2502}x", font_key);
-            assert!(matches!(shaped[0], (ShapedGlyphSpec::Char('\u{2502}'), _)));
-            assert!(matches!(shaped[1], (ShapedGlyphSpec::GlyphIndex(_), _)));
+            assert!(matches!(shaped[0].spec, ShapedGlyphSpec::Char('\u{2502}')));
+            assert!(matches!(shaped[1].spec, ShapedGlyphSpec::GlyphIndex(_)));
         }
     }
 
@@ -697,16 +797,78 @@ mod tests {
         for text in ["->", "->>", "=>", "fi"] {
             let shaped = glyph_cache.shape_text(text, font_key);
             assert!(
-                shaped.iter().all(|(spec, _)| matches!(spec, ShapedGlyphSpec::GlyphIndex(_))),
+                shaped.iter().all(|glyph| matches!(glyph.spec, ShapedGlyphSpec::GlyphIndex(_))),
                 "{text:?} took a non-font rendering path: {shaped:?}"
             );
 
             // If the font ligated the run into a single glyph, the ligature
             // keeps its font glyph and its cluster still covers the sequence.
             if shaped.len() == 1 {
-                assert_eq!(shaped[0].1, 0, "{text:?} ligated with a shifted cluster");
+                assert_eq!(shaped[0].cluster, 0, "{text:?} ligated with a shifted cluster");
             }
         }
+    }
+
+    // Regression test: fonts can implement a ligature by substituting a
+    // cluster with advance-carrying empty glyphs followed by the visible
+    // glyph. Monaspace's `...` is exactly that: two `emptyAdvanceWidth`
+    // glyphs and then `period_period_period`, all with cluster 0. Every glyph
+    // of the cluster must keep its shaped pen position, otherwise the dots
+    // are painted ~2 cells to the left of where they belong.
+    #[test]
+    fn expanded_cluster_keeps_shaped_pen_position() {
+        let glyph = |cluster, x_advance, y_offset| ShapedGlyphInfo {
+            spec: ShapedGlyphSpec::GlyphIndex(0),
+            cluster,
+            x_offset: 0,
+            y_offset,
+            x_advance,
+            y_advance: 0,
+        };
+
+        let shaped = [glyph(0, 1000, 0), glyph(0, 1000, 0), glyph(0, 1000, 0), glyph(3, 1000, 0)];
+
+        // Scale 1/1000 puts one font unit at one thousandth of a pixel, so
+        // one cell of 1000 units is 1 pixel. The glyphs of cluster 0 share an
+        // anchor and accumulate the pen; cluster 3 starts a new anchor.
+        let placements = GlyphCache::glyph_placements(&shaped, 0.001);
+        assert_eq!(placements, vec![(0, 0, 0), (0, 1, 0), (0, 2, 0), (3, 0, 0)]);
+
+        // The shaped x and y offsets are carried into the pixel placement too.
+        let mut shaped = [glyph(0, 1000, 100)];
+        shaped[0].x_offset = 50;
+        let placements = GlyphCache::glyph_placements(&shaped, 0.01);
+        assert_eq!(placements, vec![(0, 1, 1)]);
+
+        // A cluster from the past is not re-anchored (the ligature-mark case).
+        let mut out_of_order = [glyph(0, 1000, 0), glyph(2, 1000, 0), glyph(1, 1000, 0)];
+        out_of_order[0].x_advance = 1000;
+        let placements = GlyphCache::glyph_placements(&out_of_order, 0.001);
+        assert_eq!(placements, vec![(0, 0, 0), (2, 0, 0), (2, 1, 0)]);
+    }
+
+    // JetBrains Mono and Fira Code pad ligatures with spacer glyphs in their
+    // own clusters (`SPC, SPC, ligature` in clusters 0, 1, 2), while Cascadia
+    // Code puts them after the ligature. Every glyph is anchored to the cell
+    // of its own cluster; no intra-cluster advance is involved.
+    #[test]
+    fn embedded_spacer_ligatures_use_their_own_cells() {
+        if !cfg!(embed_fonts) || cfg!(any(target_os = "macos", windows)) {
+            return;
+        }
+
+        let font = Font::default();
+        let mut rasterizer = Rasterizer::new().unwrap();
+        crate::embedded_font::register(&mut rasterizer);
+        let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
+        let font_key = glyph_cache.font_key;
+
+        let mut loader = TestLoader;
+        let shaped = glyph_cache.shape_run("...", font_key, &mut loader);
+
+        assert_eq!(shaped.len(), 3);
+        assert_eq!(shaped.iter().map(|glyph| glyph.cluster).collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(shaped.iter().all(|glyph| glyph.x_offset == 0 && glyph.y_offset == 0));
     }
 
     /// The cluster classification: single built-in characters resolve to the
