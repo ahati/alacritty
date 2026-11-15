@@ -39,6 +39,13 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 ### Fixed
 
+- Ligature glyphs from substitutions with spacer glyphs rendering to the left
+  of their cells. Fonts encode `...` as empty advance-width glyphs plus a
+  visible glyph with a negative bearing, either inside one cluster (Monaspace)
+  or spread across clusters (Fira Code, JetBrains Mono, Cascadia Code). Shaped
+  advances, horizontal offsets and vertical offsets are now tracked across the
+  shaped run and anchored to the grid, so the dots, `!=`, `!!`, `;;`, `||` and
+  `///` stay in their cells instead of shifting left
 - Box drawing characters rendering with seams at the cell boundaries while
   `font.ligatures` is enabled. Shaped runs now keep drawing characters that the
   built-in font covers (box drawing, block elements, powerline) through that
