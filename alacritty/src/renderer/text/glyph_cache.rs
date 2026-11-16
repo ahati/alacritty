@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::str::FromStr;
 
 use ahash::RandomState;
 use crossfont::{
@@ -174,7 +175,7 @@ impl GlyphCache {
             metrics,
             builtin_box_drawing: font.builtin_box_drawing,
             ligatures: font.ligatures,
-            shape_features: Self::shape_features(font.ligatures),
+            shape_features: Self::shape_features(font.ligatures, &font.features),
             shaped_fonts: Default::default(),
             shaped_runs: Default::default(),
             shaped_cache: Default::default(),
@@ -386,7 +387,7 @@ impl GlyphCache {
         self.metrics = metrics;
         self.builtin_box_drawing = font.builtin_box_drawing;
         self.ligatures = font.ligatures;
-        self.shape_features = Self::shape_features(font.ligatures);
+        self.shape_features = Self::shape_features(font.ligatures, &font.features);
 
         // Shaped runs are only valid for a single font size.
         self.shaped_runs.clear();
@@ -518,8 +519,9 @@ impl GlyphCache {
 
     /// Shape `text`, using a cache for runs shaped before.
     fn shape_text(&mut self, text: &str, font_key: FontKey) -> Vec<ShapedGlyphInfo> {
-        // Without ligatures there is no need for shaping at all.
-        if !self.ligatures {
+        // Without ligatures and without configured features there is no need
+        // for shaping at all.
+        if !self.ligatures && self.shape_features.is_empty() {
             return Self::shape_char_by_char(text);
         }
 
@@ -660,19 +662,38 @@ impl GlyphCache {
             .collect()
     }
 
-    /// The OpenType features used during shaping.
-    fn shape_features(ligatures: bool) -> Vec<Feature> {
+    /// Features used during shaping.
+    ///
+    /// `liga` and `calt` are enabled by default, since they are where most
+    /// programming fonts keep their ligatures. Fonts that split their
+    /// ligatures into OpenType features of their own, like Monaspace's
+    /// `ss01`-`ss10`, are enabled through the `font.features` config.
+    ///
+    /// User features are appended last: HarfBuzz lets later settings win, so
+    /// `-calt` still overrides the default.
+    fn shape_features(ligatures: bool, features: &[String]) -> Vec<Feature> {
+        let mut shaped = Vec::with_capacity(features.len() + 2);
+
         if ligatures {
-            vec![Feature::new(Tag::new(b"liga"), 1, ..), Feature::new(Tag::new(b"calt"), 1, ..)]
-        } else {
-            Vec::new()
+            shaped.push(Feature::new(Tag::new(b"liga"), 1, ..));
+            shaped.push(Feature::new(Tag::new(b"calt"), 1, ..));
         }
+
+        for feature in features {
+            match Feature::from_str(feature) {
+                Ok(feature) => shaped.push(feature),
+                Err(err) => warn!("Invalid font feature {feature:?}: {err}"),
+            }
+        }
+
+        shaped
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crossfont::{Rasterize, Rasterizer};
+    use harfrust::{Feature, Tag};
 
     use super::{Glyph, GlyphCache, LoadGlyph, RasterizedGlyph, ShapedGlyphInfo, ShapedGlyphSpec};
     use crate::config::font::Font;
@@ -712,6 +733,75 @@ mod tests {
         assert_eq!(shaped.len(), 2);
         assert_eq!(shaped[0].cluster, 0);
         assert_eq!(shaped[1].cluster, 1);
+    }
+
+    /// Features from `font.features` are applied after the defaults implied
+    /// by `ligatures`, so they can both extend them and override them.
+    #[test]
+    fn configured_features_extend_defaults() {
+        let tags = |features: &[Feature]| {
+            features.iter().map(|feature| (feature.tag, feature.value)).collect::<Vec<_>>()
+        };
+
+        let defaults = GlyphCache::shape_features(true, &[]);
+        assert_eq!(tags(&defaults), [(Tag::new(b"liga"), 1), (Tag::new(b"calt"), 1)]);
+
+        // `ss001` is not valid HarfBuzz feature syntax and is dropped.
+        let features = ["ss03".to_owned(), "-calt".to_owned(), "ss001".to_owned()];
+        let shaped = GlyphCache::shape_features(true, &features);
+
+        // The valid features land after the defaults, where HarfBuzz's
+        // later-wins rule lets `-calt` override the default.
+        assert_eq!(tags(&shaped), [
+            (Tag::new(b"liga"), 1),
+            (Tag::new(b"calt"), 1),
+            (Tag::new(b"ss03"), 1),
+            (Tag::new(b"calt"), 0),
+        ]);
+
+        // With ligatures disabled only the configured features remain.
+        assert_eq!(tags(&GlyphCache::shape_features(false, &features)), [
+            (Tag::new(b"ss03"), 1),
+            (Tag::new(b"calt"), 0)
+        ]);
+
+        // Without ligatures and features there is nothing left to shape with.
+        assert!(GlyphCache::shape_features(false, &[]).is_empty());
+    }
+
+    /// Configured features must reach the shaper: the embedded font
+    /// substitutes glyphs of `!=` through `calt`, which `-calt` turns off.
+    #[test]
+    fn configured_features_reach_shaper() {
+        if !cfg!(embed_fonts) || cfg!(any(target_os = "macos", windows)) {
+            return;
+        }
+
+        let shape = |features: Vec<String>| {
+            let mut font = Font::default();
+            font.features = features;
+            let mut rasterizer = Rasterizer::new().unwrap();
+            crate::embedded_font::register(&mut rasterizer);
+            let mut glyph_cache = GlyphCache::new(rasterizer, &font).unwrap();
+            let font_key = glyph_cache.font_key;
+            glyph_cache.shape_text("!=", font_key)
+        };
+
+        let glyph_ids = |shaped: &[ShapedGlyphInfo]| {
+            shaped
+                .iter()
+                .map(|glyph| match glyph.spec {
+                    ShapedGlyphSpec::GlyphIndex(id) => Some(id),
+                    ShapedGlyphSpec::Char(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let default = shape(Vec::new());
+        let disabled = shape(vec!["-calt".to_owned()]);
+
+        assert!(matches!(default[0].spec, ShapedGlyphSpec::GlyphIndex(_)));
+        assert_ne!(glyph_ids(&default), glyph_ids(&disabled));
     }
 
     /// The default font resolves to the embedded font, which is shaped from

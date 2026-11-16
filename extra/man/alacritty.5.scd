@@ -288,9 +288,29 @@ macOS:     { family = _"Menlo"_,     style = _"Regular"_ }
 	identically-styled cells, so ligatures like `->` or `fi` render as a single
 	glyph spanning multiple cells. Anything applying a different style to one of
 	its cells, like the cursor or a selection, breaks up both the run and the
-	ligature. Disabling this also skips text shaping entirely.
+	ligature. Disabling this also skips text shaping entirely, unless
+	*features* is set.
 
 	Default: _true_
+
+*features* = [_"<string>"_, _"<string>"_, ...]
+	OpenType features enabled during shaping, in HarfBuzz feature syntax:
+	_"ss01"_ and _"+ss01"_ enable a feature,
+	_"-calt"_ and _"calt=0"_ disable it, _"ss01=2"_ selects an alternate and
+	_"kern[3:5]"_ limits a feature to a cluster range. Invalid entries are
+	ignored with a warning.
+
+	Features are applied after the _liga_ and _calt_ that *ligatures* enables,
+	so they can extend the defaults or override them; _"-calt"_ disables part
+	of the default ligature rendering. Fonts that split their ligatures into
+	stylistic sets, like Monaspace, only render them when those sets are
+	enabled; for Monaspace that is
+	_["ss01", "ss02", "ss03", "ss04", "ss05", "ss07", "ss08", "ss09", "ss10"]_.
+	Fonts using stylistic sets for unrelated character variants change their
+	rendering when those sets are enabled, so only enable the sets the font
+	documents.
+
+	Default: _[]_
 
 *builtin_box_drawing* = _true_ | _false_
 

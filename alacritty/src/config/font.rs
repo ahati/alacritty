@@ -28,6 +28,12 @@ pub struct Font {
     /// Render font ligatures.
     pub ligatures: bool,
 
+    /// OpenType features used during shaping, in HarfBuzz feature syntax.
+    ///
+    /// These are applied after the defaults implied by `ligatures`, so they
+    /// can also disable one of them, e.g. with `-calt`.
+    pub features: Vec<String>,
+
     /// Normal font face.
     normal: FontDescription,
 
@@ -86,6 +92,7 @@ impl Default for Font {
             glyph_offset: Default::default(),
             use_thin_strokes: Default::default(),
             ligatures: true,
+            features: Default::default(),
             bold_italic: Default::default(),
             italic: Default::default(),
             offset: Default::default(),

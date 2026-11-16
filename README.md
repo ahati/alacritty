@@ -28,7 +28,10 @@ This fork extends upstream Alacritty with the following features:
   harfrust (a pure-Rust HarfBuzz port), so ligatures like `->`, `=>` or
   `fi` render as a single glyph spanning multiple cells, without
   disturbing cursor, selection or damage tracking. Toggle with
-  [`font.ligatures`](extra/man/alacritty.5.scd) (on by default).
+  [`font.ligatures`](extra/man/alacritty.5.scd) (on by default), and
+  enable font-specific feature sets such as Monaspace's `ss01`–`ss10`
+  code ligatures with
+  [`font.features`](extra/man/alacritty.5.scd).
 - **Embedded default font** — JetBrains Mono Nerd Font Mono is compiled
   into the binary, so terminals render well out of the box even on
   systems with no usable fonts installed.
