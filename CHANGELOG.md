@@ -26,6 +26,10 @@ Notable changes to the `alacritty_terminal` crate are documented in its
   `terminal.graphics`
 - Font ligature support, shaping style-homogeneous runs of cells with harfrust and
   rendering the resulting glyphs across multiple cells, configurable through `font.ligatures`
+- Configurable OpenType features through `font.features`, in HarfBuzz syntax
+  (`ss01`, `-calt`, `ss01=2`, `kern[3:5]`). They are applied after the `liga` and
+  `calt` enabled by `font.ligatures`, so they extend the defaults and can override
+  them, and they also make Monaspace's code ligatures reachable
 
 ### Changed
 
@@ -39,6 +43,10 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 ### Fixed
 
+- Monaspace code ligatures never rendering for `->`, `===`, `=>`, `<=`, `>=`,
+  `!=` and the rest, because Monaspace keeps them in its `ss01`-`ss10`
+  stylistic sets rather than `calt`. `font.features` exposes those sets; see
+  the Monaspace entry in `alacritty(5)` for the sets to enable
 - Ligature glyphs from substitutions with spacer glyphs rendering to the left
   of their cells. Fonts encode `...` as empty advance-width glyphs plus a
   visible glyph with a negative bearing, either inside one cluster (Monaspace)
