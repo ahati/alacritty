@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Web Assembly build support (without the PTY modules)
 - Kitty graphics protocol support. Decoded images are kept in the layout they were
   transmitted in, so an uncompressed transmission needs no per-pixel conversion, and
   decoding runs away from the terminal lock via `Term::take_graphics_jobs` and
