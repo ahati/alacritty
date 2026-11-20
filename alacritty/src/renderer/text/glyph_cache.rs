@@ -645,7 +645,34 @@ impl GlyphCache {
         let (path, face_index) = rasterizer.font_path(font_key).ok()?;
         let data = std::fs::read(path).ok()?;
 
-        harfrust::Font::new(data, face_index)
+        harfrust::Font::new(data, Self::shaping_face_index(face_index))
+    }
+
+    /// The face index to shape `font_key` with, derived from the index
+    /// FreeType rasterizes it at.
+    ///
+    /// Fontconfig encodes variable-font named-instance selection in the high
+    /// 16 bits of `FC_INDEX`, following the FreeType convention of
+    /// `(instance << 16) | face_index`. For example, fontconfig reports the
+    /// ExtraLight and Bold instances of MonoLisa Code 3.001 (a variable font
+    /// with no collections) as indexes `0x30000` and `0x80000`.
+    ///
+    /// FreeType decodes those bits when rasterizing, but harfrust stores its
+    /// font data through `read-fonts`, whose `FontRef::from_index` only
+    /// understands the low 16 bits (the TrueType collection index) and
+    /// rejects every other value. Passing the raw FC_INDEX through makes
+    /// `harfrust::Font::new` return `None`, which silently degrades all runs
+    /// in that style to char-by-char rendering: no ligatures and no feature
+    /// alternates (Ghostty shapes the same fonts fine, so this only shows up
+    /// as a fork-vs-Ghostty difference).
+    ///
+    /// Masking the instance bits off is always safe for shaping: the OpenType
+    /// layout tables (GSUB/GPOS) and cmap are identical across named
+    /// instances, and any advance-width variation only affects positions,
+    /// never substitutions. The low 16 bits (the collection index) are
+    /// preserved, so TrueType collections keep working.
+    fn shaping_face_index(face_index: u32) -> u32 {
+        face_index & 0xFFFF
     }
 
     /// "Shape" `text` by mapping every character to its own glyph.
@@ -983,5 +1010,94 @@ mod tests {
         // With the built-in font disabled, everything uses the font glyphs.
         glyph_cache.builtin_box_drawing = false;
         assert_eq!(glyph_cache.builtin_cluster_char("\u{2502}", 0, 3), None);
+    }
+
+    /// FC_INDEX values observed on this system for variable-font named
+    /// instances, and the collection indexes the shaper must see instead.
+    #[test]
+    fn shaping_face_index_strips_named_instance_bits() {
+        // MonoLisa Code 3.001 variable, ExtraLight / Bold (fontconfig FC_INDEX
+        // as reported by `fc-match --format="%{index}"` on this system).
+        assert_eq!(GlyphCache::shaping_face_index(0x30000), 0);
+        assert_eq!(GlyphCache::shaping_face_index(0x80000), 0);
+
+        // Static fonts keep their plain index.
+        assert_eq!(GlyphCache::shaping_face_index(0), 0);
+        assert_eq!(GlyphCache::shaping_face_index(1), 1);
+
+        // A named instance inside a TrueType collection keeps the collection
+        // index: the instance bits are dropped, the low bits survive.
+        assert_eq!(GlyphCache::shaping_face_index(0x2_0003), 3);
+
+        // Every low-16 value is preserved.
+        assert_eq!(GlyphCache::shaping_face_index(0xFFFF), 0xFFFF);
+    }
+
+    /// Regression test: shaping must survive variable-font named instances.
+    ///
+    /// Fontconfig reports named-instance matches with the instance encoded in
+    /// the high 16 bits of FC_INDEX (MonoLisa Code ExtraLight shapes with
+    /// FC_INDEX `0x30000`). `read-fonts`, which backs harfrust, only accepts
+    /// plain collection indexes, so the raw value made `harfrust::Font::new`
+    /// return `None` and every run in that style fell back to char-by-char
+    /// rendering — losing ligatures and feature alternates (like `dlig`
+    /// operator ligatures and `ss01` script italics) while the text itself
+    /// still looked correct, making the regression invisible except against
+    /// Ghostty. The fix masks the instance bits off in
+    /// `GlyphCache::shaping_face_index`.
+    ///
+    /// Compile-time gated (not just a runtime bail-out) because
+    /// `EMBEDDED_FONT_REGULAR` is only set by `build.rs` when fonts were
+    /// fetched.
+    #[cfg(all(embed_fonts, not(any(target_os = "macos", windows))))]
+    #[test]
+    fn named_instance_index_must_not_break_shaping() {
+        let data: &[u8] = include_bytes!(env!("EMBEDDED_FONT_REGULAR"));
+
+        // The raw FC_INDEX values of a named-instance match are rejected by
+        // read-fonts; this is the exact failure the masking avoids.
+        assert!(harfrust::Font::new(data, 0x30000).is_none());
+        assert!(harfrust::Font::new(data, 0x80000).is_none());
+
+        // With the instance bits masked off, the font loads and shapes.
+        let font = harfrust::Font::new(data, GlyphCache::shaping_face_index(0x30000))
+            .expect("masked FC_INDEX must load for shaping");
+        let shaper = harfrust::ShaperFont::new(&font);
+
+        let shape = |features: [harfrust::Feature; 2]| {
+            let mut buffer = harfrust::Buffer::default();
+            buffer.push_str("!=");
+            buffer.guess_segment_properties();
+            buffer.set_direction(harfrust::Direction::LeftToRight);
+            harfrust::shape(&shaper, &mut buffer, harfrust::ShapeOptions::new().features(&features))
+                .unwrap();
+            buffer
+                .glyph_infos()
+                .iter()
+                .map(|info| info.glyph_id)
+                .collect::<Vec<_>>()
+        };
+
+        // With the default features (liga + calt, as GlyphCache configures
+        // them), `!=` substitutes into the font's ligature glyph. JetBrains
+        // Mono pads ligatures with a leading spacer glyph (`SPC, lig`), so
+        // the run stays two glyphs — the spacer and the merged ligature,
+        // not the input characters' glyphs.
+        let defaults = shape([
+            Feature::new(Tag::new(b"liga"), 1, ..),
+            Feature::new(Tag::new(b"calt"), 1, ..),
+        ]);
+        assert_eq!(defaults.len(), 2);
+
+        // Disabling the ligature features must yield the two input glyphs
+        // instead. An unsubstituted run would look exactly like this, so
+        // the inequality proves the substitutions genuinely flowed through
+        // the shaper once the index was valid.
+        let disabled = shape([
+            Feature::new(Tag::new(b"liga"), 0, ..),
+            Feature::new(Tag::new(b"calt"), 0, ..),
+        ]);
+        assert_eq!(disabled.len(), 2);
+        assert_ne!(defaults, disabled);
     }
 }
