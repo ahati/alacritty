@@ -1760,10 +1760,6 @@ impl FrameTimer {
     }
 }
 
-/// Calculate the cell dimensions based on font metrics.
-///
-/// This will return a tuple of the cell width and height.
-#[inline]
 /// Pair each renderable image with its uploaded texture.
 ///
 /// Images whose texture is missing are skipped, which can only happen when the
@@ -1775,11 +1771,25 @@ fn image_quads(images: &[&image::RenderableImage], cache: &ImageTextureCache) ->
         .collect()
 }
 
+/// Width of a single terminal cell in pixels, derived from the font metrics
+/// and the horizontal `font.offset`.
+///
+/// The glyph cache lays shaped runs out against this width — instead of the
+/// font's natural advance — so it must always stay in sync with the value
+/// [`compute_cell_size`] returns for the same metrics and offset.
+#[inline]
+pub(crate) fn cell_width(metrics: &crossfont::Metrics, offset_x: i8) -> f32 {
+    (metrics.average_advance + f64::from(offset_x)).floor().max(1.) as f32
+}
+
+/// Calculate the cell dimensions based on font metrics.
+///
+/// This will return a tuple of the cell width and height.
+#[inline]
 fn compute_cell_size(config: &UiConfig, metrics: &crossfont::Metrics) -> (f32, f32) {
-    let offset_x = f64::from(config.font.offset.x);
     let offset_y = f64::from(config.font.offset.y);
     (
-        (metrics.average_advance + offset_x).floor().max(1.) as f32,
+        cell_width(metrics, config.font.offset.x),
         (metrics.line_height + offset_y).floor().max(1.) as f32,
     )
 }

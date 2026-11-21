@@ -429,7 +429,21 @@ impl GlyphCache {
             .get(&font_key)
             .and_then(Option::as_ref)
             .map_or(1., |font| self.font_size.as_px() / f32::from(font.units_per_em()));
-        let placements = Self::glyph_placements(&shaped, scale);
+
+        // Horizontal positions follow the cell grid, though: the cells a
+        // shaped run spans are `cell_width` apart, which `font.offset.x` can
+        // move away from the font's natural advance. Scaling the shaped pen
+        // by their ratio stretches and compresses clusters with the grid, so
+        // ligatures never overhang or fall short of the cells they cover.
+        // Without an offset the ratio is the natural advance divided by
+        // itself, leaving shaped runs untouched.
+        let cell_width = crate::display::cell_width(&self.metrics, self.font_offset.x);
+        let x_scale = if self.metrics.average_advance > 0. {
+            scale * cell_width / self.metrics.average_advance as f32
+        } else {
+            scale
+        };
+        let placements = Self::glyph_placements(&shaped, scale, x_scale);
 
         shaped
             .into_iter()
@@ -457,10 +471,21 @@ impl GlyphCache {
     /// share the anchor and keep accumulating the pen, which places the
     /// visible glyph of the ligature across the cells the cluster covers.
     ///
+    /// `scale` converts font units to the pixels the glyphs are rasterized at,
+    /// for the vertical axis. `x_scale` does the same for horizontal
+    /// positions, but relative to the cell grid: it is `scale` multiplied by
+    /// the ratio of the cell width to the font's natural advance, so a
+    /// cluster covering several cells spans exactly those cells even when
+    /// `font.offset.x` resizes them.
+    ///
     /// A glyph whose cluster was already passed is not re-anchored. This is
     /// the same heuristic Ghostty uses for glyphs that mark a ligature whose
     /// first codepoint was consumed by the substitution.
-    fn glyph_placements(shaped: &[ShapedGlyphInfo], scale: f32) -> Vec<(usize, i32, i32)> {
+    fn glyph_placements(
+        shaped: &[ShapedGlyphInfo],
+        scale: f32,
+        x_scale: f32,
+    ) -> Vec<(usize, i32, i32)> {
         let mut placements = Vec::with_capacity(shaped.len());
         let mut pen_x = 0i64;
         let mut pen_y = 0i64;
@@ -478,7 +503,7 @@ impl GlyphCache {
             let y = pen_y + i64::from(glyph.y_offset);
             placements.push((
                 anchor,
-                (x as f32 * scale).round() as i32,
+                (x as f32 * x_scale).round() as i32,
                 (y as f32 * scale).round() as i32,
             ));
 
@@ -948,20 +973,61 @@ mod tests {
         // Scale 1/1000 puts one font unit at one thousandth of a pixel, so
         // one cell of 1000 units is 1 pixel. The glyphs of cluster 0 share an
         // anchor and accumulate the pen; cluster 3 starts a new anchor.
-        let placements = GlyphCache::glyph_placements(&shaped, 0.001);
+        let placements = GlyphCache::glyph_placements(&shaped, 0.001, 0.001);
         assert_eq!(placements, vec![(0, 0, 0), (0, 1, 0), (0, 2, 0), (3, 0, 0)]);
 
         // The shaped x and y offsets are carried into the pixel placement too.
         let mut shaped = [glyph(0, 1000, 100)];
         shaped[0].x_offset = 50;
-        let placements = GlyphCache::glyph_placements(&shaped, 0.01);
+        let placements = GlyphCache::glyph_placements(&shaped, 0.01, 0.01);
         assert_eq!(placements, vec![(0, 1, 1)]);
 
         // A cluster from the past is not re-anchored (the ligature-mark case).
         let mut out_of_order = [glyph(0, 1000, 0), glyph(2, 1000, 0), glyph(1, 1000, 0)];
         out_of_order[0].x_advance = 1000;
-        let placements = GlyphCache::glyph_placements(&out_of_order, 0.001);
+        let placements = GlyphCache::glyph_placements(&out_of_order, 0.001, 0.001);
         assert_eq!(placements, vec![(0, 0, 0), (2, 0, 0), (2, 1, 0)]);
+    }
+
+    // Regression test: `font.offset.x` can move the cell width away from the
+    // font's natural advance — MonoLisa at the fork's reference size advances
+    // 13 px per cell while `offset.x = -1` shrinks cells to 12 px. Shaped
+    // clusters must stretch and compress with the grid: the pen is scaled by
+    // the ratio of cell width to natural advance, so the spacer of a ligature
+    // lands exactly on the next cell's origin instead of overhanging it.
+    #[test]
+    fn expanded_cluster_pen_follows_cell_width() {
+        let glyph = |cluster, x_advance, y_offset| ShapedGlyphInfo {
+            spec: ShapedGlyphSpec::GlyphIndex(0),
+            cluster,
+            x_offset: 0,
+            y_offset,
+            x_advance,
+            y_advance: 0,
+        };
+
+        // One cell is 1000 font units, and the natural scale puts a cell's
+        // advance at 13 px, like MonoLisa hinted at 15 pt.
+        let natural = 0.013;
+        let shaped = [glyph(0, 1000, 0), glyph(0, 1000, 0), glyph(0, 1000, 0)];
+
+        // Without an offset the cell width matches the natural advance, so
+        // shaped positions are unchanged no matter how many cells a cluster
+        // covers.
+        let x_scale = natural * 13. / 13.;
+        let placements = GlyphCache::glyph_placements(&shaped, natural, x_scale);
+        assert_eq!(placements, vec![(0, 0, 0), (0, 13, 0), (0, 26, 0)]);
+
+        // `offset.x = -1` shrinks the cells to 12 px: the same shaped run is
+        // compressed onto the grid instead of overhanging every cell by 1 px.
+        let x_scale = natural * 12. / 13.;
+        let placements = GlyphCache::glyph_placements(&shaped, natural, x_scale);
+        assert_eq!(placements, vec![(0, 0, 0), (0, 12, 0), (0, 24, 0)]);
+
+        // The vertical axis keeps its natural scale regardless of the grid.
+        let shaped = [glyph(0, 0, 100)];
+        let placements = GlyphCache::glyph_placements(&shaped, natural, x_scale);
+        assert_eq!(placements, vec![(0, 0, 1)]);
     }
 
     // JetBrains Mono and Fira Code pad ligatures with spacer glyphs in their
