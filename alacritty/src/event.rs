@@ -1970,7 +1970,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         };
                         self.ctx.write_to_pty(format(color.0).into_bytes());
                     },
-                    TerminalEvent::TextAreaSizeRequest(format) => {
+                    TerminalEvent::WindowSizeInfoRequest(format) => {
                         let text = format(self.ctx.size_info().into());
                         self.ctx.write_to_pty(text.into_bytes());
                     },

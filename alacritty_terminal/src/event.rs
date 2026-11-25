@@ -60,8 +60,12 @@ pub enum Event {
     /// Write some text to the PTY.
     PtyWrite(String),
 
-    /// Request to write the text area size.
-    TextAreaSizeRequest(Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>),
+    /// Request to report window size information.
+    ///
+    /// The attached function is a formatter which will correctly transform the terminal's
+    /// current window size into the expected escape sequence response, such as the size of
+    /// the text area or of a single cell.
+    WindowSizeInfoRequest(Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>),
 
     /// Cursor blinking state has changed.
     CursorBlinkingChange,
@@ -86,7 +90,7 @@ impl Debug for Event {
             Event::ClipboardLoad(ty, _) => write!(f, "ClipboardLoad({ty:?})"),
             Event::KittyClipboardRead(ty, _) => write!(f, "KittyClipboardRead({ty:?})"),
             Event::KittyClipboardStore(ty, _, _) => write!(f, "KittyClipboardStore({ty:?})"),
-            Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
+            Event::WindowSizeInfoRequest(_) => write!(f, "WindowSizeInfoRequest"),
             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
             Event::Title(title) => write!(f, "Title({title})"),

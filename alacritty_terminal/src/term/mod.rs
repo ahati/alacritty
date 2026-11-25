@@ -2666,10 +2666,17 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn text_area_size_pixels(&mut self) {
-        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+        self.event_proxy.send_event(Event::WindowSizeInfoRequest(Arc::new(move |window_size| {
             let height = window_size.num_lines * window_size.cell_height;
             let width = window_size.num_cols * window_size.cell_width;
             format!("\x1b[4;{height};{width}t")
+        })));
+    }
+
+    #[inline]
+    fn cell_size_pixels(&mut self) {
+        self.event_proxy.send_event(Event::WindowSizeInfoRequest(Arc::new(|window_size| {
+            format!("\x1b[6;{};{}t", window_size.cell_width, window_size.cell_height)
         })));
     }
 
@@ -2917,7 +2924,9 @@ pub mod test {
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
     use std::mem;
+    use std::rc::Rc;
 
     use crate::event::VoidListener;
     use crate::grid::{Grid, Scroll};
@@ -2926,6 +2935,73 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    /// Listener recording every event the terminal emits.
+    #[derive(Clone, Default)]
+    struct RecordingListener(Rc<RefCell<Vec<Event>>>);
+
+    impl EventListener for RecordingListener {
+        fn send_event(&self, event: Event) {
+            self.0.borrow_mut().push(event);
+        }
+    }
+
+    #[test]
+    fn window_size_queries_are_reported() {
+        let listener = RecordingListener::default();
+        let size = TermSize::new(12, 7);
+        let mut term = Term::new(Config::default(), &size, listener.clone());
+
+        Handler::cell_size_pixels(&mut term);
+        Handler::text_area_size_pixels(&mut term);
+        Handler::text_area_size_chars(&mut term);
+
+        let window_size =
+            crate::event::WindowSize { num_lines: 7, num_cols: 12, cell_width: 7, cell_height: 14 };
+
+        let events = listener.0.borrow();
+        assert_eq!(events.len(), 3);
+
+        // A cell size report carries the cell width before the cell height.
+        match &events[0] {
+            Event::WindowSizeInfoRequest(format) => {
+                assert_eq!(format(window_size), "\x1b[6;7;14t");
+            },
+            _ => panic!("expected WindowSizeInfoRequest, got {:?}", events[0]),
+        }
+
+        // A text area report carries the height before the width.
+        match &events[1] {
+            Event::WindowSizeInfoRequest(format) => {
+                assert_eq!(format(window_size), "\x1b[4;98;84t");
+            },
+            _ => panic!("expected WindowSizeInfoRequest, got {:?}", events[1]),
+        }
+
+        // A character report goes out as a plain PTY write, rows first.
+        match &events[2] {
+            Event::PtyWrite(text) => assert_eq!(text, "\x1b[8;7;12t"),
+            _ => panic!("expected PtyWrite, got {:?}", events[2]),
+        }
+    }
+
+    #[test]
+    fn terminal_identity_is_reported_for_kitten() {
+        let listener = RecordingListener::default();
+        let size = TermSize::new(5, 10);
+        let mut term = Term::new(Config::default(), &size, listener.clone());
+
+        Handler::identify_terminal(&mut term, None);
+
+        let events = listener.0.borrow();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            // `kitten icat` only recognises a reply longer than three bytes, so
+            // the VT102 report must carry at least one capability parameter.
+            Event::PtyWrite(text) => assert_eq!(text, "\x1b[?6;22c"),
+            _ => panic!("expected PtyWrite, got {:?}", events[0]),
+        }
+    }
 
     #[test]
     fn scroll_display_page_up() {
