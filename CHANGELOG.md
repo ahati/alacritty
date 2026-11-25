@@ -24,7 +24,7 @@ Notable changes to the `alacritty_terminal` crate are documented in its
   `f=100`, zlib compression, direct, file, temp-file and shared-memory transmission,
   placements, z-index, deletion and chunked transfers), configurable through
   `terminal.graphics`
-- Cell size reporting for `CSI 16 t`, answering `CSI 6 ; <width> ; <height> t` from
+- Cell size reporting for `CSI 16 t`, answering `CSI 6 ; <height> ; <width> t` from
   the display's current cell metrics, completing the XTWINOPS window-size queries
   (`CSI 14 t`, `CSI 18 t`) that kitty graphics clients use alongside the pixel
   fields of `TIOCGWINSZ`

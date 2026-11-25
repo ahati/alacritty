@@ -2676,7 +2676,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn cell_size_pixels(&mut self) {
         self.event_proxy.send_event(Event::WindowSizeInfoRequest(Arc::new(|window_size| {
-            format!("\x1b[6;{};{}t", window_size.cell_width, window_size.cell_height)
+            format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
         })));
     }
 
@@ -2962,10 +2962,11 @@ mod tests {
         let events = listener.0.borrow();
         assert_eq!(events.len(), 3);
 
-        // A cell size report carries the cell width before the cell height.
+        // A cell size report carries the cell height before the cell width,
+        // like the text-area and character reports (xterm, kitty, tmux).
         match &events[0] {
             Event::WindowSizeInfoRequest(format) => {
-                assert_eq!(format(window_size), "\x1b[6;7;14t");
+                assert_eq!(format(window_size), "\x1b[6;14;7t");
             },
             _ => panic!("expected WindowSizeInfoRequest, got {:?}", events[0]),
         }
